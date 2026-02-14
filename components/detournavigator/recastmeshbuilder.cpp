@@ -109,6 +109,34 @@ namespace DetourNavigator
                     return true;
             return false;
         }
+
+        bool getHeightfieldTriangleCoordinates(
+            const JPH::HeightFieldShape& shape, const JPH::Float3* localVertices, int& outPartId, int& outTriangleIndex)
+        {
+            const JPH::Vec3 centroid((localVertices[0].x + localVertices[1].x + localVertices[2].x) / 3.0f,
+                (localVertices[0].y + localVertices[1].y + localVertices[2].y) / 3.0f,
+                (localVertices[0].z + localVertices[1].z + localVertices[2].z) / 3.0f);
+
+            JPH::Vec3 projectedPosition;
+            JPH::SubShapeID subShapeId;
+            if (!shape.ProjectOntoSurface(centroid, projectedPosition, subShapeId))
+                return false;
+
+            JPH::SubShapeID remainder;
+            const JPH::Shape* leafShape = shape.GetLeafShape(subShapeId, remainder);
+            if (leafShape != &shape)
+                return false;
+
+            unsigned int x = 0;
+            unsigned int y = 0;
+            unsigned int triangle = 0;
+            shape.GetSubShapeCoordinates(remainder, x, y, triangle);
+
+            const int quadsPerRow = static_cast<int>(shape.GetSampleCount()) - 1;
+            outPartId = static_cast<int>(y) * quadsPerRow + static_cast<int>(x);
+            outTriangleIndex = outPartId * 2 + static_cast<int>(triangle);
+            return true;
+        }
     }
 
     Mesh makeMesh(std::vector<RecastMeshTriangle>&& triangles, const osg::Vec3f& shift)
@@ -380,13 +408,15 @@ namespace DetourNavigator
             for (int i = 0; i < triangleCount; ++i)
             {
                 const JPH::Float3* vertices = batchVertices + i * 3;
-                const int triangleIndex = firstTriangleIndex + i;
+                int partId = 0;
+                int triangleIndex = firstTriangleIndex + i;
+                getHeightfieldTriangleCoordinates(shape, vertices, partId, triangleIndex);
                 // Convert to a world space triangle set
                 std::array<JPH::Float3, 3> transformed;
                 transformed[0] = joltTransformMult(vertices[0], transform);
                 transformed[1] = joltTransformMult(vertices[1], transform);
                 transformed[2] = joltTransformMult(vertices[2], transform);
-                processTriangle(transformed.data(), 0, triangleIndex);
+                processTriangle(transformed.data(), partId, triangleIndex);
             }
         };
         walkShapeTriangles(shape, bounds, walkerFunc);
