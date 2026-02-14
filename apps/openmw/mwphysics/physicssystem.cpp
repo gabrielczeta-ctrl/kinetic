@@ -20,7 +20,9 @@
 #include <Jolt/Physics/Body/BodyFilter.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
 #include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 #include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/SimShapeFilter.h>
 #include <Jolt/Physics/Collision/ShapeCast.h>
 #include <Jolt/Physics/Collision/ShapeFilter.h>
 #include <Jolt/Physics/PhysicsSettings.h>
@@ -98,6 +100,38 @@ static bool AssertFailedImpl(const char* inExpression, const char* inMessage, co
 
 namespace
 {
+    class AlwaysCollideSimShapeFilter final : public JPH::SimShapeFilter
+    {
+    public:
+        bool ShouldCollide(const JPH::Body&, const JPH::Shape*, const JPH::SubShapeID&, const JPH::Body&,
+            const JPH::Shape*, const JPH::SubShapeID&) const override
+        {
+            return true;
+        }
+    };
+
+    AlwaysCollideSimShapeFilter sSimShapeFilter;
+
+    void simCollideBodyVsBody(const JPH::Body& inBody1, const JPH::Body& inBody2,
+        JPH::Mat44Arg inCenterOfMassTransform1, JPH::Mat44Arg inCenterOfMassTransform2,
+        JPH::CollideShapeSettings& ioCollideShapeSettings, JPH::CollideShapeCollector& ioCollector,
+        const JPH::ShapeFilter& inShapeFilter)
+    {
+        // Sensors only need overlap information, so a single deepest hit is enough.
+        if (inBody1.IsSensor() || inBody2.IsSensor())
+        {
+            JPH::ClosestHitCollisionCollector<JPH::CollideShapeCollector> closestHitCollector;
+            JPH::PhysicsSystem::sDefaultSimCollideBodyVsBody(inBody1, inBody2, inCenterOfMassTransform1,
+                inCenterOfMassTransform2, ioCollideShapeSettings, closestHitCollector, inShapeFilter);
+            if (closestHitCollector.HadHit())
+                ioCollector.AddHit(closestHitCollector.mHit);
+            return;
+        }
+
+        JPH::PhysicsSystem::sDefaultSimCollideBodyVsBody(inBody1, inBody2, inCenterOfMassTransform1,
+            inCenterOfMassTransform2, ioCollideShapeSettings, ioCollector, inShapeFilter);
+    }
+
     constexpr std::array<JPH::ObjectLayer, 11> sRaycastObjectLayers = { MWPhysics::Layers::WORLD,
         MWPhysics::Layers::DOOR, MWPhysics::Layers::ACTOR, MWPhysics::Layers::HEIGHTMAP, MWPhysics::Layers::PROJECTILE,
         MWPhysics::Layers::WATER, MWPhysics::Layers::CAMERA_ONLY, MWPhysics::Layers::VISUAL_ONLY,
@@ -283,6 +317,8 @@ namespace MWPhysics
         // Now we can create the actual physics system.
         mPhysicsSystem.Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints, mBPLayerInterface,
             mObjectVsBPLayerFilter, mObjectVsObjectLayerFilter);
+        mPhysicsSystem.SetSimShapeFilter(&sSimShapeFilter);
+        mPhysicsSystem.SetSimCollideBodyVsBody(simCollideBodyVsBody);
         mPhysicsSystem.SetContactListener(&mContactListener);
         mPhysicsSystem.SetGravity(JPH::Vec3(0, 0, Constants::GravityConst * Constants::UnitsPerMeter));
 
