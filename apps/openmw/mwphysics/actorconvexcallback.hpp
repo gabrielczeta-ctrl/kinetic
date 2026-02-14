@@ -86,23 +86,26 @@ namespace MWPhysics
                     osg::Vec3f motion = Misc::Convert::toOsg(mMotion);
                     osg::Vec3f normal = (originA - originB);
                     normal.z() = 0;
-                    normal.normalize();
+                    motion.z() = 0;
 
-                    // only collide if horizontally moving towards the hit actor
-                    // FIXME: This kinda screws with standing on actors that walk up slopes for some reason. Makes you
-                    // fall through them. It happens in vanilla Morrowind too, but much less often. I tried hunting down
-                    // why but couldn't figure it out. Possibly a stair stepping or ground ejection bug.
-                    if (normal * motion < 0.0f)
+                    // Prefer the vanilla-like horizontal actor-vs-actor response when moving into another actor.
+                    // If actors are vertically stacked (normal almost zero), fall back to the standard contact normal
+                    // handling below to avoid dropping contacts.
+                    if (normal.length2() > 0.0001f && motion.length2() > 0.0001f)
                     {
-                        // Get the contact properties
-                        mHitCollisionObject = body;
-                        mHitCollisionLayer = collisionGroup;
-                        mHitPointWorld = mOrigin + inResult.mContactPointOn2;
-                        mHitNormalWorld = Misc::Convert::toJolt<JPH::Vec3>(normal);
-                        mClosestHitFraction = 0.0f;
-                        ForceEarlyOut();
+                        normal.normalize();
+                        if (normal * motion < 0.0f)
+                        {
+                            // Get the contact properties
+                            mHitCollisionObject = body;
+                            mHitCollisionLayer = collisionGroup;
+                            mHitPointWorld = mOrigin + inResult.mContactPointOn2;
+                            mHitNormalWorld = Misc::Convert::toJolt<JPH::Vec3>(normal);
+                            mClosestHitFraction = 0.0f;
+                            ForceEarlyOut();
+                            return;
+                        }
                     }
-                    return;
                 }
             }
 
