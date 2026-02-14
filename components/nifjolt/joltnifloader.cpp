@@ -3,6 +3,7 @@
 #include <cassert>
 #include <optional>
 #include <sstream>
+#include <string_view>
 #include <tuple>
 #include <variant>
 #include <vector>
@@ -19,11 +20,12 @@
 #include <components/nif/nifstream.hpp>
 #include <components/nif/node.hpp>
 #include <components/nif/parent.hpp>
+#include <components/vfs/manager.hpp>
 
 namespace
 {
 
-    bool pathFileNameStartsWithX(const std::string& path)
+    bool pathFileNameStartsWithX(std::string_view path)
     {
         const std::size_t slashpos = path.find_last_of("/\\");
         const std::size_t letterPos = slashpos == std::string::npos ? 0 : slashpos + 1;
@@ -34,6 +36,21 @@ namespace
 
 namespace NifJolt
 {
+    bool JoltNifLoader::hasExternalKeyframeAnimation(VFS::Path::NormalizedView fileName) const
+    {
+        if (!pathFileNameStartsWithX(fileName.value()))
+            return false;
+
+        if (!mVfs)
+            return true;
+
+        VFS::Path::Normalized keyframeFileName(fileName);
+        if (!keyframeFileName.changeExtension(VFS::Path::ExtensionView("kf")))
+            return true;
+
+        return mVfs->exists(keyframeFileName);
+    }
+
     // Some nif scales aren't exactly 1.0f, 1.0f, 1.0f but within a small epsilon
     // detect that so we can skip potentially expensive scaling
     bool isScaleUniformAndCloseToOne(const osg::Vec3& localScale)
@@ -84,9 +101,8 @@ namespace NifJolt
         HandleNodeArgs args;
 
         // files with the name convention xmodel.nif usually have keyframes stored in a separate file xmodel.kf (see
-        // Animation::addAnimSource). assume all nodes in the file will be animated
-        // TODO: investigate whether this should and could be optimized.
-        args.mAnimated = pathFileNameStartsWithX(mShape->mFileName);
+        // Animation::addAnimSource). If VFS is available, only treat it as externally animated when the sidecar exists.
+        args.mAnimated = hasExternalKeyframeAnimation(mShape->mFileName);
 
         for (const Nif::NiAVObject* node : roots)
             handleRoot(nif, *node, args);

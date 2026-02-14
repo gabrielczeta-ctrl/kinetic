@@ -25,6 +25,11 @@ namespace Nif
     struct Parent;
 }
 
+namespace VFS
+{
+    class Manager;
+}
+
 namespace NifJolt
 {
 
@@ -34,6 +39,11 @@ namespace NifJolt
     class JoltNifLoader
     {
     public:
+        explicit JoltNifLoader(const VFS::Manager* vfs = nullptr)
+            : mVfs(vfs)
+        {
+        }
+
         void warn(const std::string& msg) { Log(Debug::Warning) << "NIFLoader: Warn: " << msg; }
 
         [[noreturn]] void fail(const std::string& msg)
@@ -46,6 +56,7 @@ namespace NifJolt
 
     private:
         bool findBoundingBox(const Nif::NiAVObject& node);
+        bool hasExternalKeyframeAnimation(VFS::Path::NormalizedView fileName) const;
 
         struct HandleNodeArgs
         {
@@ -64,6 +75,7 @@ namespace NifJolt
         bool mShapeMutable = false;
         std::unique_ptr<JPH::CompoundShapeSettings> mCompoundShape;
         std::unique_ptr<JPH::CompoundShapeSettings> mAvoidCompoundShape;
+        const VFS::Manager* mVfs = nullptr;
 
         osg::ref_ptr<Resource::PhysicsShape> mShape;
     };

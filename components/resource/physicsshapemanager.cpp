@@ -144,7 +144,7 @@ namespace Resource
 
         if (Misc::getFileExtension(name.value()) == "nif")
         {
-            NifJolt::JoltNifLoader loader;
+            NifJolt::JoltNifLoader loader(getVFS());
             shape = loader.load(*mNifFileManager->get(name));
         }
         else
