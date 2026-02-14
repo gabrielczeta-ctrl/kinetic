@@ -7,6 +7,7 @@
 
 #include <map>
 #include <mutex>
+#include <vector>
 
 namespace Resource
 {
@@ -48,6 +49,7 @@ namespace MWPhysics
         bool collidedWith(ScriptedCollisionType type) const;
         void addCollision(ScriptedCollisionType type);
         void resetCollisions();
+        static std::vector<const MWWorld::LiveCellRefBase*> consumeCollidedObjects();
 
         bool isScaleIdentity() const { return mScale == osg::Vec3f(1.0f, 1.0f, 1.0f); }
 

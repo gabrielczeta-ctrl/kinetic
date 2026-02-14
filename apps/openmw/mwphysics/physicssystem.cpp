@@ -1000,10 +1000,11 @@ namespace MWPhysics
             }
         }
 
-        // FIXME: looping every object each frame to do this is a smell
-        // most objects wont even need resetting
-        for (auto& [_, object] : mObjects)
-            object->resetCollisions();
+        for (const MWWorld::LiveCellRefBase* ref : Object::consumeCollidedObjects())
+        {
+            if (const auto it = mObjects.find(ref); it != mObjects.end())
+                it->second->resetCollisions();
+        }
 
         mTimeAccum += dt;
         mTimeAccumJolt += dt;

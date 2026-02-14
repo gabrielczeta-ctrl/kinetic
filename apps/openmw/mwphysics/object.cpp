@@ -13,6 +13,12 @@
 
 namespace MWPhysics
 {
+    namespace
+    {
+        std::mutex sCollidedObjectsMutex;
+        std::vector<const MWWorld::LiveCellRefBase*> sCollidedObjects;
+    }
+
     Object::Object(const MWWorld::Ptr& ptr, osg::ref_ptr<Resource::PhysicsShapeInstance> shapeInstance,
         osg::Quat rotation, int collisionType, PhysicsTaskScheduler* scheduler)
         : PtrHolder(ptr, osg::Vec3f())
@@ -220,12 +226,31 @@ namespace MWPhysics
 
     void Object::addCollision(ScriptedCollisionType type)
     {
-        std::unique_lock<std::mutex> lock(mPositionMutex);
-        mCollidedWith |= type;
+        bool firstCollisionForThisFrame = false;
+        {
+            std::unique_lock<std::mutex> lock(mPositionMutex);
+            firstCollisionForThisFrame = mCollidedWith == ScriptedCollisionType_None;
+            mCollidedWith |= type;
+        }
+
+        if (firstCollisionForThisFrame)
+        {
+            std::unique_lock<std::mutex> lock(sCollidedObjectsMutex);
+            sCollidedObjects.push_back(mPtr.mRef);
+        }
     }
 
     void Object::resetCollisions()
     {
+        std::unique_lock<std::mutex> lock(mPositionMutex);
         mCollidedWith = ScriptedCollisionType_None;
+    }
+
+    std::vector<const MWWorld::LiveCellRefBase*> Object::consumeCollidedObjects()
+    {
+        std::unique_lock<std::mutex> lock(sCollidedObjectsMutex);
+        auto result = std::move(sCollidedObjects);
+        sCollidedObjects.clear();
+        return result;
     }
 }
