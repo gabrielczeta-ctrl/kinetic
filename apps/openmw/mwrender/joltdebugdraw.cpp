@@ -33,7 +33,7 @@ namespace MWRender
 
         JPH::DebugRenderer::Initialize();
 
-        // TODO: in the future might make sense to allow toggling these from a debug menu
+        // Keep expensive/verbose overlays disabled by default for frame-time stability.
         mBodyDrawSettings.mDrawCenterOfMassTransform = false;
         mBodyDrawSettings.mDrawGetSupportFunction = false;
         mBodyDrawSettings.mDrawSupportDirection = false;
