@@ -180,9 +180,9 @@ namespace MWPhysics
     }
 
     PhysicsSystem::PhysicsSystem(Resource::ResourceSystem* resourceSystem, osg::ref_ptr<osg::Group> parentNode)
-        : mShapeManager(
-            std::make_unique<Resource::PhysicsShapeManager>(resourceSystem->getVFS(), resourceSystem->getSceneManager(),
-                resourceSystem->getNifFileManager(), Settings::cells().mCacheExpiryDelay))
+        : mShapeManager(std::make_unique<Resource::PhysicsShapeManager>(resourceSystem->getVFS(),
+              resourceSystem->getSceneManager(), resourceSystem->getNifFileManager(),
+              Settings::cells().mCacheExpiryDelay))
         , mResourceSystem(resourceSystem)
         , mDebugDrawEnabled(false)
         , mTimeAccum(0.0f)
@@ -612,12 +612,12 @@ namespace MWPhysics
     }
 
     void PhysicsSystem::addObject(
-        const MWWorld::Ptr& ptr, const std::string& mesh, osg::Quat rotation, int collisionType)
+        const MWWorld::Ptr& ptr, VFS::Path::NormalizedView mesh, osg::Quat rotation, int collisionType)
     {
         if (ptr.mRef->mData.mPhysicsPostponed)
             return;
 
-        std::string animationMesh = mesh;
+        VFS::Path::Normalized animationMesh(mesh);
         if (ptr.getClass().useAnim())
             animationMesh = Misc::ResourceHelpers::correctActorModelPath(mesh, mResourceSystem->getVFS());
         osg::ref_ptr<Resource::PhysicsShapeInstance> shapeInstance = mShapeManager->getInstance(animationMesh);
@@ -761,9 +761,10 @@ namespace MWPhysics
         }
     }
 
-    void PhysicsSystem::addActor(const MWWorld::Ptr& ptr, const std::string& mesh)
+    void PhysicsSystem::addActor(const MWWorld::Ptr& ptr, VFS::Path::NormalizedView mesh)
     {
-        std::string animationMesh = Misc::ResourceHelpers::correctActorModelPath(mesh, mResourceSystem->getVFS());
+        VFS::Path::Normalized animationMesh
+            = Misc::ResourceHelpers::correctActorModelPath(mesh, mResourceSystem->getVFS());
         osg::ref_ptr<const Resource::PhysicsShape> shape = mShapeManager->getShape(animationMesh);
 
         // Try to get shape from basic model as fallback for creatures
@@ -789,7 +790,7 @@ namespace MWPhysics
     }
 
     int PhysicsSystem::addProjectile(
-        const MWWorld::Ptr& caster, const osg::Vec3f& position, const std::string& mesh, bool computeRadius)
+        const MWWorld::Ptr& caster, const osg::Vec3f& position, VFS::Path::NormalizedView mesh, bool computeRadius)
     {
         osg::ref_ptr<Resource::PhysicsShapeInstance> shapeInstance = mShapeManager->getInstance(mesh);
         assert(shapeInstance);
@@ -832,6 +833,21 @@ namespace MWPhysics
         ActorMap::iterator found = mActors.find(ptr.mRef);
         if (found != mActors.end())
             found->second->setVelocity(velocity);
+    }
+
+    void PhysicsSystem::updateAnimatedCollisionShape(const MWWorld::Ptr& ptr)
+    {
+        auto foundObject = mObjects.find(ptr.mRef);
+        if (foundObject == mObjects.end())
+            return;
+
+        Object* object = foundObject->second.get();
+        auto animatedObject = mAnimatedObjects.find(object);
+        if (animatedObject == mAnimatedObjects.end())
+            return;
+
+        std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
+        animatedObject->second = object->animateCollisionShapes();
     }
 
     void PhysicsSystem::clearQueuedMovement()
@@ -1156,10 +1172,10 @@ namespace MWPhysics
         , mSwimLevel(waterlevel
               - (actor.getRenderingHalfExtents().z() * 2
                   * MWBase::Environment::get()
-                        .getESMStore()
-                        ->get<ESM::GameSetting>()
-                        .find("fSwimHeightScale")
-                        ->mValue.getFloat()))
+                      .getESMStore()
+                      ->get<ESM::GameSetting>()
+                      .find("fSwimHeightScale")
+                      ->mValue.getFloat()))
         , mSlowFall(slowFall)
         , mRotation()
         , mMovement(actor.velocity())

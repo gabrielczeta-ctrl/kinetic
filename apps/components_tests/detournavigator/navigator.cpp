@@ -37,6 +37,11 @@ MATCHER_P3(Vec3fEq, x, y, z, "")
     return std::abs(arg.x() - x) < 1e-3 && std::abs(arg.y() - y) < 1e-3 && std::abs(arg.z() - z) < 1e-3;
 }
 
+MATCHER_P4(Vec3fEq, x, y, z, precision, "")
+{
+    return std::abs(arg.x() - x) < precision && std::abs(arg.y() - y) < precision && std::abs(arg.z() - z) < precision;
+}
+
 namespace
 {
     using namespace testing;
@@ -48,34 +53,32 @@ namespace
     struct DetourNavigatorNavigatorTest : Test
     {
         Settings mSettings = makeSettings();
-        std::unique_ptr<Navigator> mNavigator;
-        const osg::Vec3f mPlayerPosition;
-        const std::string mWorldspace;
+        std::unique_ptr<Navigator> mNavigator = std::make_unique<NavigatorImpl>(
+            mSettings, std::make_unique<NavMeshDb>(":memory:", std::numeric_limits<std::uint64_t>::max()));
+        const osg::Vec3f mPlayerPosition{ 256, 256, 0 };
+        const ESM::RefId mWorldspace = ESM::RefId::stringRefId("sys::default");
         const AgentBounds mAgentBounds{ CollisionShapeType::Aabb, { 29, 29, 66 } };
-        osg::Vec3f mStart;
-        osg::Vec3f mEnd;
+        osg::Vec3f mStart{ 52, 460, 1 };
+        osg::Vec3f mEnd{ 460, 52, 1 };
         std::deque<osg::Vec3f> mPath;
-        std::back_insert_iterator<std::deque<osg::Vec3f>> mOut;
+        std::back_insert_iterator<std::deque<osg::Vec3f>> mOut{ mPath };
         AreaCosts mAreaCosts;
         Loading::Listener mListener;
         const osg::Vec2i mCellPosition{ 0, 0 };
         const float mEndTolerance = 0;
         const osg::Matrixd mTransform = osg::Matrixd::translate(osg::Vec3f(256, 256, 0));
         const ObjectTransform mObjectTransform{ ESM::Position{ { 256, 256, 0 }, { 0, 0, 0 } }, 0.0f };
-
-        DetourNavigatorNavigatorTest()
-            : mPlayerPosition(256, 256, 0)
-            , mWorldspace("sys::default")
-            , mStart(52, 460, 1)
-            , mEnd(460, 52, 1)
-            , mOut(mPath)
-        {
-            mNavigator.reset(new NavigatorImpl(
-                mSettings, std::make_unique<NavMeshDb>(":memory:", std::numeric_limits<std::uint64_t>::max())));
-        }
     };
 
     constexpr std::array<float, 5 * 5> defaultHeightfieldData{ {
+        0, 0, 0, 0, 0, // row 0
+        0, -25, -25, -25, -25, // row 1
+        0, -25, -100, -100, -100, // row 2
+        0, -25, -100, -100, -100, // row 3
+        0, -25, -100, -100, -100, // row 4
+    } };
+
+    constexpr std::array<float, 5 * 5> defaultHeightfieldDataScalar{ {
         0, 0, 0, 0, 0, // row 0
         0, -25, -25, -25, -25, // row 1
         0, -25, -100, -100, -100, // row 2
@@ -155,7 +158,7 @@ namespace
 
     TEST_F(DetourNavigatorNavigatorTest, find_path_for_empty_should_return_empty)
     {
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::NavMeshNotFound);
         EXPECT_EQ(mPath, std::deque<osg::Vec3f>());
     }
@@ -163,7 +166,7 @@ namespace
     TEST_F(DetourNavigatorNavigatorTest, find_path_for_existing_agent_with_no_navmesh_should_throw_exception)
     {
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::StartPolygonNotFound);
     }
 
@@ -172,7 +175,7 @@ namespace
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->removeAgent(mAgentBounds);
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::StartPolygonNotFound);
     }
 
@@ -188,7 +191,7 @@ namespace
         updateGuard.reset();
         mNavigator->wait(WaitConditionType::requiredTilesPresent, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -210,7 +213,7 @@ namespace
         updateGuard.reset();
         mNavigator->wait(WaitConditionType::requiredTilesPresent, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mStart, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mStart, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath, ElementsAre(Vec3fEq(56.66666412353515625, 460, 1.99998295307159423828125))) << mPath;
@@ -237,7 +240,7 @@ namespace
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -256,7 +259,7 @@ namespace
 
         mPath.clear();
         mOut = std::back_inserter(mPath);
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -288,7 +291,7 @@ namespace
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -309,7 +312,7 @@ namespace
 
         mPath.clear();
         mOut = std::back_inserter(mPath);
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -342,7 +345,7 @@ namespace
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -408,7 +411,7 @@ namespace
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -443,7 +446,7 @@ namespace
         mEnd.x() = 256;
         mEnd.z() = 300;
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_swim, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_swim, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -475,8 +478,8 @@ namespace
         mStart.x() = 256;
         mEnd.x() = 256;
 
-        EXPECT_EQ(
-            findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_swim | Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_swim | Flag_walk, mAreaCosts, mEndTolerance,
+                      {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -509,8 +512,8 @@ namespace
         mStart.x() = 256;
         mEnd.x() = 256;
 
-        EXPECT_EQ(
-            findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_swim | Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_swim | Flag_walk, mAreaCosts, mEndTolerance,
+                      {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -542,7 +545,7 @@ namespace
         mStart.x() = 256;
         mEnd.x() = 256;
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -570,7 +573,7 @@ namespace
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -598,7 +601,7 @@ namespace
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -631,12 +634,13 @@ namespace
         const auto result = findRandomPointAroundCircle(
             *mNavigator, mAgentBounds, mStart, 100.0, Flag_walk, []() { return Misc::Rng::rollClosedProbability(); });
 
-        ASSERT_THAT(result, Optional(Vec3fEq(70.35845947265625, 335.592041015625, -2.6667339801788330078125)))
-            << (result ? *result : osg::Vec3f());
+        ASSERT_TRUE(result.has_value());
+
+        EXPECT_THAT(*result, Vec3fEq(70.35845947265625, 335.592041015625, -2.6667339801788330078125, 1)) << *result;
 
         const auto distance = (*result - mStart).length();
 
-        EXPECT_FLOAT_EQ(distance, 125.80865478515625) << distance;
+        EXPECT_NEAR(distance, 125.80865478515625, 1) << distance;
     }
 
     TEST_F(DetourNavigatorNavigatorTest, multiple_threads_should_lock_tiles)
@@ -679,7 +683,7 @@ namespace
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -804,7 +808,7 @@ namespace
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::requiredTilesPresent, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -833,7 +837,7 @@ namespace
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
             Status::PartialPath);
 
         EXPECT_THAT(mPath,
@@ -865,7 +869,7 @@ namespace
 
         const float endTolerance = 1000.0f;
 
-        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, endTolerance, mOut),
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, mStart, mEnd, Flag_walk, mAreaCosts, endTolerance, {}, mOut),
             Status::Success);
 
         EXPECT_THAT(mPath,
@@ -896,6 +900,17 @@ namespace
         EXPECT_EQ(mNavigator->getNavMesh(mAgentBounds)->lockConst()->getVersion(), version);
     }
 
+    std::pair<TilePosition, TilePosition> getMinMax(const RecastMeshTiles& tiles)
+    {
+        const auto lessByX = [](const auto& l, const auto& r) { return l.first.x() < r.first.x(); };
+        const auto lessByY = [](const auto& l, const auto& r) { return l.first.y() < r.first.y(); };
+
+        const auto [minX, maxX] = std::ranges::minmax_element(tiles, lessByX);
+        const auto [minY, maxY] = std::ranges::minmax_element(tiles, lessByY);
+
+        return { TilePosition(minX->first.x(), minY->first.y()), TilePosition(maxX->first.x(), maxY->first.y()) };
+    }
+
     TEST_F(DetourNavigatorNavigatorTest, update_for_very_big_object_should_be_limited)
     {
         const float size = static_cast<float>((1 << 22) - 1);
@@ -905,8 +920,10 @@ namespace
             .mPosition = ESM::Position{ .pos = { 0, 0, 0 }, .rot{ 0, 0, 0 } },
             .mScale = 1.0f,
         };
+        const std::optional<CellGridBounds> cellGridBounds = std::nullopt;
+        const osg::Vec3f playerPosition(32, 1024, 0);
 
-        mNavigator->updateBounds(mPlayerPosition, nullptr);
+        mNavigator->updateBounds(mWorldspace, cellGridBounds, playerPosition, nullptr);
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addObject(ObjectId(&bigBox.shape()), ObjectShapes(bigBox.instance(), objectTransform),
             osg::Matrixd::identity(), nullptr);
@@ -916,7 +933,8 @@ namespace
         std::mutex mutex;
 
         std::thread thread([&] {
-            mNavigator->update(mPlayerPosition, nullptr);
+            auto guard = mNavigator->makeUpdateGuard();
+            mNavigator->update(playerPosition, guard.get());
             std::lock_guard lock(mutex);
             updated = true;
             updateFinished.notify_all();
@@ -924,7 +942,7 @@ namespace
 
         {
             std::unique_lock lock(mutex);
-            updateFinished.wait_for(lock, std::chrono::seconds(3), [&] { return updated; });
+            updateFinished.wait_for(lock, std::chrono::seconds(10), [&] { return updated; });
             ASSERT_TRUE(updated);
         }
 
@@ -932,14 +950,209 @@ namespace
 
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
-        EXPECT_EQ(mNavigator->getRecastMeshTiles().size(), 509);
+        const auto recastMeshTiles = mNavigator->getRecastMeshTiles();
+        ASSERT_EQ(recastMeshTiles.size(), 1033);
+        EXPECT_EQ(getMinMax(recastMeshTiles), std::pair(TilePosition(-18, -17), TilePosition(18, 19)));
 
         const auto navMesh = mNavigator->getNavMesh(mAgentBounds);
         ASSERT_NE(navMesh, nullptr);
 
         std::size_t usedNavMeshTiles = 0;
         navMesh->lockConst()->forEachUsedTile([&](const auto&...) { ++usedNavMeshTiles; });
-        EXPECT_EQ(usedNavMeshTiles, 509);
+        EXPECT_EQ(usedNavMeshTiles, 1024);
+    }
+
+    TEST_F(DetourNavigatorNavigatorTest, update_should_be_limited_by_cell_grid_bounds)
+    {
+        const float size = static_cast<float>((1 << 22) - 1);
+        CollisionShapeInstance bigBox(std::make_unique<JPH::BoxShape>(JPH::Vec3(size, size, 1)));
+        const ObjectTransform objectTransform{
+            .mPosition = ESM::Position{ .pos = { 0, 0, 0 }, .rot{ 0, 0, 0 } },
+            .mScale = 1.0f,
+        };
+        const CellGridBounds cellGridBounds{
+            .mCenter = osg::Vec2i(0, 0),
+            .mHalfSize = 1,
+        };
+        const osg::Vec3f playerPosition(32, 1024, 0);
+
+        mNavigator->updateBounds(mWorldspace, cellGridBounds, playerPosition, nullptr);
+        ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
+        mNavigator->addObject(ObjectId(&bigBox.shape()), ObjectShapes(bigBox.instance(), objectTransform),
+            osg::Matrixd::identity(), nullptr);
+
+        bool updated = false;
+        std::condition_variable updateFinished;
+        std::mutex mutex;
+
+        std::thread thread([&] {
+            auto guard = mNavigator->makeUpdateGuard();
+            mNavigator->update(playerPosition, guard.get());
+            std::lock_guard lock(mutex);
+            updated = true;
+            updateFinished.notify_all();
+        });
+
+        {
+            std::unique_lock lock(mutex);
+            updateFinished.wait_for(lock, std::chrono::seconds(10), [&] { return updated; });
+            ASSERT_TRUE(updated);
+        }
+
+        thread.join();
+
+        mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
+
+        const auto recastMeshTiles = mNavigator->getRecastMeshTiles();
+        ASSERT_EQ(recastMeshTiles.size(), 854);
+        EXPECT_EQ(getMinMax(recastMeshTiles), std::pair(TilePosition(-12, -12), TilePosition(18, 19)));
+
+        const auto navMesh = mNavigator->getNavMesh(mAgentBounds);
+        ASSERT_NE(navMesh, nullptr);
+
+        std::size_t usedNavMeshTiles = 0;
+        navMesh->lockConst()->forEachUsedTile([&](const auto&...) { ++usedNavMeshTiles; });
+        EXPECT_EQ(usedNavMeshTiles, 854);
+    }
+
+    TEST_F(DetourNavigatorNavigatorTest, find_path_should_return_path_around_steep_mountains)
+    {
+        const std::array<float, 5 * 5> heightfieldData{ {
+            0, 0, 0, 0, 0, // row 0
+            0, 0, 0, 0, 0, // row 1
+            0, 0, 1000, 0, 0, // row 2
+            0, 0, 1000, 0, 0, // row 3
+            0, 0, 0, 0, 0, // row 4
+        } };
+        const HeightfieldSurface surface = makeSquareHeightfieldSurface(heightfieldData);
+        const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
+
+        ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
+        mNavigator->addHeightfield(mCellPosition, cellSize, surface, nullptr);
+        mNavigator->update(mPlayerPosition, nullptr);
+        mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
+
+        const osg::Vec3f start(56, 56, 12);
+        const osg::Vec3f end(464, 464, 12);
+
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, start, end, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
+            Status::Success);
+
+        EXPECT_THAT(mPath,
+            ElementsAre( //
+                Vec3fEq(56.66664886474609375, 56.66664886474609375, 11.33333301544189453125),
+                Vec3fEq(396.666656494140625, 79.33331298828125, 11.33333301544189453125),
+                Vec3fEq(430.666656494140625, 113.33331298828125, 11.33333301544189453125),
+                Vec3fEq(463.999969482421875, 463.999969482421875, 11.33333301544189453125)))
+            << mPath;
+    }
+
+    TEST_F(DetourNavigatorNavigatorTest, find_path_should_return_path_around_steep_cliffs)
+    {
+        const std::array<float, 5 * 5> heightfieldData{ {
+            0, 0, 0, 0, 0, // row 0
+            0, 0, 0, 0, 0, // row 1
+            0, 0, -1000, 0, 0, // row 2
+            0, 0, -1000, 0, 0, // row 3
+            0, 0, 0, 0, 0, // row 4
+        } };
+        const HeightfieldSurface surface = makeSquareHeightfieldSurface(heightfieldData);
+        const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
+
+        ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
+        mNavigator->addHeightfield(mCellPosition, cellSize, surface, nullptr);
+        mNavigator->update(mPlayerPosition, nullptr);
+        mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
+
+        const osg::Vec3f start(56, 56, 12);
+        const osg::Vec3f end(464, 464, 12);
+
+        EXPECT_EQ(findPath(*mNavigator, mAgentBounds, start, end, Flag_walk, mAreaCosts, mEndTolerance, {}, mOut),
+            Status::Success);
+
+        EXPECT_THAT(mPath,
+            ElementsAre( //
+                Vec3fEq(56.66664886474609375, 56.66664886474609375, 8.66659259796142578125),
+                Vec3fEq(385.33331298828125, 79.33331298828125, 8.66659259796142578125),
+                Vec3fEq(430.666656494140625, 124.66664886474609375, 8.66659259796142578125),
+                Vec3fEq(463.999969482421875, 463.999969482421875, 8.66659259796142578125)))
+            << mPath;
+    }
+
+    TEST_F(DetourNavigatorNavigatorTest, find_path_should_return_path_with_checkpoints)
+    {
+        const std::array<float, 5 * 5> heightfieldData{ {
+            0, 0, 0, 0, 0, // row 0
+            0, 0, 0, 0, 0, // row 1
+            0, 0, 1000, 0, 0, // row 2
+            0, 0, 1000, 0, 0, // row 3
+            0, 0, 0, 0, 0, // row 4
+        } };
+        const HeightfieldSurface surface = makeSquareHeightfieldSurface(heightfieldData);
+        const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
+
+        ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
+        mNavigator->addHeightfield(mCellPosition, cellSize, surface, nullptr);
+        mNavigator->update(mPlayerPosition, nullptr);
+        mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
+
+        const std::vector<osg::Vec3f> checkpoints = {
+            osg::Vec3f(400, 70, 12),
+        };
+
+        const osg::Vec3f start(56, 56, 12);
+        const osg::Vec3f end(464, 464, 12);
+
+        EXPECT_EQ(
+            findPath(*mNavigator, mAgentBounds, start, end, Flag_walk, mAreaCosts, mEndTolerance, checkpoints, mOut),
+            Status::Success);
+
+        EXPECT_THAT(mPath,
+            ElementsAre( //
+                Vec3fEq(56.66664886474609375, 56.66664886474609375, 11.33333301544189453125),
+                Vec3fEq(400, 70, 11.33333301544189453125),
+                Vec3fEq(430.666656494140625, 113.33331298828125, 11.33333301544189453125),
+                Vec3fEq(463.999969482421875, 463.999969482421875, 11.33333301544189453125)))
+            << mPath;
+    }
+
+    TEST_F(DetourNavigatorNavigatorTest, find_path_should_skip_unreachable_checkpoints)
+    {
+        const std::array<float, 5 * 5> heightfieldData{ {
+            0, 0, 0, 0, 0, // row 0
+            0, 0, 0, 0, 0, // row 1
+            0, 0, 1000, 0, 0, // row 2
+            0, 0, 1000, 0, 0, // row 3
+            0, 0, 0, 0, 0, // row 4
+        } };
+        const HeightfieldSurface surface = makeSquareHeightfieldSurface(heightfieldData);
+        const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
+
+        ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
+        mNavigator->addHeightfield(mCellPosition, cellSize, surface, nullptr);
+        mNavigator->update(mPlayerPosition, nullptr);
+        mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
+
+        const std::vector<osg::Vec3f> checkpoints = {
+            osg::Vec3f(400, 70, 10000),
+            osg::Vec3f(256, 256, 1000),
+            osg::Vec3f(-1000, -1000, 0),
+        };
+
+        const osg::Vec3f start(56, 56, 12);
+        const osg::Vec3f end(464, 464, 12);
+
+        EXPECT_EQ(
+            findPath(*mNavigator, mAgentBounds, start, end, Flag_walk, mAreaCosts, mEndTolerance, checkpoints, mOut),
+            Status::Success);
+
+        EXPECT_THAT(mPath,
+            ElementsAre( //
+                Vec3fEq(56.66664886474609375, 56.66664886474609375, 11.33333301544189453125),
+                Vec3fEq(396.666656494140625, 79.33331298828125, 11.33333301544189453125),
+                Vec3fEq(430.666656494140625, 113.33331298828125, 11.33333301544189453125),
+                Vec3fEq(463.999969482421875, 463.999969482421875, 11.33333301544189453125)))
+            << mPath;
     }
 
     struct DetourNavigatorNavigatorNotSupportedAgentBoundsTest : TestWithParam<AgentBounds>

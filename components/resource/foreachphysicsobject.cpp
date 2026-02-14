@@ -97,7 +97,7 @@ namespace Resource
 
             for (CellRef& cellRef : cellRefs)
             {
-                std::string model(getModel(esmData, cellRef.mRefId, cellRef.mType));
+                VFS::Path::Normalized model(getModel(esmData, cellRef.mRefId, cellRef.mType));
                 if (model.empty())
                     continue;
 
@@ -107,7 +107,7 @@ namespace Resource
                 osg::ref_ptr<const Resource::PhysicsShape> shape = [&] {
                     try
                     {
-                        return physicsShapeManager.getShape("meshes/" + model);
+                        return physicsShapeManager.getShape(Misc::ResourceHelpers::correctMeshPath(model));
                     }
                     catch (const std::exception& e)
                     {

@@ -13,8 +13,11 @@
 #include "../mwworld/cellstore.hpp"
 #include "../mwworld/scene.hpp"
 
+#include "context.hpp"
 #include "luamanagerimp.hpp"
 #include "objectlists.hpp"
+
+#include <vector>
 
 namespace
 {
@@ -23,18 +26,27 @@ namespace
     {
         std::vector<T> ignore;
 
-        if (const auto& ignoreObj = options.get<sol::optional<MWLua::LObject>>("ignore"))
+        if (const auto& ignoreObj = options.get<sol::optional<sol::object>>("ignore"))
         {
-            ignore.push_back(ignoreObj->ptr());
-        }
-        else if (const auto& ignoreTable = options.get<sol::optional<sol::table>>("ignore"))
-        {
-            ignoreTable->for_each([&](const auto& _, const sol::object& value) {
-                if (value.is<MWLua::LObject>())
+            if (ignoreObj->is<MWLua::LObject>())
+                ignore.push_back(ignoreObj->as<MWLua::LObject>().ptr());
+            else if (ignoreObj->is<MWLua::LObjectList>())
+            {
+                for (const MWLua::ObjectId& id : *ignoreObj->as<MWLua::LObjectList>().mIds)
                 {
-                    ignore.push_back(value.as<MWLua::LObject>().ptr());
+                    ignore.push_back(MWLua::LObject(id).ptr());
                 }
-            });
+            }
+            else
+            {
+                // ignoreObj->as throws if the type doesn't match, but an unchecked value.as crashes...
+                ignoreObj->as<sol::lua_table>().for_each([&](sol::object _, sol::object value) {
+                    if (value.is<MWLua::LObject>())
+                        ignore.push_back(value.as<MWLua::LObject>().ptr());
+                    else
+                        throw std::runtime_error("Table value is not a GameObject");
+                });
+            }
         }
 
         return ignore;
@@ -232,6 +244,7 @@ namespace MWLua
                   DetourNavigator::Flags includeFlags = defaultIncludeFlags;
                   DetourNavigator::AreaCosts areaCosts{};
                   float destinationTolerance = 1;
+                  std::vector<osg::Vec3f> checkpoints;
 
                   if (options.has_value())
                   {
@@ -257,13 +270,24 @@ namespace MWLua
                       }
                       if (const auto& v = options->get<sol::optional<float>>("destinationTolerance"))
                           destinationTolerance = *v;
+                      if (const auto& t = options->get<sol::optional<sol::table>>("checkpoints"))
+                      {
+                          for (const auto& [k, v] : *t)
+                          {
+                              const int index = k.as<int>();
+                              const osg::Vec3f position = v.as<osg::Vec3f>();
+                              if (index != static_cast<int>(checkpoints.size() + 1))
+                                  throw std::runtime_error("checkpoints is not an array");
+                              checkpoints.push_back(position);
+                          }
+                      }
                   }
 
                   std::vector<osg::Vec3f> path;
 
-                  const DetourNavigator::Status status
-                      = DetourNavigator::findPath(*MWBase::Environment::get().getWorld()->getNavigator(), agentBounds,
-                          source, destination, includeFlags, areaCosts, destinationTolerance, std::back_inserter(path));
+                  const DetourNavigator::Status status = DetourNavigator::findPath(
+                      *MWBase::Environment::get().getWorld()->getNavigator(), agentBounds, source, destination,
+                      includeFlags, areaCosts, destinationTolerance, checkpoints, std::back_inserter(path));
 
                   sol::table result(lua, sol::create);
                   LuaUtil::copyVectorToTable(path, result);
@@ -340,9 +364,9 @@ namespace MWLua
             if (!searchAreaHalfExtents.has_value())
             {
                 const bool isEsm4 = MWBase::Environment::get().getWorldScene()->getCurrentCell()->getCell()->isEsm4();
-                const float halfExtents = isEsm4
-                    ? (1 + 2 * Constants::ESM4CellGridRadius) * Constants::ESM4CellSizeInUnits
-                    : (1 + 2 * Constants::CellGridRadius) * Constants::CellSizeInUnits;
+                const float halfExtents = static_cast<float>(isEsm4
+                        ? (1 + 2 * Constants::ESM4CellGridRadius) * Constants::ESM4CellSizeInUnits
+                        : (1 + 2 * Constants::CellGridRadius) * Constants::CellSizeInUnits);
                 searchAreaHalfExtents = osg::Vec3f(halfExtents, halfExtents, halfExtents);
             }
 

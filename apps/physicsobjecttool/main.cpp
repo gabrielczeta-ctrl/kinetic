@@ -20,7 +20,7 @@
 #include <components/resource/physicsshapemanager.hpp>
 #include <components/resource/scenemanager.hpp>
 #include <components/settings/settings.hpp>
-#include <components/to_utf8/to_utf8.hpp>
+#include <components/toutf8/toutf8.hpp>
 #include <components/version/version.hpp>
 #include <components/vfs/manager.hpp>
 #include <components/vfs/registerarchives.hpp>
@@ -129,14 +129,15 @@ namespace
 
         if (variables.find("help") != variables.end())
         {
-            getRawStdout() << desc << std::endl;
+            Debug::getRawStdout() << desc << std::endl;
             return 0;
         }
 
         Files::ConfigurationManager config;
+        config.processPaths(variables, std::filesystem::current_path());
         config.readConfiguration(variables, desc);
 
-        setupLogging(config.getLogPath(), applicationName);
+        Debug::setupLogging(config.getLogPath(), applicationName);
 
         const std::string encoding(variables["encoding"].as<std::string>());
         Log(Debug::Info) << ToUTF8::encodingUsingMessage(encoding);
@@ -163,7 +164,7 @@ namespace
 
         VFS::Manager vfs;
 
-        VFS::registerArchives(&vfs, fileCollections, archives, true);
+        VFS::registerArchives(&vfs, fileCollections, archives, true, &encoder.getStatelessEncoder());
 
         Settings::Manager::load(config);
 
@@ -210,5 +211,5 @@ namespace
 
 int main(int argc, char* argv[])
 {
-    return wrapApplication(runPhysicsObjectTool, argc, argv, applicationName);
+    return Debug::wrapApplication(runPhysicsObjectTool, argc, argv, applicationName);
 }

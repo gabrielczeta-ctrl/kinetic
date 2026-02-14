@@ -24,6 +24,7 @@
 #include <components/resource/niffilemanager.hpp>
 #include <components/resource/physicsshapemanager.hpp>
 #include <components/resource/scenemanager.hpp>
+#include <components/sceneutil/workqueue.hpp>
 #include <components/settings/values.hpp>
 #include <components/toutf8/toutf8.hpp>
 #include <components/version/version.hpp>
@@ -42,9 +43,9 @@
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <regex>
 #include <string>
 #include <thread>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -122,6 +123,10 @@ namespace NavMeshTool
             addOption("write-binary-log", bpo::value<bool>()->implicit_value(true)->default_value(false),
                 "write progress in binary messages to be consumed by the launcher");
 
+            addOption("worldspace-filter", bpo::value<std::string>()->default_value(".*"),
+                "Regular expression to filter in specified worldspaces in modified ECMAScript grammar (see "
+                "https://en.cppreference.com/w/cpp/regex/ecmascript.html)");
+
             Files::ConfigurationManager::addCommonOptions(result);
 
             return result;
@@ -187,6 +192,8 @@ namespace NavMeshTool
             const bool removeUnusedTiles = variables["remove-unused-tiles"].as<bool>();
             const bool writeBinaryLog = variables["write-binary-log"].as<bool>();
 
+            const std::regex worldspaceFilter(variables["worldspace-filter"].as<std::string>());
+
 #ifdef WIN32
             if (writeBinaryLog)
                 _setmode(_fileno(stderr), _O_BINARY);
@@ -236,11 +243,42 @@ namespace NavMeshTool
             navigatorSettings.mRecast.mSwimHeightScale
                 = EsmLoader::getGameSetting(esmData.mGameSettings, "fSwimHeightScale").getFloat();
 
-            WorldspaceData cellsData = gatherWorldspaceData(
-                navigatorSettings, readers, vfs, physicsShapeManager, esmData, processInteriorCells, writeBinaryLog);
+            const std::unordered_map<ESM::RefId, std::vector<std::size_t>> worldspaceCells
+                = collectWorldspaceCells(esmData, processInteriorCells, worldspaceFilter);
 
-            const Status status = generateAllNavMeshTiles(agentBounds, navigatorSettings, threadsNumber,
-                removeUnusedTiles, writeBinaryLog, cellsData, std::move(db));
+            Status status = Status::Ok;
+            bool needVacuum = false;
+            std::size_t count = 0;
+
+            SceneUtil::WorkQueue workQueue(threadsNumber);
+
+            Log(Debug::Info) << "Using " << threadsNumber << " parallel workers...";
+
+            for (const auto& [worldspace, cells] : worldspaceCells)
+            {
+                const WorldspaceData worldspaceData = gatherWorldspaceData(
+                    navigatorSettings, readers, vfs, physicsShapeManager, esmData, writeBinaryLog, worldspace, cells);
+
+                const Result result = generateAllNavMeshTiles(
+                    agentBounds, navigatorSettings, removeUnusedTiles, writeBinaryLog, worldspaceData, db, workQueue);
+
+                ++count;
+
+                Log(Debug::Info) << "Processed worldspace (" << count << "/" << worldspaceCells.size() << ") "
+                                 << worldspace;
+
+                status = result.mStatus;
+                needVacuum = needVacuum || result.mNeedVacuum;
+
+                if (status != Status::Ok)
+                    break;
+            }
+
+            if (status == Status::Ok && needVacuum)
+            {
+                Log(Debug::Info) << "Vacuuming the database...";
+                db.vacuum();
+            }
 
             switch (status)
             {

@@ -32,16 +32,16 @@ namespace Resource
         ~PhysicsShapeManager();
 
         /// @note May return a null pointer if the object has no shape.
-        osg::ref_ptr<const PhysicsShape> getShape(const std::string& name);
+        osg::ref_ptr<const PhysicsShape> getShape(VFS::Path::NormalizedView name);
 
         /// Create an instance of the given shape and cache it for later use, so that future calls to getInstance() can
         /// simply return the cached instance instead of having to create a new one.
         /// @note The returned ref_ptr may be kept by the caller to ensure that the instance stays in cache for as long
         /// as needed.
-        osg::ref_ptr<PhysicsShapeInstance> cacheInstance(const std::string& name);
+        osg::ref_ptr<PhysicsShapeInstance> cacheInstance(VFS::Path::NormalizedView name);
 
         /// @note May return a null pointer if the object has no shape.
-        osg::ref_ptr<PhysicsShapeInstance> getInstance(const std::string& name);
+        osg::ref_ptr<PhysicsShapeInstance> getInstance(VFS::Path::NormalizedView name);
 
         /// @see ResourceManager::updateCache
         void updateCache(double referenceTime) override;
@@ -51,7 +51,7 @@ namespace Resource
         void reportStats(unsigned int frameNumber, osg::Stats* stats) const override;
 
     private:
-        osg::ref_ptr<PhysicsShapeInstance> createInstance(const std::string& name);
+        osg::ref_ptr<PhysicsShapeInstance> createInstance(VFS::Path::NormalizedView name);
 
         osg::ref_ptr<MultiObjectCache> mInstanceCache;
         SceneManager* mSceneManager;

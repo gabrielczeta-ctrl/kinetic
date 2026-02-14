@@ -5,6 +5,7 @@
 #include <components/debug/debuglog.hpp>
 
 #include <components/esm/defs.hpp>
+#include <components/esm3/actoridconverter.hpp>
 #include <components/esm3/esmreader.hpp>
 #include <components/esm3/esmwriter.hpp>
 #include <components/esm3/loadbsgn.hpp>
@@ -343,6 +344,10 @@ namespace MWWorld
 
             MWBase::Environment::get().getWorldModel()->deregisterLiveCellRef(mPlayer);
             mPlayer.load(player.mObject);
+            MWBase::Environment::get().getWorldModel()->registerPtr(getPlayer());
+            if (reader.mActorIdConverter)
+                reader.mActorIdConverter->mMappings.emplace(
+                    player.mObject.mCreatureStats.mActorId, mPlayer.mRef.getRefNum());
 
             for (size_t i = 0; i < mSaveAttributes.size(); ++i)
                 mSaveAttributes[i] = player.mSaveAttributes[i];

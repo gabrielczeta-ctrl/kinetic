@@ -76,10 +76,12 @@ namespace Misc::Convert
         return osg::Vec3f(vec.GetX(), vec.GetY(), vec.GetZ());
     }
 
+#ifdef JPH_DOUBLE_PRECISION
     inline osg::Vec3f toOsg(const JPH::Vec3& vec)
     {
         return osg::Vec3f(vec.GetX(), vec.GetY(), vec.GetZ());
     }
+#endif
 
     template <typename T>
     inline T* toPointerFromUserData(uint64_t userData)
@@ -138,10 +140,12 @@ namespace Misc::Convert
         return osg::Vec2f(static_cast<float>(value.GetX()), static_cast<float>(value.GetY()));
     }
 
+#ifdef JPH_DOUBLE_PRECISION
     inline osg::Vec2f toOsgXY(const JPH::Vec3& value)
     {
         return osg::Vec2f(static_cast<float>(value.GetX()), static_cast<float>(value.GetY()));
     }
+#endif
 }
 
 #endif

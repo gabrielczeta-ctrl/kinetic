@@ -110,9 +110,6 @@ namespace MWWorld
         return ptr;
     }
 
-    // Need to instantiate these before they're used
-    template class IndexedStore<ESM::MagicEffect>;
-
     template <class T, class Id>
     TypedDynamicStore<T, Id>::TypedDynamicStore()
     {
@@ -976,10 +973,6 @@ namespace MWWorld
         TypedDynamicStore<ESM::GameSetting>::setUp();
     }
 
-    // Magic effect
-    //=========================================================================
-    Store<ESM::MagicEffect>::Store() {}
-
     // Attribute
     //=========================================================================
 
@@ -1026,6 +1019,19 @@ namespace MWWorld
             .mDescription = std::string{ getGMSTString(settings, "sLucDesc") },
             .mIcon = "icons\\k\\attribute_luck.dds",
             .mWerewolfValue = getGMSTFloat(settings, "fWerewolfLuck") });
+    }
+
+    // Magic Effect
+    //=========================================================================
+
+    void Store<ESM::MagicEffect>::setUp(const MWWorld::Store<ESM::GameSetting>& settings)
+    {
+        for (ESM::MagicEffect* mgef : mShared)
+        {
+            std::string_view gmst = ESM::MagicEffect::refIdToGmstString(mgef->mId);
+            if (!gmst.empty())
+                mgef->mName = getGMSTString(settings, gmst);
+        }
     }
 
     // Dialogue
@@ -1260,7 +1266,7 @@ template class MWWorld::TypedDynamicStore<ESM::ItemLevList>;
 // template class MWWorld::Store<ESM::LandTexture>;
 template class MWWorld::TypedDynamicStore<ESM::Light>;
 template class MWWorld::TypedDynamicStore<ESM::Lockpick>;
-// template class MWWorld::Store<ESM::MagicEffect>;
+template class MWWorld::TypedDynamicStore<ESM::MagicEffect>;
 template class MWWorld::TypedDynamicStore<ESM::Miscellaneous>;
 template class MWWorld::TypedDynamicStore<ESM::NPC>;
 // template class MWWorld::Store<ESM::Pathgrid>;

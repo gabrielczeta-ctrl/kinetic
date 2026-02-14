@@ -156,8 +156,8 @@ namespace MWPhysics
         bool result = false;
         for (const auto& [recordIndex, shapeIndex] : mShapeInstance->mAnimatedShapes)
         {
-            auto nodePathFound = mRecordIndexToNodePath.find(recordIndex);
-            if (nodePathFound == mRecordIndexToNodePath.end())
+            auto nodePathFound = mRecIndexToNodePath.find(recordIndex);
+            if (nodePathFound == mRecIndexToNodePath.end())
             {
                 NifOsg::FindGroupByRecordIndex visitor(recordIndex);
                 mPtr.getRefData().getBaseNode()->accept(visitor);
@@ -172,7 +172,7 @@ namespace MWPhysics
                 }
                 osg::NodePath nodePath = visitor.mFoundPath;
                 nodePath.erase(nodePath.begin());
-                nodePathFound = mRecordIndexToNodePath.emplace(recordIndex, nodePath).first;
+                nodePathFound = mRecIndexToNodePath.emplace(recordIndex, nodePath).first;
             }
 
             assert(static_cast<int>(compound->GetNumSubShapes()) > shapeIndex);

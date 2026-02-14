@@ -5,7 +5,9 @@
 #include <components/detournavigator/makenavmesh.hpp>
 #include <components/detournavigator/navmeshdbutils.hpp>
 #include <components/detournavigator/serialization.hpp>
+#include <components/files/conversion.hpp>
 #include <components/loadinglistener/loadinglistener.hpp>
+#include <components/testing/util.hpp>
 
 #include <Jolt/Jolt.h>
 #include <Jolt/Physics/Body/Body.h>
@@ -37,7 +39,8 @@ namespace
     {
         const ObjectId id(&shape);
         osg::ref_ptr<Resource::PhysicsShape> physicsShape(new Resource::PhysicsShape);
-        physicsShape->mFileName = "test.nif";
+        constexpr VFS::Path::NormalizedView test("test.nif");
+        physicsShape->mFileName = test;
         physicsShape->mFileHash = "test_hash";
         ObjectTransform objectTransform;
         std::fill(std::begin(objectTransform.mPosition.pos), std::end(objectTransform.mPosition.pos), 0.1f);
@@ -56,7 +59,7 @@ namespace
         OffMeshConnectionsManager mOffMeshConnectionsManager{ mSettings.mRecast };
         const AgentBounds mAgentBounds{ CollisionShapeType::Aabb, { 29, 29, 66 } };
         const TilePosition mPlayerTile{ 0, 0 };
-        const std::string mWorldspace = "sys::default";
+        const ESM::RefId mWorldspace = ESM::RefId::stringRefId("sys::default");
         const JPH::BoxShape mBox{ JPH::Vec3(100, 100, 20) };
         Loading::Listener mListener;
     };
@@ -270,20 +273,11 @@ namespace
         updater.post(mAgentBounds, navMeshCacheItem, mPlayerTile, mWorldspace, changedTiles);
         updater.wait(WaitConditionType::allJobsDone, &mListener);
         updater.stop();
-        const std::set<TilePosition> present{
-            TilePosition(-1, -1),
-            TilePosition(-1, 0),
-            TilePosition(-1, 1),
-            TilePosition(0, -2),
-            TilePosition(0, -1),
-            TilePosition(0, 0),
-            TilePosition(0, 1),
-            TilePosition(0, 2),
-            TilePosition(1, -1),
-            TilePosition(1, 0),
-            TilePosition(1, 1),
-        };
+
+        std::size_t present = 0;
+
         for (int x = -5; x <= 5; ++x)
+        {
             for (int y = -5; y <= 5; ++y)
             {
                 const TilePosition tilePosition(x, y);
@@ -293,15 +287,15 @@ namespace
                     recastMesh->getMeshSources(), [&](const MeshSource& v) { return resolveMeshSource(*dbPtr, v); });
                 if (std::holds_alternative<MeshSource>(objects))
                     continue;
-                EXPECT_EQ(dbPtr
-                              ->findTile(mWorldspace, tilePosition,
-                                  serialize(mSettings.mRecast, mAgentBounds, *recastMesh,
-                                      std::get<std::vector<DbRefGeometryObject>>(objects)))
-                              .has_value(),
-                    present.find(tilePosition) != present.end())
-                    << tilePosition.x() << " " << tilePosition.y()
-                    << " present=" << (present.find(tilePosition) != present.end());
+                present += dbPtr
+                               ->findTile(mWorldspace, tilePosition,
+                                   serialize(mSettings.mRecast, mAgentBounds, *recastMesh,
+                                       std::get<std::vector<DbRefGeometryObject>>(objects)))
+                               .has_value();
             }
+        }
+
+        EXPECT_EQ(present, 11);
     }
 
     TEST_F(DetourNavigatorAsyncNavMeshUpdaterTest, next_tile_id_should_be_updated_on_duplicate)
@@ -314,7 +308,7 @@ namespace
         AsyncNavMeshUpdater updater(mSettings, mRecastMeshManager, mOffMeshConnectionsManager, std::move(db));
 
         const TileId nextTileId(dbPtr->getMaxTileId() + 1);
-        ASSERT_EQ(dbPtr->insertTile(nextTileId, "worldspace", TilePosition{}, TileVersion{ 1 }, {}, {}), 1);
+        ASSERT_EQ(dbPtr->insertTile(nextTileId, mWorldspace, TilePosition{}, TileVersion{ 1 }, {}, {}), 1);
 
         const auto navMeshCacheItem = std::make_shared<GuardedNavMeshCacheItem>(1, mSettings);
         const TilePosition tilePosition{ 0, 0 };
@@ -384,12 +378,112 @@ namespace
         }
     }
 
+    TEST_F(DetourNavigatorAsyncNavMeshUpdaterTest, should_write_debug_recast_mesh)
+    {
+        mRecastMeshManager.setWorldspace(mWorldspace, nullptr);
+        addHeightFieldPlane(mRecastMeshManager);
+        mSettings.mEnableWriteRecastMeshToFile = true;
+        const std::filesystem::path dir = TestingOpenMW::outputDirPath("DetourNavigatorAsyncNavMeshUpdaterTest");
+        mSettings.mRecastMeshPathPrefix = Files::pathToUnicodeString(dir) + "/";
+        Log(Debug::Verbose) << mSettings.mRecastMeshPathPrefix;
+        AsyncNavMeshUpdater updater(mSettings, mRecastMeshManager, mOffMeshConnectionsManager, nullptr);
+        const auto navMeshCacheItem = std::make_shared<GuardedNavMeshCacheItem>(1, mSettings);
+        const std::map<TilePosition, ChangeType> changedTiles{ { TilePosition{ 0, 0 }, ChangeType::add } };
+        updater.post(mAgentBounds, navMeshCacheItem, mPlayerTile, mWorldspace, changedTiles);
+        updater.wait(WaitConditionType::allJobsDone, &mListener);
+        EXPECT_TRUE(std::filesystem::exists(dir / "0.0.recastmesh.obj"));
+    }
+
+    TEST_F(DetourNavigatorAsyncNavMeshUpdaterTest, should_write_debug_recast_mesh_with_revision)
+    {
+        mRecastMeshManager.setWorldspace(mWorldspace, nullptr);
+        addHeightFieldPlane(mRecastMeshManager);
+        mSettings.mEnableWriteRecastMeshToFile = true;
+        mSettings.mEnableRecastMeshFileNameRevision = true;
+        const std::filesystem::path dir = TestingOpenMW::outputDirPath("DetourNavigatorAsyncNavMeshUpdaterTest");
+        mSettings.mRecastMeshPathPrefix = Files::pathToUnicodeString(dir) + "/";
+        Log(Debug::Verbose) << mSettings.mRecastMeshPathPrefix;
+        AsyncNavMeshUpdater updater(mSettings, mRecastMeshManager, mOffMeshConnectionsManager, nullptr);
+        const auto navMeshCacheItem = std::make_shared<GuardedNavMeshCacheItem>(1, mSettings);
+        const std::map<TilePosition, ChangeType> changedTiles{ { TilePosition{ 0, 0 }, ChangeType::add } };
+        updater.post(mAgentBounds, navMeshCacheItem, mPlayerTile, mWorldspace, changedTiles);
+        updater.wait(WaitConditionType::allJobsDone, &mListener);
+        EXPECT_TRUE(std::filesystem::exists(dir / "0.0.recastmesh.1.2.obj"));
+    }
+
+    TEST_F(DetourNavigatorAsyncNavMeshUpdaterTest, writing_recast_mesh_to_absent_file_should_not_fail_tile_generation)
+    {
+        mRecastMeshManager.setWorldspace(mWorldspace, nullptr);
+        addHeightFieldPlane(mRecastMeshManager);
+        mSettings.mEnableWriteRecastMeshToFile = true;
+        const std::filesystem::path dir = TestingOpenMW::outputDir() / "absent";
+        mSettings.mRecastMeshPathPrefix = Files::pathToUnicodeString(dir) + "/";
+        Log(Debug::Verbose) << mSettings.mRecastMeshPathPrefix;
+        AsyncNavMeshUpdater updater(mSettings, mRecastMeshManager, mOffMeshConnectionsManager, nullptr);
+        const auto navMeshCacheItem = std::make_shared<GuardedNavMeshCacheItem>(1, mSettings);
+        const std::map<TilePosition, ChangeType> changedTiles{ { TilePosition{ 0, 0 }, ChangeType::add } };
+        updater.post(mAgentBounds, navMeshCacheItem, mPlayerTile, mWorldspace, changedTiles);
+        updater.wait(WaitConditionType::allJobsDone, &mListener);
+        EXPECT_NE(navMeshCacheItem->lockConst()->getImpl().getTileRefAt(0, 0, 0), 0u);
+        EXPECT_FALSE(std::filesystem::exists(dir));
+    }
+
+    TEST_F(DetourNavigatorAsyncNavMeshUpdaterTest, should_write_debug_navmesh)
+    {
+        mRecastMeshManager.setWorldspace(mWorldspace, nullptr);
+        addHeightFieldPlane(mRecastMeshManager);
+        mSettings.mEnableWriteNavMeshToFile = true;
+        const std::filesystem::path dir = TestingOpenMW::outputDirPath("DetourNavigatorAsyncNavMeshUpdaterTest");
+        mSettings.mNavMeshPathPrefix = Files::pathToUnicodeString(dir) + "/";
+        Log(Debug::Verbose) << mSettings.mRecastMeshPathPrefix;
+        AsyncNavMeshUpdater updater(mSettings, mRecastMeshManager, mOffMeshConnectionsManager, nullptr);
+        const auto navMeshCacheItem = std::make_shared<GuardedNavMeshCacheItem>(1, mSettings);
+        const std::map<TilePosition, ChangeType> changedTiles{ { TilePosition{ 0, 0 }, ChangeType::add } };
+        updater.post(mAgentBounds, navMeshCacheItem, mPlayerTile, mWorldspace, changedTiles);
+        updater.wait(WaitConditionType::allJobsDone, &mListener);
+        EXPECT_TRUE(std::filesystem::exists(dir / "all_tiles_navmesh.bin"));
+    }
+
+    TEST_F(DetourNavigatorAsyncNavMeshUpdaterTest, should_write_debug_navmesh_with_revision)
+    {
+        mRecastMeshManager.setWorldspace(mWorldspace, nullptr);
+        addHeightFieldPlane(mRecastMeshManager);
+        mSettings.mEnableWriteNavMeshToFile = true;
+        mSettings.mEnableNavMeshFileNameRevision = true;
+        const std::filesystem::path dir = TestingOpenMW::outputDirPath("DetourNavigatorAsyncNavMeshUpdaterTest");
+        mSettings.mNavMeshPathPrefix = Files::pathToUnicodeString(dir) + "/";
+        Log(Debug::Verbose) << mSettings.mRecastMeshPathPrefix;
+        AsyncNavMeshUpdater updater(mSettings, mRecastMeshManager, mOffMeshConnectionsManager, nullptr);
+        const auto navMeshCacheItem = std::make_shared<GuardedNavMeshCacheItem>(1, mSettings);
+        const std::map<TilePosition, ChangeType> changedTiles{ { TilePosition{ 0, 0 }, ChangeType::add } };
+        updater.post(mAgentBounds, navMeshCacheItem, mPlayerTile, mWorldspace, changedTiles);
+        updater.wait(WaitConditionType::allJobsDone, &mListener);
+        EXPECT_TRUE(std::filesystem::exists(dir / "all_tiles_navmesh.1.1.bin"));
+    }
+
+    TEST_F(DetourNavigatorAsyncNavMeshUpdaterTest, writing_navmesh_to_absent_file_should_not_fail_tile_generation)
+    {
+        mRecastMeshManager.setWorldspace(mWorldspace, nullptr);
+        addHeightFieldPlane(mRecastMeshManager);
+        mSettings.mEnableWriteNavMeshToFile = true;
+        const std::filesystem::path dir = TestingOpenMW::outputDir() / "absent";
+        mSettings.mNavMeshPathPrefix = Files::pathToUnicodeString(dir) + "/";
+        Log(Debug::Verbose) << mSettings.mRecastMeshPathPrefix;
+        AsyncNavMeshUpdater updater(mSettings, mRecastMeshManager, mOffMeshConnectionsManager, nullptr);
+        const auto navMeshCacheItem = std::make_shared<GuardedNavMeshCacheItem>(1, mSettings);
+        const std::map<TilePosition, ChangeType> changedTiles{ { TilePosition{ 0, 0 }, ChangeType::add } };
+        updater.post(mAgentBounds, navMeshCacheItem, mPlayerTile, mWorldspace, changedTiles);
+        updater.wait(WaitConditionType::allJobsDone, &mListener);
+        EXPECT_NE(navMeshCacheItem->lockConst()->getImpl().getTileRefAt(0, 0, 0), 0u);
+        EXPECT_FALSE(std::filesystem::exists(dir));
+    }
+
     struct DetourNavigatorSpatialJobQueueTest : Test
     {
         const AgentBounds mAgentBounds{ CollisionShapeType::Aabb, osg::Vec3f(1, 1, 1) };
         const std::shared_ptr<GuardedNavMeshCacheItem> mNavMeshCacheItemPtr;
         const std::weak_ptr<GuardedNavMeshCacheItem> mNavMeshCacheItem = mNavMeshCacheItemPtr;
-        const std::string_view mWorldspace = "worldspace";
+        const ESM::RefId mWorldspace = ESM::RefId::stringRefId("worldspace");
         const TilePosition mChangedTile{ 0, 0 };
         const std::chrono::steady_clock::time_point mProcessTime{};
         const TilePosition mPlayerTile{ 0, 0 };
@@ -401,20 +495,23 @@ namespace
         std::list<Job> jobs;
         SpatialJobQueue queue;
 
-        queue.push(jobs.emplace(jobs.end(), mAgentBounds, mNavMeshCacheItem, "worldspace1", mChangedTile,
-            ChangeType::remove, mProcessTime));
-        queue.push(jobs.emplace(jobs.end(), mAgentBounds, mNavMeshCacheItem, "worldspace2", mChangedTile,
-            ChangeType::update, mProcessTime));
+        const ESM::RefId worldspace1 = ESM::RefId::stringRefId("worldspace1");
+        const ESM::RefId worldspace2 = ESM::RefId::stringRefId("worldspace2");
+
+        queue.push(jobs.emplace(
+            jobs.end(), mAgentBounds, mNavMeshCacheItem, worldspace1, mChangedTile, ChangeType::remove, mProcessTime));
+        queue.push(jobs.emplace(
+            jobs.end(), mAgentBounds, mNavMeshCacheItem, worldspace2, mChangedTile, ChangeType::update, mProcessTime));
 
         ASSERT_EQ(queue.size(), 2);
 
         const auto job1 = queue.pop(mChangedTile);
         ASSERT_TRUE(job1.has_value());
-        EXPECT_EQ((*job1)->mWorldspace, "worldspace1");
+        EXPECT_EQ((*job1)->mWorldspace, worldspace1);
 
         const auto job2 = queue.pop(mChangedTile);
         ASSERT_TRUE(job2.has_value());
-        EXPECT_EQ((*job2)->mWorldspace, "worldspace2");
+        EXPECT_EQ((*job2)->mWorldspace, worldspace2);
 
         EXPECT_EQ(queue.size(), 0);
     }

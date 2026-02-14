@@ -1256,11 +1256,14 @@ namespace MWMechanics
         if (mAttackStrength == -1.f)
             mAttackStrength = std::min(1.f, 0.1f + Misc::Rng::rollClosedProbability(prng));
         ESM::WeaponType::Class weapclass = getWeaponType(mWeaponType)->mWeaponClass;
-        if (weapclass != ESM::WeaponType::Ranged && weapclass != ESM::WeaponType::Thrown)
+        if (weapclass != ESM::WeaponType::Ranged)
         {
-            mAttackSuccess = mPtr.getClass().evaluateHit(mPtr, mAttackVictim, mAttackHitPos);
-            if (!mAttackSuccess)
-                mAttackStrength = 0.f;
+            if (weapclass != ESM::WeaponType::Thrown)
+            {
+                mAttackSuccess = mPtr.getClass().evaluateHit(mPtr, mAttackVictim, mAttackHitPos);
+                if (!mAttackSuccess)
+                    mAttackStrength = 0.f;
+            }
             playSwishSound();
         }
 
@@ -2803,19 +2806,19 @@ namespace MWMechanics
         // Stop any effects that are no longer active
         std::vector<std::string_view> effects = mAnimation->getLoopingEffects();
 
-        for (std::string_view effectId : effects)
+        for (std::string_view effectStr : effects)
         {
-            auto index = ESM::MagicEffect::indexNameToIndex(effectId);
+            auto effectId = ESM::RefId::deserializeText(effectStr);
 
-            if (index >= 0
+            if (MWBase::Environment::get().getESMStore()->get<ESM::MagicEffect>().search(effectId)
                 && (mPtr.getClass().getCreatureStats(mPtr).isDeathAnimationFinished()
                     || mPtr.getClass()
                             .getCreatureStats(mPtr)
                             .getMagicEffects()
-                            .getOrDefault(MWMechanics::EffectKey(index))
+                            .getOrDefault(MWMechanics::EffectKey(effectId))
                             .getMagnitude()
                         <= 0))
-                mAnimation->removeEffect(effectId);
+                mAnimation->removeEffect(effectStr);
         }
     }
 

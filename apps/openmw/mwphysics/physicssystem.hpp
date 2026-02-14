@@ -244,6 +244,9 @@ namespace MWPhysics
         /// be overwritten. Valid until the next call to stepSimulation
         void queueObjectMovement(const MWWorld::Ptr& ptr, const osg::Vec3f& velocity);
 
+        /// Force a collision-shape animation update for a single object.
+        void updateAnimatedCollisionShape(const MWWorld::Ptr& ptr);
+
         /// Clear the queued movements list without applying.
         void clearQueuedMovement();
 
@@ -279,6 +282,8 @@ namespace MWPhysics
 
         bool isAreaOccupiedByOtherActor(const osg::Vec3f& position, const float radius,
             std::span<const MWWorld::ConstPtr> ignore, std::vector<MWWorld::Ptr>* occupyingActors) const;
+
+        float getPhysicsDt() const { return mPhysicsDt; }
 
         void reportStats(unsigned int frameNumber, osg::Stats& stats) const;
 

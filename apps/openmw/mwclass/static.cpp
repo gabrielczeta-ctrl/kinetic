@@ -40,7 +40,7 @@ namespace MWClass
     void Static::insertObjectPhysics(const MWWorld::Ptr& ptr, const std::string& model, const osg::Quat& rotation,
         MWPhysics::PhysicsSystem& physics) const
     {
-        physics.addObject(ptr, model, rotation, MWPhysics::Layers::WORLD);
+        physics.addObject(ptr, VFS::Path::toNormalized(model), rotation, MWPhysics::Layers::WORLD);
     }
 
     std::string_view Static::getModel(const MWWorld::ConstPtr& ptr) const

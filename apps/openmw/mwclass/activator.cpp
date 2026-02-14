@@ -9,6 +9,7 @@
 #include <components/esm3/loadsoun.hpp>
 #include <components/misc/rng.hpp>
 #include <components/sceneutil/positionattitudetransform.hpp>
+#include <components/vfs/pathutil.hpp>
 
 #include "../mwbase/environment.hpp"
 #include "../mwbase/windowmanager.hpp"
@@ -59,7 +60,7 @@ namespace MWClass
     void Activator::insertObjectPhysics(const MWWorld::Ptr& ptr, const std::string& model, const osg::Quat& rotation,
         MWPhysics::PhysicsSystem& physics) const
     {
-        physics.addObject(ptr, model, rotation, MWPhysics::Layers::WORLD);
+        physics.addObject(ptr, VFS::Path::toNormalized(model), rotation, MWPhysics::Layers::WORLD);
     }
 
     std::string_view Activator::getModel(const MWWorld::ConstPtr& ptr) const
@@ -161,7 +162,7 @@ namespace MWClass
         {
             std::vector<const ESM::SoundGenerator*> sounds;
             for (auto sound = store.get<ESM::SoundGenerator>().begin(); sound != store.get<ESM::SoundGenerator>().end();
-                 ++sound)
+                ++sound)
             {
                 if (type == sound->mType && !sound->mCreature.empty() && (*creatureId == sound->mCreature))
                     sounds.push_back(&*sound);
@@ -178,7 +179,7 @@ namespace MWClass
         {
             // The activator doesn't have a corresponding creature ID, but we can try to use the defaults
             for (auto sound = store.get<ESM::SoundGenerator>().begin(); sound != store.get<ESM::SoundGenerator>().end();
-                 ++sound)
+                ++sound)
                 if (type == sound->mType && sound->mCreature.empty())
                     fallbacksounds.push_back(&*sound);
 

@@ -311,7 +311,7 @@ namespace MWPhysics
 
     PhysicsTaskScheduler::~PhysicsTaskScheduler() {}
 
-    std::tuple<int, float> PhysicsTaskScheduler::calculateStepConfig(float timeAccum) const
+    std::tuple<unsigned, float> PhysicsTaskScheduler::calculateStepConfig(float timeAccum) const
     {
         int maxAllowedSteps = 2;
         int numSteps = timeAccum / mDefaultPhysicsDt;
@@ -354,7 +354,7 @@ namespace MWPhysics
             actualDelta = std::max(actualDelta, mDefaultPhysicsDt);
         }
 
-        return std::make_tuple(numSteps, actualDelta);
+        return std::make_tuple(static_cast<unsigned>(numSteps), actualDelta);
     }
 
     void PhysicsTaskScheduler::applyQueuedMovements(float& timeAccum, std::vector<Simulation>& simulations,
@@ -410,8 +410,8 @@ namespace MWPhysics
             // physics system must call syncSimulation to guarantee they have completed
             assert(mSimulationBarrier == nullptr);
             mSimulationBarrier = mJobSystem->CreateBarrier();
-            JPH::JobHandle handle = mJobSystem->CreateJob(
-                "MWSimulation", JPH::Color::sBlue, [this]() { doSimulation(); }, 0);
+            JPH::JobHandle handle
+                = mJobSystem->CreateJob("MWSimulation", JPH::Color::sBlue, [this]() { doSimulation(); }, 0);
             mSimulationBarrier->AddJob(handle);
         }
     }

@@ -3,7 +3,9 @@
 
 #include <cassert>
 #include <filesystem>
+#include <optional>
 
+#include "cellgridbounds.hpp"
 #include "heightfieldshape.hpp"
 #include "objectid.hpp"
 #include "objecttransform.hpp"
@@ -88,16 +90,14 @@ namespace DetourNavigator
         virtual void removeAgent(const AgentBounds& agentBounds) = 0;
 
         /**
-         * @brief setWorldspace should be called before adding object from new worldspace
-         * @param worldspace
-         */
-        virtual void setWorldspace(std::string_view worldspace, const UpdateGuard* guard) = 0;
-
-        /**
          * @brief updateBounds should be called before adding object from loading cell
+         * @param worldspace worldspace of loading cell
+         * @param cellGridBounds bounds of loaded exterior cells around the player
          * @param playerPosition corresponds to the bounds center
          */
-        virtual void updateBounds(const osg::Vec3f& playerPosition, const UpdateGuard* guard) = 0;
+        virtual void updateBounds(ESM::RefId worldspace, const std::optional<CellGridBounds>& cellGridBounds,
+            const osg::Vec3f& playerPosition, const UpdateGuard* guard)
+            = 0;
 
         /**
          * @brief addObject is used to add complex object with allowed to walk and avoided to walk shapes

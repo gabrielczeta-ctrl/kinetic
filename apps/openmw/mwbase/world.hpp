@@ -196,9 +196,6 @@ namespace MWBase
         ///< Return a pointer to a liveCellRef with the given name.
         /// \param activeOnly do non search inactive cells.
 
-        virtual MWWorld::Ptr searchPtrViaActorId(int actorId) = 0;
-        ///< Search is limited to the active cells.
-
         virtual MWWorld::Ptr findContainer(const MWWorld::ConstPtr& ptr) = 0;
         ///< Return a pointer to a liveCellRef which contains \a ptr.
         /// \note Search is limited to the active cells.
@@ -311,6 +308,8 @@ namespace MWBase
         ///< Queues movement for \a ptr (in local space), to be applied in the next call to
         /// doPhysics.
 
+        virtual void updateAnimatedCollisionShape(const MWWorld::Ptr& ptr) = 0;
+
         virtual const MWPhysics::RayCastingInterface* getRayCasting() const = 0;
 
         virtual bool castRenderingRay(MWPhysics::RayCastingResult& res, const osg::Vec3f& from, const osg::Vec3f& to,
@@ -373,7 +372,7 @@ namespace MWBase
         virtual void applyDeferredPreviewRotationToPlayer(float dt) = 0;
         virtual void disableDeferredPreviewRotation() = 0;
 
-        virtual void saveLoaded() = 0;
+        virtual void saveLoaded(const ESM::ESMReader& reader) = 0;
 
         virtual void setupPlayer() = 0;
         virtual void renderPlayer() = 0;

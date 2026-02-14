@@ -92,9 +92,15 @@ namespace
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                -1, -1, 0, // vertex 0
-                -1, 1, 0, // vertex 1
-                1, -1, 0, // vertex 2
+                -1,
+                -1,
+                0, // vertex 0
+                -1,
+                1,
+                0, // vertex 1
+                1,
+                -1,
+                0, // vertex 2
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0 }));
@@ -121,9 +127,15 @@ namespace
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                0, 0, 3, // vertex 0
-                0, 4, 3, // vertex 1
-                2, 0, 3, // vertex 2
+                0,
+                0,
+                3, // vertex 0
+                0,
+                4,
+                3, // vertex 1
+                2,
+                0,
+                3, // vertex 2
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0 }));
@@ -151,22 +163,54 @@ namespace
 
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                -1.5, 0.0, -1.5, // vertex 0
-                -1.5, 0.0, -0.5, // vertex 1
-                -1.5, 0.0, 0.5, // vertex 2
-                -1.5, 0.0, 1.5, // vertex 3
-                -0.5, 0.0, -1.5, // vertex 4
-                -0.5, 0.0, -0.5, // vertex 5
-                -0.5, 0.0, 0.5, // vertex 6
-                -0.5, 0.0, 1.5, // vertex 7
-                0.5, 0.0, -1.5, // vertex 8
-                0.5, 0.0, -0.5, // vertex 9
-                0.5, 0.0, 0.5, // vertex 10
-                0.5, 0.0, 1.5, // vertex 11
-                1.5, 0.0, -1.5, // vertex 12
-                1.5, 0.0, -0.5, // vertex 13
-                1.5, 0.0, 0.5, // vertex 14
-                1.5, 0.0, 1.5, // vertex 15
+                -1.5,
+                0.0,
+                -1.5, // vertex 0
+                -1.5,
+                0.0,
+                -0.5, // vertex 1
+                -1.5,
+                0.0,
+                0.5, // vertex 2
+                -1.5,
+                0.0,
+                1.5, // vertex 3
+                -0.5,
+                0.0,
+                -1.5, // vertex 4
+                -0.5,
+                0.0,
+                -0.5, // vertex 5
+                -0.5,
+                0.0,
+                0.5, // vertex 6
+                -0.5,
+                0.0,
+                1.5, // vertex 7
+                0.5,
+                0.0,
+                -1.5, // vertex 8
+                0.5,
+                0.0,
+                -0.5, // vertex 9
+                0.5,
+                0.0,
+                0.5, // vertex 10
+                0.5,
+                0.0,
+                1.5, // vertex 11
+                1.5,
+                0.0,
+                -1.5, // vertex 12
+                1.5,
+                0.0,
+                -0.5, // vertex 13
+                1.5,
+                0.0,
+                0.5, // vertex 14
+                1.5,
+                0.0,
+                1.5, // vertex 15
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(),
@@ -187,30 +231,70 @@ namespace
 
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                -1, -1, -2, // vertex 0
-                -1, -1, 2, // vertex 1
-                -1, 1, -2, // vertex 2
-                -1, 1, 2, // vertex 3
-                1, -1, -2, // vertex 4
-                1, -1, 2, // vertex 5
-                1, 1, -2, // vertex 6
-                1, 1, 2, // vertex 7
+                -1,
+                -1,
+                -2, // vertex 0
+                -1,
+                -1,
+                2, // vertex 1
+                -1,
+                1,
+                -2, // vertex 2
+                -1,
+                1,
+                2, // vertex 3
+                1,
+                -1,
+                -2, // vertex 4
+                1,
+                -1,
+                2, // vertex 5
+                1,
+                1,
+                -2, // vertex 6
+                1,
+                1,
+                2, // vertex 7
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(),
             std::vector<int>({
-                0, 4, 2, // triangle 0
-                1, 0, 2, // triangle 1
-                1, 5, 0, // triangle 2
-                3, 1, 2, // triangle 3
-                4, 5, 7, // triangle 4
-                4, 6, 2, // triangle 5
-                5, 1, 3, // triangle 6
-                5, 4, 0, // triangle 7
-                6, 4, 7, // triangle 8
-                6, 7, 2, // triangle 9
-                7, 3, 2, // triangle 10
-                7, 5, 3, // triangle 11
+                0,
+                4,
+                2, // triangle 0
+                1,
+                0,
+                2, // triangle 1
+                1,
+                5,
+                0, // triangle 2
+                3,
+                1,
+                2, // triangle 3
+                4,
+                5,
+                7, // triangle 4
+                4,
+                6,
+                2, // triangle 5
+                5,
+                1,
+                3, // triangle 6
+                5,
+                4,
+                0, // triangle 7
+                6,
+                4,
+                7, // triangle 8
+                6,
+                7,
+                2, // triangle 9
+                7,
+                3,
+                2, // triangle 10
+                7,
+                5,
+                3, // triangle 11
             }))
             << recastMesh->getMesh().getIndices();
         EXPECT_EQ(recastMesh->getMesh().getAreaTypes(), std::vector<AreaType>(12, AreaType_ground));
@@ -252,36 +336,88 @@ namespace
 
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                -1, -1, -2, // vertex 0
-                -1, -1, 0, // vertex 1
-                -1, -1, 2, // vertex 2
-                -1, 1, -2, // vertex 3
-                -1, 1, 0, // vertex 4
-                -1, 1, 2, // vertex 5
-                1, -1, -2, // vertex 6
-                1, -1, 0, // vertex 7
-                1, -1, 2, // vertex 8
-                1, 1, -2, // vertex 9
-                1, 1, 0, // vertex 10
-                1, 1, 2, // vertex 11
+                -1,
+                -1,
+                -2, // vertex 0
+                -1,
+                -1,
+                0, // vertex 1
+                -1,
+                -1,
+                2, // vertex 2
+                -1,
+                1,
+                -2, // vertex 3
+                -1,
+                1,
+                0, // vertex 4
+                -1,
+                1,
+                2, // vertex 5
+                1,
+                -1,
+                -2, // vertex 6
+                1,
+                -1,
+                0, // vertex 7
+                1,
+                -1,
+                2, // vertex 8
+                1,
+                1,
+                -2, // vertex 9
+                1,
+                1,
+                0, // vertex 10
+                1,
+                1,
+                2, // vertex 11
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(),
             std::vector<int>({
-                0, 6, 3, // triangle 0
-                2, 0, 3, // triangle 1
-                2, 8, 0, // triangle 2
-                5, 2, 3, // triangle 3
-                6, 8, 11, // triangle 4
-                6, 9, 3, // triangle 5
-                7, 4, 1, // triangle 6
-                7, 4, 10, // triangle 7
-                8, 2, 5, // triangle 8
-                8, 6, 0, // triangle 9
-                9, 6, 11, // triangle 10
-                9, 11, 3, // triangle 11
-                11, 5, 3, // triangle 12
-                11, 8, 5, // triangle 13
+                0,
+                6,
+                3, // triangle 0
+                2,
+                0,
+                3, // triangle 1
+                2,
+                8,
+                0, // triangle 2
+                5,
+                2,
+                3, // triangle 3
+                6,
+                8,
+                11, // triangle 4
+                6,
+                9,
+                3, // triangle 5
+                7,
+                4,
+                1, // triangle 6
+                7,
+                4,
+                10, // triangle 7
+                8,
+                2,
+                5, // triangle 8
+                8,
+                6,
+                0, // triangle 9
+                9,
+                6,
+                11, // triangle 10
+                9,
+                11,
+                3, // triangle 11
+                11,
+                5,
+                3, // triangle 12
+                11,
+                8,
+                5, // triangle 13
             }))
             << recastMesh->getMesh().getIndices();
         EXPECT_EQ(recastMesh->getMesh().getAreaTypes(), std::vector<AreaType>(14, AreaType_ground));
@@ -311,9 +447,15 @@ namespace
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                0, 0, 3, // vertex 0
-                0, 4, 3, // vertex 1
-                2, 0, 3, // vertex 2
+                0,
+                0,
+                3, // vertex 0
+                0,
+                4,
+                3, // vertex 1
+                2,
+                0,
+                3, // vertex 2
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0 }));
@@ -346,9 +488,15 @@ namespace
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                1, 2, 12, // vertex 0
-                1, 10, 12, // vertex 1
-                3, 2, 12, // vertex 2
+                1,
+                2,
+                12, // vertex 0
+                1,
+                10,
+                12, // vertex 1
+                3,
+                2,
+                12, // vertex 2
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0 }));
@@ -379,12 +527,24 @@ namespace
         // NOTE: jolt mesh shape triangle walk causes this inprecision
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                -3, -3, 0, // vertex 0
-                -3, -1.999999523162841796875, 0, // vertex 1
-                -1.999999523162841796875, -3, 0, // vertex 2
-                -0.99999904632568359375, -0.99999904632568359375, 0, // vertex 3
-                -0.99999904632568359375, 1, 0, // vertex 4
-                1, -0.99999904632568359375, 0, // vertex 5
+                -3,
+                -3,
+                0, // vertex 0
+                -3,
+                -1.999999523162841796875,
+                0, // vertex 1
+                -1.999999523162841796875,
+                -3,
+                0, // vertex 2
+                -0.99999904632568359375,
+                -0.99999904632568359375,
+                0, // vertex 3
+                -0.99999904632568359375,
+                1,
+                0, // vertex 4
+                1,
+                -0.99999904632568359375,
+                0, // vertex 5
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0, 5, 4, 3 }));
@@ -418,9 +578,15 @@ namespace
         // NOTE: jolt mesh shape triangle walk causes this inprecision
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                -3, -3, 0, // vertex 0
-                -3, -1.999999523162841796875, 0, // vertex 1
-                -1.999999523162841796875, -3, 0, // vertex 2
+                -3,
+                -3,
+                0, // vertex 0
+                -3,
+                -1.999999523162841796875,
+                0, // vertex 1
+                -1.999999523162841796875,
+                -3,
+                0, // vertex 2
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0 }));
@@ -455,9 +621,15 @@ namespace
         EXPECT_THAT(recastMesh->getMesh().getVertices(),
             Pointwise(FloatNear(1e-5f),
                 std::vector<float>({
-                    0, -4.24264049530029296875f, 4.44089209850062616169452667236328125e-16f, // vertex 0
-                    0, -3.535533905029296875f, -0.707106769084930419921875f, // vertex 1
-                    0, -3.535533905029296875f, 0.707106769084930419921875f, // vertex 2
+                    0,
+                    -4.24264049530029296875f,
+                    4.44089209850062616169452667236328125e-16f, // vertex 0
+                    0,
+                    -3.535533905029296875f,
+                    -0.707106769084930419921875f, // vertex 1
+                    0,
+                    -3.535533905029296875f,
+                    0.707106769084930419921875f, // vertex 2
                 })))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 1, 2, 0 }));
@@ -492,9 +664,15 @@ namespace
         EXPECT_THAT(recastMesh->getMesh().getVertices(),
             Pointwise(FloatNear(1e-5f),
                 std::vector<float>({
-                    -4.24264049530029296875f, 0, 4.44089209850062616169452667236328125e-16f, // vertex 0
-                    -3.535533905029296875f, 0, -0.707106769084930419921875f, // vertex 1
-                    -3.535533905029296875f, 0, 0.707106769084930419921875f, // vertex 2
+                    -4.24264049530029296875f,
+                    0,
+                    4.44089209850062616169452667236328125e-16f, // vertex 0
+                    -3.535533905029296875f,
+                    0,
+                    -0.707106769084930419921875f, // vertex 1
+                    -3.535533905029296875f,
+                    0,
+                    0.707106769084930419921875f, // vertex 2
                 })))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 1, 2, 0 }));
@@ -529,9 +707,15 @@ namespace
         EXPECT_THAT(recastMesh->getMesh().getVertices(),
             Pointwise(FloatNear(1e-5f),
                 std::vector<float>({
-                    -1.41421353816986083984375f, -1.1102230246251565404236316680908203125e-16f, 0, // vertex 0
-                    1.1102230246251565404236316680908203125e-16f, -1.41421353816986083984375f, 0, // vertex 1
-                    1.41421353816986083984375f, 1.1102230246251565404236316680908203125e-16f, 0, // vertex 2
+                    -1.41421353816986083984375f,
+                    -1.1102230246251565404236316680908203125e-16f,
+                    0, // vertex 0
+                    1.1102230246251565404236316680908203125e-16f,
+                    -1.41421353816986083984375f,
+                    0, // vertex 1
+                    1.41421353816986083984375f,
+                    1.1102230246251565404236316680908203125e-16f,
+                    0, // vertex 2
                 })))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 0, 1 }));
@@ -564,12 +748,24 @@ namespace
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                -3, -3, 0, // vertex 0
-                -3, -2, 0, // vertex 1
-                -2, -3, 0, // vertex 2
-                -1, -1, 0, // vertex 3
-                -1, 1, 0, // vertex 4
-                1, -1, 0, // vertex 5
+                -3,
+                -3,
+                0, // vertex 0
+                -3,
+                -2,
+                0, // vertex 1
+                -2,
+                -3,
+                0, // vertex 2
+                -1,
+                -1,
+                0, // vertex 3
+                -1,
+                1,
+                0, // vertex 4
+                1,
+                -1,
+                0, // vertex 5
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0, 5, 4, 3 }));
@@ -607,10 +803,18 @@ namespace
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
-                -1, -1, 0, // vertex 0
-                -1, 1, 0, // vertex 1
-                1, -1, 0, // vertex 2
-                1, 1, 0, // vertex 3
+                -1,
+                -1,
+                0, // vertex 0
+                -1,
+                1,
+                0, // vertex 1
+                1,
+                -1,
+                0, // vertex 2
+                1,
+                1,
+                0, // vertex 3
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0, 2, 1, 3 }));

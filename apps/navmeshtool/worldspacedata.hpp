@@ -2,7 +2,8 @@
 #define OPENMW_NAVMESHTOOL_WORLDSPACEDATA_H
 
 #include <memory>
-#include <string>
+#include <regex>
+#include <span>
 #include <vector>
 
 #include <Jolt/Jolt.h>
@@ -47,16 +48,6 @@ namespace NavMeshTool
     using DetourNavigator::ObjectTransform;
     using DetourNavigator::TileCachedRecastMeshManager;
 
-    struct WorldspaceNavMeshInput
-    {
-        ESM::RefId mWorldspace;
-        TileCachedRecastMeshManager mTileCachedRecastMeshManager;
-        JPH::AABox mAabb;
-        bool mAabbInitialized = false;
-
-        explicit WorldspaceNavMeshInput(ESM::RefId worldspace, const DetourNavigator::RecastSettings& settings);
-    };
-
     class PhysicsObject
     {
     public:
@@ -83,15 +74,24 @@ namespace NavMeshTool
 
     struct WorldspaceData
     {
-        std::vector<std::unique_ptr<WorldspaceNavMeshInput>> mNavMeshInputs;
+        ESM::RefId mWorldspace;
+        std::unique_ptr<TileCachedRecastMeshManager> mTileCachedRecastMeshManager;
+        JPH::AABox mAabb;
+        bool mAabbInitialized = false;
+        std::vector<DetourNavigator::TilePosition> mTiles;
         std::vector<PhysicsObject> mObjects;
         std::vector<std::unique_ptr<ESM::Land::LandData>> mLandData;
         std::vector<std::vector<float>> mHeightfields;
+
+        WorldspaceData(ESM::RefId worldspace, const DetourNavigator::RecastSettings& settings);
     };
+
+    std::unordered_map<ESM::RefId, std::vector<std::size_t>> collectWorldspaceCells(
+        const EsmLoader::EsmData& esmData, bool processInteriorCells, const std::regex& worldspaceFilter);
 
     WorldspaceData gatherWorldspaceData(const DetourNavigator::Settings& settings, ESM::ReadersCache& readers,
         const VFS::Manager& vfs, Resource::PhysicsShapeManager& physicsShapeManager, const EsmLoader::EsmData& esmData,
-        bool processInteriorCells, bool writeBinaryLog);
+        bool writeBinaryLog, ESM::RefId worldspace, std::span<const std::size_t> cells);
 }
 
 #endif

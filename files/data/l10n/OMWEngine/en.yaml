@@ -121,6 +121,7 @@ ForcePerPixelLightingTooltip: |-
     Note that groundcover shaders and particle effects ignore this setting.
 FrameRateHint: "Hint: press F3 to show\nthe current frame rate."
 GammaCorrection: "Gamma Correction"
+GammaCorrectionValue: "Gamma Correction ({value, number, ::.00})"
 GammaDark: "Dark"
 GammaLight: "Light"
 GmstOverridesL10n: "Strings From ESM Files Have Priority"
@@ -157,7 +158,7 @@ MatchSunlightToSunTooltip: |-
 
     This option makes the sun light source's position match the sun's position.
 MaxLights: "Max Lights"
-MaxLightsValue: "Max Lights ({value, number, ::.00})"
+MaxLightsValue: "Max Lights ({value, number, :: group-off})"
 MaxLightsTooltip: "Default: 8\nMaximum number of lights per object.\n\nA low number near default will cause light popping similar to what you would see with legacy lighting."
 MenuHelpDelay: "Menu Help Delay"
 MenuTransparency: "Menu Transparency"

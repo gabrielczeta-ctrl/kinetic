@@ -172,8 +172,6 @@ namespace MWGui
         auto tradeModel = std::make_unique<TradeItemModel>(std::make_unique<InventoryItemModel>(mPtr), MWWorld::Ptr());
         mTradeModel = tradeModel.get();
 
-        mPtr.getClass().getInventoryStore(mPtr).setContListener(this);
-
         if (mSortModel) // reuse existing SortModel when possible to keep previous category/filter settings
             mSortModel->setSourceModel(std::move(tradeModel));
         else
@@ -368,22 +366,7 @@ namespace MWGui
             if (mTrading || mPendingControllerAction == ControllerAction::Sell)
                 sellItem(nullptr, count);
             else if (mPendingControllerAction == ControllerAction::Use)
-            {
-                dragItem(nullptr, count);
-                if (item.mType == ItemStack::Type_Equipped)
-                {
-                    // Drop the item on the inventory background to unequip it.
-                    onBackgroundSelected();
-                }
-                else
-                {
-                    // Drop the item on the avatar to activate or equip it.
-                    onAvatarClicked(nullptr);
-                    // Drop any remaining items back in inventory. This is needed when clicking on a
-                    // stack of items; we only want to use the first item.
-                    onBackgroundSelected();
-                }
-            }
+                equipItem(count);
             else if (mPendingControllerAction == ControllerAction::Drop)
                 dropItem(nullptr, count);
             else if (MyGUI::InputManager::getInstance().isAltPressed()
@@ -478,6 +461,25 @@ namespace MWGui
         // Drop the item into the gameworld
         if (mDragAndDrop->mIsOnDragAndDrop)
             MWBase::Environment::get().getWindowManager()->getHud()->dropDraggedItem(0.5f, 0.5f);
+    }
+
+    void InventoryWindow::equipItem(std::size_t count)
+    {
+        const ItemStack& item = mTradeModel->getItem(mSelectedItem);
+        ensureSelectedItemUnequipped(static_cast<int>(count));
+        // Disable the pick up sound as the item will be used immediately
+        mDragAndDrop->startDrag(mSelectedItem, mSortModel, mTradeModel, mItemView, count, false);
+        notifyContentChanged();
+
+        const bool wasEquipped = item.mType == ItemStack::Type_Equipped;
+        // Drop the item on the avatar to activate or equip it.
+        if (!wasEquipped)
+            onAvatarClicked(nullptr);
+
+        // Drop the item to unequip it or drop any remaining items back in inventory.
+        // This is needed when clicking on a stack of items; we only want to use the first item.
+        if (mDragAndDrop->mIsOnDragAndDrop)
+            mDragAndDrop->drop(mTradeModel, mItemView, wasEquipped);
     }
 
     void InventoryWindow::updateItemView()
@@ -932,14 +934,10 @@ namespace MWGui
         mPreview->rebuild();
     }
 
-    void InventoryWindow::itemAdded(const MWWorld::ConstPtr& item, int count)
+    void InventoryWindow::onInventoryUpdate(const MWWorld::Ptr& ptr)
     {
-        mUpdateNextFrame = true;
-    }
-
-    void InventoryWindow::itemRemoved(const MWWorld::ConstPtr& item, int count)
-    {
-        mUpdateNextFrame = true;
+        if (ptr == mPtr)
+            mUpdateNextFrame = true;
     }
 
     MyGUI::IntSize InventoryWindow::getPreviewViewportSize() const

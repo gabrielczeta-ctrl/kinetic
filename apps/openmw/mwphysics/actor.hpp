@@ -63,8 +63,6 @@ namespace MWPhysics
          */
         void setSimulationPosition(const osg::Vec3f& position);
 
-        osg::Vec3f getSimulationPosition() const override { return mSimulationPosition; }
-
         void updateCollisionObjectPosition();
 
         /**

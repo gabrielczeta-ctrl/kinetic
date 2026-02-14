@@ -182,7 +182,6 @@ namespace MWWorld
 
         float feetToGameUnits(float feet);
         float getActivationDistancePlusTelekinesis();
-
         MWWorld::ConstPtr getClosestMarker(const MWWorld::ConstPtr& ptr, const ESM::RefId& id);
         MWWorld::ConstPtr getClosestMarkerFromExteriorPosition(const osg::Vec3f& worldPos, const ESM::RefId& id);
 
@@ -287,9 +286,6 @@ namespace MWWorld
         Ptr searchPtr(const ESM::RefId& name, bool activeOnly, bool searchInContainers = false) override;
         ///< Return a pointer to a liveCellRef with the given name.
         /// \param activeOnly do not search inactive cells.
-
-        Ptr searchPtrViaActorId(int actorId) override;
-        ///< Search is limited to the active cells.
 
         MWWorld::Ptr findContainer(const MWWorld::ConstPtr& ptr) override;
         ///< Return a pointer to a liveCellRef which contains \a ptr.
@@ -396,6 +392,8 @@ namespace MWWorld
         ///< Queues movement for \a ptr (in local space), to be applied in the next call to
         /// doPhysics.
 
+        void updateAnimatedCollisionShape(const Ptr& ptr) override;
+
         const MWPhysics::RayCastingInterface* getRayCasting() const override;
 
         bool castRenderingRay(MWPhysics::RayCastingResult& res, const osg::Vec3f& from, const osg::Vec3f& to,
@@ -465,7 +463,7 @@ namespace MWWorld
         void applyDeferredPreviewRotationToPlayer(float dt) override;
         void disableDeferredPreviewRotation() override;
 
-        void saveLoaded() override;
+        void saveLoaded(const ESM::ESMReader& reader) override;
 
         void setupPlayer() override;
         void renderPlayer() override;
