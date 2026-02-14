@@ -1,5 +1,6 @@
 #include "mtphysics.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <functional>
 #include <mutex>
@@ -287,6 +288,7 @@ namespace MWPhysics
         , mTimeAccum(0.f)
         , mDebugDrawer(debugDrawer)
         , mLockingPolicy(jobSystem->GetMaxConcurrency() <= 1 ? LockingPolicy::NoLocks : LockingPolicy::AllowSharedLocks)
+        , mNumThreads(std::max(1u, jobSystem->GetMaxConcurrency() - 1))
         , mNumJobs(0)
         , mRemainingSteps(0)
         , mLOSCacheExpiry(Settings::physics().mLineofsightKeepInactiveCache)
@@ -304,7 +306,7 @@ namespace MWPhysics
         , mFrameStart(0)
         , mSimulationBarrier(nullptr)
     {
-        Log(Debug::Info) << "Using " << (jobSystem->GetMaxConcurrency() - 1) << " async physics threads";
+        Log(Debug::Info) << "Using " << mNumThreads << " async physics threads";
         if (jobSystem->GetMaxConcurrency() <= 1)
             mLOSCacheExpiry = 0;
     }
@@ -565,9 +567,8 @@ namespace MWPhysics
             // Before any jobs spawned for this sim step
             afterPreStep();
 
-            // Calculate the amount of job groups to dispatch (overestimate, or "ceil"):
-            const uint32_t groupSize = mNumJobs > 32 ? 32 : 2; // FIXME: could scale this dynamically better than this
             const uint32_t jobCount = mNumJobs;
+            const uint32_t groupSize = std::clamp((jobCount + mNumThreads - 1) / mNumThreads, 2u, 32u);
             const uint32_t groupCount = (jobCount + groupSize - 1) / groupSize;
 
             std::vector<JPH::JobHandle> handles;
