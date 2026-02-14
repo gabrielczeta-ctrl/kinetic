@@ -109,7 +109,6 @@ namespace MWPhysics
         // intersects with other geometry if the actor's base is taken into account
         JPH::RVec3 rayOrigin = Misc::Convert::toJolt<JPH::RVec3>(position);
         JPH::RRayCast ray(rayOrigin, JPH::Vec3(0.0f, 0.0f, -maxHeight));
-        JPH::RayCastResult ioHit;
 
         MultiBroadPhaseLayerFilter broadphaseLayerFilter({ BroadPhaseLayers::WORLD });
         MultiObjectLayerFilter objectLayerFilter({ Layers::WORLD, Layers::HEIGHTMAP });
@@ -124,6 +123,7 @@ namespace MWPhysics
         public:
             virtual void AddHit(const JPH::RayCastResult& inResult) override
             {
+                mFraction = inResult.mFraction;
                 mSubShapeID2 = inResult.mSubShapeID2;
                 mBodyID = inResult.mBodyID;
                 mHit = true;
@@ -131,6 +131,7 @@ namespace MWPhysics
             }
 
             bool mHit = false;
+            float mFraction = 1.0f;
             JPH::BodyID mBodyID;
             JPH::SubShapeID mSubShapeID2;
         };
@@ -141,15 +142,15 @@ namespace MWPhysics
 
         if (collector.mHit)
         {
-            JPH::RVec3 hitPointWorld = ray.GetPointOnRay(ioHit.mFraction);
+            JPH::RVec3 hitPointWorld = ray.GetPointOnRay(collector.mFraction);
             if (((Misc::Convert::toOsg(hitPointWorld) - tracer.mEndPos + offset).length2() > 35 * 35
                     || !isWalkableSlope(tracer.mPlaneNormal)))
             {
-                JPH::BodyLockRead lock(physicsSystem->GetBodyLockInterface(), ioHit.mBodyID);
+                JPH::BodyLockRead lock(physicsSystem->GetBodyLockInterface(), collector.mBodyID);
                 if (lock.Succeeded())
                 {
                     const JPH::Body& hitBody = lock.GetBody();
-                    const JPH::Vec3 normal = hitBody.GetWorldSpaceSurfaceNormal(ioHit.mSubShapeID2, hitPointWorld);
+                    const JPH::Vec3 normal = hitBody.GetWorldSpaceSurfaceNormal(collector.mSubShapeID2, hitPointWorld);
                     actor->setOnSlope(!isWalkableSlope(Misc::Convert::toOsg(normal)));
                     return Misc::Convert::toOsg(hitPointWorld) + osg::Vec3f(0.f, 0.f, sGroundOffset);
                 }
