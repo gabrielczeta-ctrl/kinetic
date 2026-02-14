@@ -3,6 +3,7 @@
 
 #include <components/debug/debuglog.hpp>
 #include <components/misc/convert.hpp>
+#include <components/nifosg/nifloader.hpp>
 #include <components/nifosg/particle.hpp>
 #include <components/physicshelpers/collisionobject.hpp>
 #include <components/resource/physicsshape.hpp>
@@ -159,42 +160,68 @@ namespace MWPhysics
 
         JPH::MutableCompoundShape* compound = static_cast<JPH::MutableCompoundShape*>(mBasePhysicsShape.GetPtr());
 
-        bool result = false;
-        for (const auto& [recordIndex, shapeIndex] : mShapeInstance->mAnimatedShapes)
-        {
+        const auto getNodePathByRecordIndex = [this](int recordIndex) -> osg::NodePath* {
             auto nodePathFound = mRecIndexToNodePath.find(recordIndex);
             if (nodePathFound == mRecIndexToNodePath.end())
             {
                 NifOsg::FindGroupByRecordIndex visitor(recordIndex);
                 mPtr.getRefData().getBaseNode()->accept(visitor);
                 if (!visitor.mFound)
-                {
-                    Log(Debug::Warning) << "Warning: animateCollisionShapes can't find node " << recordIndex << " for "
-                                        << mPtr.getCellRef().getRefId();
+                    return nullptr;
 
-                    // Remove nonexistent nodes from animated shapes map and early out
-                    mShapeInstance->mAnimatedShapes.erase(recordIndex);
-                    return false;
-                }
                 osg::NodePath nodePath = visitor.mFoundPath;
                 nodePath.erase(nodePath.begin());
-                nodePathFound = mRecIndexToNodePath.emplace(recordIndex, nodePath).first;
+                nodePathFound = mRecIndexToNodePath.emplace(recordIndex, std::move(nodePath)).first;
+            }
+
+            return &nodePathFound->second;
+        };
+
+        bool result = false;
+        for (const auto& [recordIndex, shapeIndex] : mShapeInstance->mAnimatedShapes)
+        {
+            osg::NodePath* nodePath = getNodePathByRecordIndex(recordIndex);
+            if (!nodePath)
+            {
+                Log(Debug::Warning) << "Warning: animateCollisionShapes can't find node " << recordIndex << " for "
+                                    << mPtr.getCellRef().getRefId();
+
+                // Remove nonexistent nodes from animated shapes map and early out
+                mShapeInstance->mAnimatedShapes.erase(recordIndex);
+                return false;
             }
 
             assert(static_cast<int>(compound->GetNumSubShapes()) > shapeIndex);
-
-            osg::NodePath& nodePath = nodePathFound->second;
-            osg::Matrixf matrix = osg::computeLocalToWorld(nodePath);
-            osg::Vec3f scale = matrix.getScale();
-            matrix.orthoNormalize(matrix);
-
-            auto origin = Misc::Convert::toJolt<JPH::Vec3>(matrix.getTrans());
-            auto rotation = Misc::Convert::toJolt(matrix.getRotate());
 
             const JPH::CompoundShape::SubShape& subShape = compound->GetSubShape(shapeIndex);
             JPH::RefConst<JPH::Shape> childShape = subShape.mShape;
             auto subShapePosition = subShape.GetPositionCOM();
             auto subShapeRotation = subShape.GetRotation();
+
+            if (const auto collisionSwitch = mShapeInstance->mCollisionSwitches.find(recordIndex);
+                collisionSwitch != mShapeInstance->mCollisionSwitches.end())
+            {
+                osg::NodePath* switchNodePath = getNodePathByRecordIndex(collisionSwitch->second);
+                if (switchNodePath && !switchNodePath->empty()
+                    && switchNodePath->back()->getNodeMask() == NifOsg::Loader::getIntersectionDisabledNodeMask())
+                {
+                    static const JPH::Vec3 disabledPosition(1.0e8f, 1.0e8f, 1.0e8f);
+                    static const JPH::Quat disabledRotation = JPH::Quat::sIdentity();
+                    if (subShapePosition != disabledPosition || subShapeRotation != disabledRotation)
+                    {
+                        compound->ModifyShape(shapeIndex, disabledPosition, disabledRotation);
+                        result = true;
+                    }
+                    continue;
+                }
+            }
+
+            osg::Matrixf matrix = osg::computeLocalToWorld(*nodePath);
+            osg::Vec3f scale = matrix.getScale();
+            matrix.orthoNormalize(matrix);
+
+            auto origin = Misc::Convert::toJolt<JPH::Vec3>(matrix.getTrans());
+            auto rotation = Misc::Convert::toJolt(matrix.getRotate());
 
             const JPH::ScaledShape* scaledPtr = dynamic_cast<const JPH::ScaledShape*>(subShape.mShape.GetPtr());
             const bool isScaledSubshape = scaledPtr != nullptr;

@@ -16,6 +16,7 @@ namespace Resource
         , mAvoidCollisionShape(other.mAvoidCollisionShape)
         , mCollisionBox(other.mCollisionBox)
         , mAnimatedShapes(other.mAnimatedShapes)
+        , mCollisionSwitches(other.mCollisionSwitches)
         , mFileName(other.mFileName)
         , mFileHash(other.mFileHash)
         , mVisualCollisionType(other.mVisualCollisionType)

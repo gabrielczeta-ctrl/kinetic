@@ -226,9 +226,8 @@ namespace NifJolt
 
     void JoltNifLoader::handleNode(const Nif::NiAVObject& node, const Nif::Parent* parent, HandleNodeArgs args)
     {
-        // TODO: allow on-the fly collision switching via toggling this flag
-        if (node.mRecordType == Nif::RC_NiCollisionSwitch && !node.collisionActive())
-            return;
+        if (node.mRecordType == Nif::RC_NiCollisionSwitch)
+            args.mCollisionSwitchRecordIndex = node.mRecordIndex;
 
         for (Nif::NiTimeControllerPtr ctrl = node.mController; !ctrl.empty(); ctrl = ctrl->mNext)
         {
@@ -366,7 +365,8 @@ namespace NifJolt
             createdRef = scaledSettings.Create();
         }
 
-        if (args.mAnimated && !mShapeMutable)
+        const bool needsRuntimeUpdates = args.mAnimated || args.mCollisionSwitchRecordIndex.has_value();
+        if (needsRuntimeUpdates && !mShapeMutable)
         {
             mShapeMutable = true;
 
@@ -399,8 +399,11 @@ namespace NifJolt
                 }
             }
 
-            if (args.mAnimated)
-                mShape->mAnimatedShapes.emplace(niGeometry.mRecordIndex, mCompoundShape->mSubShapes.size());
+            if (needsRuntimeUpdates)
+                mShape->mAnimatedShapes.emplace(
+                    niGeometry.mRecordIndex, static_cast<int>(mCompoundShape->mSubShapes.size()));
+            if (args.mCollisionSwitchRecordIndex.has_value())
+                mShape->mCollisionSwitches.emplace(niGeometry.mRecordIndex, *args.mCollisionSwitchRecordIndex);
 
             mCompoundShape->AddShape(JPH::Vec3(osgPos.x(), osgPos.y(), osgPos.z()),
                 JPH::Quat(osgQuat.x(), osgQuat.y(), osgQuat.z(), osgQuat.w()), createdRef.Get());

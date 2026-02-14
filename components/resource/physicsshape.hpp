@@ -51,6 +51,8 @@ namespace Resource
         // In this map, for each animated collision shape,
         // we store the node's record index mapped to the child index of the shape in the JPH::MutableCompoundShape.
         std::map<int, int> mAnimatedShapes;
+        // Maps shape record index to controlling NiCollisionSwitch record index.
+        std::map<int, int> mCollisionSwitches;
 
         VFS::Path::Normalized mFileName;
         std::string mFileHash;
