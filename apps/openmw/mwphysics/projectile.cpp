@@ -30,6 +30,7 @@ namespace MWPhysics
             = PhysicsSystemHelpers::makePhysicsBodySettings(new JPH::SphereShape(radius), mPosition,
                 osg::Quat(1.0f, 0.0f, 0.0f, 0.0f), Layers::PROJECTILE, JPH::EMotionType::Dynamic);
 
+        bodyCreationSettings.mEnhancedInternalEdgeRemoval = true;
         bodyCreationSettings.mMotionQuality
             = JPH::EMotionQuality::LinearCast; // Important for accurate collision detection at speed/small radius
         bodyCreationSettings.mMassPropertiesOverride.mMass = 10000.0f; // Very high mass so it cant be moved

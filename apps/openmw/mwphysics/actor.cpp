@@ -114,6 +114,7 @@ namespace MWPhysics
 
         JPH::BodyCreationSettings bodyCreationSettings = PhysicsSystemHelpers::makePhysicsBodySettings(mPhysicsShape,
             getScaledMeshTranslation() + mPosition, mRotation, Layers::ACTOR, JPH::EMotionType::Kinematic);
+        bodyCreationSettings.mEnhancedInternalEdgeRemoval = true;
 
         mPhysicsBody = mTaskScheduler->createPhysicsBody(bodyCreationSettings);
         mPhysicsBody->SetUserData(reinterpret_cast<uintptr_t>(this));
