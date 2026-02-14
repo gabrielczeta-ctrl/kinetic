@@ -88,12 +88,11 @@ namespace MWPhysics
                     normal.z() = 0;
                     normal.normalize();
 
-                    // only collide if horizontally moving towards the hit actor (note: the motion vector appears to be
-                    // inverted)
+                    // only collide if horizontally moving towards the hit actor
                     // FIXME: This kinda screws with standing on actors that walk up slopes for some reason. Makes you
                     // fall through them. It happens in vanilla Morrowind too, but much less often. I tried hunting down
                     // why but couldn't figure it out. Possibly a stair stepping or ground ejection bug.
-                    if (normal * motion > 0.0f)
+                    if (normal * motion < 0.0f)
                     {
                         // Get the contact properties
                         mHitCollisionObject = body;
@@ -111,8 +110,8 @@ namespace MWPhysics
                 return;
 
             // dot product of the motion vector against the collision contact normal
-            float dotCollision = mMotion.Dot(hitNormalWorld);
-            if (dotCollision <= mMinCollisionDot)
+            const float approachDot = -mMotion.Dot(hitNormalWorld);
+            if (approachDot <= mMinCollisionDot)
                 return;
 
             // Test if this collision is closer/deeper than the previous one
