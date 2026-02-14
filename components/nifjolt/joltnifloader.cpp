@@ -381,8 +381,7 @@ namespace NifJolt
                 JPH::Quat(osgQuat.x(), osgQuat.y(), osgQuat.z(), osgQuat.w()), createdRef.Get());
         }
 
-        // TODO: maybe we should delete childShape here instead of just forgetting about it
-        std::ignore = childShape.release();
+        // `childShape` is no longer needed after `Create()`, let unique_ptr clean it up.
     }
 
 } // namespace NifJolt
