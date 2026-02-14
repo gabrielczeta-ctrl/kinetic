@@ -162,7 +162,7 @@ namespace MWClass
         {
             std::vector<const ESM::SoundGenerator*> sounds;
             for (auto sound = store.get<ESM::SoundGenerator>().begin(); sound != store.get<ESM::SoundGenerator>().end();
-                ++sound)
+                 ++sound)
             {
                 if (type == sound->mType && !sound->mCreature.empty() && (*creatureId == sound->mCreature))
                     sounds.push_back(&*sound);
@@ -179,7 +179,7 @@ namespace MWClass
         {
             // The activator doesn't have a corresponding creature ID, but we can try to use the defaults
             for (auto sound = store.get<ESM::SoundGenerator>().begin(); sound != store.get<ESM::SoundGenerator>().end();
-                ++sound)
+                 ++sound)
                 if (type == sound->mType && sound->mCreature.empty())
                     fallbacksounds.push_back(&*sound);
 

@@ -1427,9 +1427,9 @@ namespace MWWorld
             spawnPoint.z() += 30; // move up a little to account for slopes, will snap down later
 
             if (!mPhysics
-                    ->castRay(spawnPoint, osg::Vec3f(pos.x(), pos.y(), pos.z() + 20),
-                        MWPhysics::Layers::WORLD | MWPhysics::Layers::DOOR)
-                    .mHit)
+                     ->castRay(spawnPoint, osg::Vec3f(pos.x(), pos.y(), pos.z() + 20),
+                         MWPhysics::Layers::WORLD | MWPhysics::Layers::DOOR)
+                     .mHit)
             {
                 // safe
                 break;

@@ -99,10 +99,9 @@ static bool AssertFailedImpl(const char* inExpression, const char* inMessage, co
 namespace
 {
     constexpr std::array<JPH::ObjectLayer, 11> sRaycastObjectLayers = { MWPhysics::Layers::WORLD,
-        MWPhysics::Layers::DOOR, MWPhysics::Layers::ACTOR, MWPhysics::Layers::HEIGHTMAP,
-        MWPhysics::Layers::PROJECTILE, MWPhysics::Layers::WATER, MWPhysics::Layers::CAMERA_ONLY,
-        MWPhysics::Layers::VISUAL_ONLY, MWPhysics::Layers::DYNAMIC_WORLD, MWPhysics::Layers::DEBRIS,
-        MWPhysics::Layers::SENSOR };
+        MWPhysics::Layers::DOOR, MWPhysics::Layers::ACTOR, MWPhysics::Layers::HEIGHTMAP, MWPhysics::Layers::PROJECTILE,
+        MWPhysics::Layers::WATER, MWPhysics::Layers::CAMERA_ONLY, MWPhysics::Layers::VISUAL_ONLY,
+        MWPhysics::Layers::DYNAMIC_WORLD, MWPhysics::Layers::DEBRIS, MWPhysics::Layers::SENSOR };
 
     std::vector<JPH::ObjectLayer> getQueryObjectLayers(int mask, int group)
     {
@@ -238,9 +237,9 @@ namespace MWPhysics
     }
 
     PhysicsSystem::PhysicsSystem(Resource::ResourceSystem* resourceSystem, osg::ref_ptr<osg::Group> parentNode)
-        : mShapeManager(std::make_unique<Resource::PhysicsShapeManager>(resourceSystem->getVFS(),
-              resourceSystem->getSceneManager(), resourceSystem->getNifFileManager(),
-              Settings::cells().mCacheExpiryDelay))
+        : mShapeManager(
+            std::make_unique<Resource::PhysicsShapeManager>(resourceSystem->getVFS(), resourceSystem->getSceneManager(),
+                resourceSystem->getNifFileManager(), Settings::cells().mCacheExpiryDelay))
         , mResourceSystem(resourceSystem)
         , mDebugDrawEnabled(false)
         , mTimeAccum(0.0f)
@@ -1240,10 +1239,10 @@ namespace MWPhysics
         , mSwimLevel(waterlevel
               - (actor.getRenderingHalfExtents().z() * 2
                   * MWBase::Environment::get()
-                      .getESMStore()
-                      ->get<ESM::GameSetting>()
-                      .find("fSwimHeightScale")
-                      ->mValue.getFloat()))
+                        .getESMStore()
+                        ->get<ESM::GameSetting>()
+                        .find("fSwimHeightScale")
+                        ->mValue.getFloat()))
         , mSlowFall(slowFall)
         , mRotation()
         , mMovement(actor.velocity())

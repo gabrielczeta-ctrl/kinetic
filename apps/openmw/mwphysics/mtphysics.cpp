@@ -412,8 +412,8 @@ namespace MWPhysics
             // physics system must call syncSimulation to guarantee they have completed
             assert(mSimulationBarrier == nullptr);
             mSimulationBarrier = mJobSystem->CreateBarrier();
-            JPH::JobHandle handle
-                = mJobSystem->CreateJob("MWSimulation", JPH::Color::sBlue, [this]() { doSimulation(); }, 0);
+            JPH::JobHandle handle = mJobSystem->CreateJob(
+                "MWSimulation", JPH::Color::sBlue, [this]() { doSimulation(); }, 0);
             mSimulationBarrier->AddJob(handle);
         }
     }
