@@ -548,10 +548,10 @@ namespace MWPhysics
             JPH::RMat44 newTransformJolt(oldTransformJolt);
             const JPH::Vec3 scale = JPH::Vec3::sReplicate(1.0f);
 
-            // Create a mask that is same of the actor minus projectiles and other actors
+            // Create a mask from the actor, excluding projectiles.
+            // Keep actor collisions enabled here so overlap recovery can separate stacked actors.
             int collisionMask = actor.mCollisionMask;
             collisionMask = collisionMask & ~Layers::PROJECTILE;
-            collisionMask = collisionMask & ~Layers::ACTOR;
 
             // Filter out layers
             JPH::DefaultBroadPhaseLayerFilter broadphaseLayerFilter

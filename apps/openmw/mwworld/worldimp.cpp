@@ -1,5 +1,6 @@
 #include "worldimp.hpp"
 
+#include <array>
 #include <charconv>
 #include <vector>
 
@@ -1426,9 +1427,9 @@ namespace MWWorld
             spawnPoint.z() += 30; // move up a little to account for slopes, will snap down later
 
             if (!mPhysics
-                                            ->castRay(spawnPoint, osg::Vec3f(pos.x(), pos.y(), pos.z() + 20),
-                                                MWPhysics::Layers::WORLD | MWPhysics::Layers::DOOR)
-                                            .mHit)
+                    ->castRay(spawnPoint, osg::Vec3f(pos.x(), pos.y(), pos.z() + 20),
+                        MWPhysics::Layers::WORLD | MWPhysics::Layers::DOOR)
+                    .mHit)
             {
                 // safe
                 break;
@@ -3862,6 +3863,14 @@ namespace MWWorld
         std::span<const MWWorld::ConstPtr> ignore, std::vector<MWWorld::Ptr>* occupyingActors) const
     {
         return mPhysics->isAreaOccupiedByOtherActor(position, radius, ignore, occupyingActors);
+    }
+
+    bool World::isAreaOccupiedByOtherActor(const MWWorld::ConstPtr& actor, const osg::Vec3f& position) const
+    {
+        const osg::Vec3f halfExtents = getHalfExtents(actor);
+        const float radius = std::max(20.f, std::max(halfExtents.x(), halfExtents.y()));
+        const std::array<MWWorld::ConstPtr, 1> ignore{ actor };
+        return isAreaOccupiedByOtherActor(position, radius, ignore, nullptr);
     }
 
     void World::reportStats(unsigned int frameNumber, osg::Stats& stats) const
