@@ -1,10 +1,15 @@
 #include "physicsshapemanager.hpp"
 
+#include <array>
 #include <cstring>
+#include <cstdint>
+#include <limits>
 
 #include <osg/Drawable>
+#include <osg/Geometry>
 #include <osg/NodeVisitor>
 #include <osg/Transform>
+#include <osg/TriangleIndexFunctor>
 #include <osg/TriangleFunctor>
 
 #include <components/misc/osguservalues.hpp>
@@ -25,6 +30,50 @@
 
 namespace Resource
 {
+    struct CollectTriangleIndices
+    {
+        void operator()(unsigned int i0, unsigned int i1, unsigned int i2)
+        {
+            mTriangles.push_back({ i0, i1, i2 });
+        }
+
+        const std::vector<std::array<unsigned int, 3>>& getTriangles() const { return mTriangles; }
+
+    private:
+        std::vector<std::array<unsigned int, 3>> mTriangles;
+    };
+
+    bool appendIndexedTriangles(
+        const osg::Geometry& geometry, const osg::Matrixf& matrix, JPH::MeshShapeSettings& triangleMesh)
+    {
+        const osg::Vec3Array* vertices = dynamic_cast<const osg::Vec3Array*>(geometry.getVertexArray());
+        if (vertices == nullptr || vertices->empty())
+            return false;
+
+        osg::TriangleIndexFunctor<CollectTriangleIndices> indexFunctor;
+        geometry.accept(indexFunctor);
+        const auto& triangles = indexFunctor.getTriangles();
+        if (triangles.empty())
+            return false;
+
+        const std::size_t baseVertex = triangleMesh.mTriangleVertices.size();
+        if (baseVertex > std::numeric_limits<std::uint32_t>::max())
+            return false;
+        if (vertices->size() > std::numeric_limits<std::uint32_t>::max() - baseVertex)
+            return false;
+
+        triangleMesh.mTriangleVertices.reserve(baseVertex + vertices->size());
+        for (const osg::Vec3& vertex : *vertices)
+            triangleMesh.mTriangleVertices.push_back(Misc::Convert::toJolt<JPH::Float3>(matrix.preMult(vertex)));
+
+        triangleMesh.mIndexedTriangles.reserve(triangleMesh.mIndexedTriangles.size() + triangles.size());
+        const auto indexBase = static_cast<std::uint32_t>(baseVertex);
+        for (const std::array<unsigned int, 3>& triangle : triangles)
+            triangleMesh.mIndexedTriangles.emplace_back(indexBase + triangle[0], indexBase + triangle[1],
+                indexBase + triangle[2]);
+
+        return true;
+    }
 
     struct GetTriangleFunctor
     {
@@ -40,8 +89,6 @@ namespace Resource
         void inline operator()(const osg::Vec3& v1, const osg::Vec3& v2, const osg::Vec3& v3,
             bool _temp = false) // Note: unused temp argument left here for OSG versions less than 3.5.6
         {
-
-            // FIXME: we could look at not using triangle functor and copying verts/indices directly!
             if (mTriMesh)
             {
                 uint32_t sizeC = mTriMesh->mTriangleVertices.size();
@@ -73,6 +120,11 @@ namespace Resource
                 mTriangleMesh.reset(new JPH::MeshShapeSettings);
 
             osg::Matrixf worldMat = osg::computeLocalToWorld(getNodePath());
+
+            if (const osg::Geometry* geometry = drawable.asGeometry())
+                if (appendIndexedTriangles(*geometry, worldMat, *mTriangleMesh))
+                    return;
+
             osg::TriangleFunctor<GetTriangleFunctor> functor;
             functor.setTriMesh(mTriangleMesh.get());
             functor.setMatrix(worldMat);
