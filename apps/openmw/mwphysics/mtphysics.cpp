@@ -505,7 +505,7 @@ namespace MWPhysics
 
     void PhysicsTaskScheduler::refreshLOSCache()
     {
-        MaybeSharedLock lock(mLOSCacheMutex, mLockingPolicy);
+        MaybeExclusiveLock lock(mLOSCacheMutex, mLockingPolicy);
         int job = 0;
         int numLOS = mLOSCache.size();
         while ((job = mNextLOS.fetch_add(1, std::memory_order_relaxed)) < numLOS)
