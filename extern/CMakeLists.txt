@@ -29,8 +29,8 @@ if(NOT OPENMW_USE_SYSTEM_JOLT)
 
     include(FetchContent)
     FetchContent_Declare(joltphysics
-        URL https://github.com/jrouwe/JoltPhysics/archive/refs/tags/v5.3.0.zip
-        URL_HASH SHA512=fd13fb560c503bc4717d0f5b7ae1f523d3fd45d5220354a062f9a1a0324cc1349e7ebf0f5a85db872e10b81a8211c514ce4e1ff17ee6e71a0f83154b8510353d
+        URL https://github.com/jrouwe/JoltPhysics/archive/refs/tags/v5.5.0.zip
+        URL_HASH SHA512=52d6013a9bd38f31e73a308b8a5355df8a59d53d28a7823699d090f8e632ac0af58f1f7ecce342927cbe269b0aeae0656ea57f876a8e8f489024211bb52196a4
         SOURCE_DIR fetched/joltphysics
         SOURCE_SUBDIR Build
     )
