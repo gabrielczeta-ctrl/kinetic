@@ -52,8 +52,9 @@ namespace MWPhysics
             // Ignore actor's own body
             JPH::IgnoreSingleBodyFilter bodyFilter(actor);
 
-            ActorConvexCallback collector(actor, physicsSystem, shapeCast.mCenterOfMassStart.GetTranslation(), 0.0,
-                Misc::Convert::toJolt<JPH::Vec3>(correctMotion));
+            const JPH::RVec3 castStart = shapeCast.mCenterOfMassStart.GetTranslation();
+            ActorConvexCallback collector(
+                actor, physicsSystem, castStart, castStart, 0.0, Misc::Convert::toJolt<JPH::Vec3>(correctMotion));
             lock.ReleaseLock();
             physicsSystem->GetNarrowPhaseQuery().CastShape(shapeCast, settings,
                 shapeCast.mCenterOfMassStart.GetTranslation(), collector, broadphaseLayerFilter, objectLayerFilter,

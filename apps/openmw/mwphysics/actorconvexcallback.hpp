@@ -26,12 +26,13 @@ namespace MWPhysics
             , mHitNormalWorld(JPH::Vec3(0.0, 0.0, 0.0))
             , mMotion(JPH::Vec3(0.0, 0.0, 0.0))
             , mPhysicsSystem(nullptr)
+            , mSelfCenterWorld(JPH::RVec3(0.0, 0.0, 0.0))
             , mOrigin(JPH::RVec3(0.0, 0.0, 0.0))
         {
         }
 
-        ActorConvexCallback(const JPH::BodyID actor, const JPH::PhysicsSystem* inPhysicsSystem, JPH::RVec3 origin,
-            float minCollisionDot, JPH::Vec3 motion)
+        ActorConvexCallback(const JPH::BodyID actor, const JPH::PhysicsSystem* inPhysicsSystem,
+            JPH::RVec3 selfCenterWorld, JPH::RVec3 origin, float minCollisionDot, JPH::Vec3 motion)
             : mMinCollisionDot(minCollisionDot)
             , mMe(actor)
             , mHitCollisionLayer(0)
@@ -39,6 +40,7 @@ namespace MWPhysics
             , mHitNormalWorld(JPH::RVec3(0.0, 0.0, 0.0))
             , mMotion(motion)
             , mPhysicsSystem(inPhysicsSystem)
+            , mSelfCenterWorld(selfCenterWorld)
             , mOrigin(origin)
         {
         }
@@ -60,13 +62,6 @@ namespace MWPhysics
             if (body->IsSensor())
                 return;
 
-            JPH::BodyLockRead myLock(mPhysicsSystem->GetBodyLockInterfaceNoLock(), mMe);
-            assert(myLock.Succeeded());
-            if (!myLock.Succeeded())
-                return;
-
-            const JPH::Body* myBody = &myLock.GetBody();
-
             const JPH::ObjectLayer collisionGroup = body->GetObjectLayer();
 
             JPH::Vec3 hitNormalWorld = -inResult.mPenetrationAxis.Normalized();
@@ -81,7 +76,7 @@ namespace MWPhysics
                 bool isOverlapping = inResult.mPenetrationDepth != 0.0f;
                 if (isOverlapping)
                 {
-                    auto originA = Misc::Convert::toOsg(myBody->GetCenterOfMassTransform().GetTranslation());
+                    auto originA = Misc::Convert::toOsg(mSelfCenterWorld);
                     auto originB = Misc::Convert::toOsg(body->GetCenterOfMassTransform().GetTranslation());
                     osg::Vec3f motion = Misc::Convert::toOsg(mMotion);
                     osg::Vec3f normal = (originA - originB);
@@ -146,6 +141,7 @@ namespace MWPhysics
 
     private:
         const JPH::PhysicsSystem* mPhysicsSystem;
+        JPH::RVec3 mSelfCenterWorld;
         JPH::RVec3 mOrigin;
     };
 }
