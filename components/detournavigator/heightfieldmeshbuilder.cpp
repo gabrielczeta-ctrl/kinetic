@@ -25,6 +25,8 @@
 #include <Jolt/Jolt.h>
 #include <Jolt/Math/Real.h>
 
+#include <algorithm>
+
 namespace DetourNavigator
 {
     HeightfieldMeshBuilder::HeightfieldMeshBuilder(
@@ -166,12 +168,22 @@ namespace DetourNavigator
         if (quantizedAabbMax[1] < endJ)
             endJ = quantizedAabbMax[1];
 
-        // TODO If m_vboundsGrid is available, use it to determine if we really need to process this area
+        const float queryMinHeight = localAabbMin.GetZ();
+        const float queryMaxHeight = localAabbMax.GetZ();
 
         for (int j = startJ; j < endJ; j++)
         {
             for (int x = startX; x < endX; x++)
             {
+                const float height00 = getRawHeightFieldValue(x, j);
+                const float height01 = getRawHeightFieldValue(x, j + 1);
+                const float height10 = getRawHeightFieldValue(x + 1, j);
+                const float height11 = getRawHeightFieldValue(x + 1, j + 1);
+                const float minHeight = std::min(std::min(height00, height01), std::min(height10, height11));
+                const float maxHeight = std::max(std::max(height00, height01), std::max(height10, height11));
+                if (maxHeight < queryMinHeight || minHeight > queryMaxHeight)
+                    continue;
+
                 JPH::Float3 vertices[3];
                 int indices[3] = { 0, 1, 2 };
 
