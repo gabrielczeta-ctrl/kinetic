@@ -397,11 +397,11 @@ namespace MWWorld
             mNavigator.removeWater(osg::Vec2i(cellX, cellY), navigatorUpdateGuard);
 
         ESM::visit(ESM::VisitOverload{
-                       [&](const ESM::Cell& cell) {
-                           if (const auto pathgrid = mWorld.getStore().get<ESM::Pathgrid>().search(cell))
+                       [&](const ESM::Cell& esmCell) {
+                           if (const auto pathgrid = mWorld.getStore().get<ESM::Pathgrid>().search(esmCell))
                                mNavigator.removePathgrid(*pathgrid);
                        },
-                       [&](const ESM4::Cell& cell) {},
+                       [&](const ESM4::Cell&) {},
                    },
             *cell->getCell());
 
@@ -476,11 +476,11 @@ namespace MWWorld
         }
 
         ESM::visit(ESM::VisitOverload{
-                       [&](const ESM::Cell& cell) {
-                           if (const auto pathgrid = mWorld.getStore().get<ESM::Pathgrid>().search(cell))
-                               mNavigator.addPathgrid(cell, *pathgrid);
+                       [&](const ESM::Cell& esmCell) {
+                           if (const auto pathgrid = mWorld.getStore().get<ESM::Pathgrid>().search(esmCell))
+                               mNavigator.addPathgrid(esmCell, *pathgrid);
                        },
-                       [&](const ESM4::Cell& cell) {},
+                       [&](const ESM4::Cell&) {},
                    },
             *cell.getCell());
 
