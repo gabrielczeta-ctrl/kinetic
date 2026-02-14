@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -551,8 +552,12 @@ namespace MWPhysics
         auto diff = to - from;
         JPH::RRayCast ray(from, Misc::Convert::toJolt<JPH::Vec3>(diff));
 
-        MultiBroadPhaseLayerFilter broadphaseLayerFilter({ BroadPhaseLayers::WORLD });
-        MultiObjectLayerFilter objectLayerFilter({ Layers::WORLD, Layers::HEIGHTMAP, Layers::DOOR });
+        const std::uint32_t broadPhaseLayer = static_cast<std::uint32_t>(BroadPhaseLayers::WORLD.GetValue());
+        if (broadPhaseLayer >= 32)
+            return true;
+        const std::uint32_t broadPhaseMask = 1u << broadPhaseLayer;
+        MaskedBroadPhaseLayerFilter broadphaseLayerFilter(broadPhaseMask);
+        MaskedObjectLayerFilter objectLayerFilter(Layers::WORLD | Layers::HEIGHTMAP | Layers::DOOR);
 
         JPH::RayCastResult ioHit;
         const bool didRayHit

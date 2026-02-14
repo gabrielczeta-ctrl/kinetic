@@ -28,6 +28,7 @@
 #include "trace.h"
 
 #include <cmath>
+#include <cstdint>
 
 namespace MWPhysics
 {
@@ -110,8 +111,9 @@ namespace MWPhysics
         JPH::RVec3 rayOrigin = Misc::Convert::toJolt<JPH::RVec3>(position);
         JPH::RRayCast ray(rayOrigin, JPH::Vec3(0.0f, 0.0f, -maxHeight));
 
-        MultiBroadPhaseLayerFilter broadphaseLayerFilter({ BroadPhaseLayers::WORLD });
-        MultiObjectLayerFilter objectLayerFilter({ Layers::WORLD, Layers::HEIGHTMAP });
+        const std::uint32_t broadPhaseMask = 1u << static_cast<std::uint32_t>(BroadPhaseLayers::WORLD.GetValue());
+        MaskedBroadPhaseLayerFilter broadphaseLayerFilter(broadPhaseMask);
+        MaskedObjectLayerFilter objectLayerFilter(Layers::WORLD | Layers::HEIGHTMAP);
 
         // It is important to ignore backfaces for this check, as all actor collision should
         JPH::RayCastSettings settings;

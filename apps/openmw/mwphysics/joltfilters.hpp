@@ -7,42 +7,30 @@
 #include <Jolt/Physics/Collision/ObjectLayer.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+
 namespace MWPhysics
 {
-    // Allows objects from a specific broad phase layer list only
-    class MultiBroadPhaseLayerFilter : public JPH::BroadPhaseLayerFilter
+    // Allows objects from a specific broad phase layer mask only
+    class MaskedBroadPhaseLayerFilter : public JPH::BroadPhaseLayerFilter
     {
     public:
-        explicit MultiBroadPhaseLayerFilter(std::vector<JPH::BroadPhaseLayer> layers)
-            : mLayers(layers)
+        explicit MaskedBroadPhaseLayerFilter(std::uint32_t mask)
+            : mMask(mask)
         {
+            assert(mask > 0);
         }
 
         virtual bool ShouldCollide(JPH::BroadPhaseLayer inLayer) const override
         {
-            return std::find(mLayers.begin(), mLayers.end(), inLayer) != mLayers.end();
+            const auto layer = static_cast<std::uint32_t>(inLayer.GetValue());
+            return layer < 32 && (mMask & (1u << layer)) != 0;
         }
 
     private:
-        std::vector<JPH::BroadPhaseLayer> mLayers;
-    };
-
-    // Allows objects from a specific layer list only
-    class MultiObjectLayerFilter : public JPH::ObjectLayerFilter
-    {
-    public:
-        explicit MultiObjectLayerFilter(std::vector<JPH::ObjectLayer> layers)
-            : mLayers(layers)
-        {
-        }
-
-        virtual bool ShouldCollide(JPH::ObjectLayer inLayer) const override
-        {
-            return std::find(mLayers.begin(), mLayers.end(), inLayer) != mLayers.end();
-        }
-
-    private:
-        std::vector<JPH::ObjectLayer> mLayers;
+        std::uint32_t mMask;
     };
 
     // Allows objects from a specific layer mask only

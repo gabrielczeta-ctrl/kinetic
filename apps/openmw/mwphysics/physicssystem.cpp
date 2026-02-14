@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdarg>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -137,10 +138,9 @@ namespace
         MWPhysics::Layers::WATER, MWPhysics::Layers::CAMERA_ONLY, MWPhysics::Layers::VISUAL_ONLY,
         MWPhysics::Layers::DYNAMIC_WORLD, MWPhysics::Layers::DEBRIS, MWPhysics::Layers::SENSOR };
 
-    std::vector<JPH::ObjectLayer> getQueryObjectLayers(int mask, int group)
+    int getQueryObjectMask(int mask, int group)
     {
-        std::vector<JPH::ObjectLayer> result;
-        result.reserve(sRaycastObjectLayers.size());
+        int result = 0;
         MWPhysics::JoltObjectLayerPairFilter layerPairFilter;
 
         for (const JPH::ObjectLayer objectLayer : sRaycastObjectLayers)
@@ -166,23 +166,23 @@ namespace
                     continue;
             }
 
-            result.push_back(objectLayer);
+            result |= static_cast<int>(objectLayer);
         }
 
         return result;
     }
 
-    std::vector<JPH::BroadPhaseLayer> getQueryBroadPhaseLayers(
-        const std::vector<JPH::ObjectLayer>& objectLayers, const MWPhysics::JoltBPLayerInterface& bpLayerInterface)
+    std::uint32_t getQueryBroadPhaseMask(int objectMask, const MWPhysics::JoltBPLayerInterface& bpLayerInterface)
     {
-        std::vector<JPH::BroadPhaseLayer> result;
-        result.reserve(objectLayers.size());
-
-        for (const JPH::ObjectLayer objectLayer : objectLayers)
+        std::uint32_t result = 0;
+        for (const JPH::ObjectLayer objectLayer : sRaycastObjectLayers)
         {
+            if ((objectMask & static_cast<int>(objectLayer)) == 0)
+                continue;
             const JPH::BroadPhaseLayer broadphaseLayer = bpLayerInterface.GetBroadPhaseLayer(objectLayer);
-            if (std::find(result.begin(), result.end(), broadphaseLayer) == result.end())
-                result.push_back(broadphaseLayer);
+            const auto broadPhaseLayerIndex = static_cast<std::uint32_t>(broadphaseLayer.GetValue());
+            if (broadPhaseLayerIndex < 32)
+                result |= 1u << broadPhaseLayerIndex;
         }
 
         return result;
@@ -453,18 +453,23 @@ namespace MWPhysics
         auto diff = to - from;
         JPH::RRayCast ray(rayOrigin, Misc::Convert::toJolt<JPH::Vec3>(diff));
 
-        const std::vector<JPH::ObjectLayer> queryObjectLayers = getQueryObjectLayers(mask, group);
-        if (queryObjectLayers.empty())
+        const int queryObjectMask = getQueryObjectMask(mask, group);
+        if (queryObjectMask == 0)
         {
             RayCastingResult result;
             result.mHit = false;
             return result;
         }
 
-        const std::vector<JPH::BroadPhaseLayer> queryBroadPhaseLayers
-            = getQueryBroadPhaseLayers(queryObjectLayers, mBPLayerInterface);
-        MultiBroadPhaseLayerFilter broadphaseLayerFilter(queryBroadPhaseLayers);
-        MultiObjectLayerFilter objectLayerFilter(queryObjectLayers);
+        const std::uint32_t queryBroadPhaseMask = getQueryBroadPhaseMask(queryObjectMask, mBPLayerInterface);
+        if (queryBroadPhaseMask == 0)
+        {
+            RayCastingResult result;
+            result.mHit = false;
+            return result;
+        }
+        MaskedBroadPhaseLayerFilter broadphaseLayerFilter(queryBroadPhaseMask);
+        MaskedObjectLayerFilter objectLayerFilter(queryObjectMask);
 
         // Cast ray and return closest hit
         JPH::RayCastResult ioHit;
@@ -509,18 +514,23 @@ namespace MWPhysics
         JPH::Vec3 scale = JPH::Vec3::sReplicate(1.0f);
         JPH::RShapeCast shapeCast(&sphere, scale, transFrom, Misc::Convert::toJolt<JPH::Vec3>(to - from));
 
-        const std::vector<JPH::ObjectLayer> queryObjectLayers = getQueryObjectLayers(mask, group);
-        if (queryObjectLayers.empty())
+        const int queryObjectMask = getQueryObjectMask(mask, group);
+        if (queryObjectMask == 0)
         {
             RayCastingResult result;
             result.mHit = false;
             return result;
         }
 
-        const std::vector<JPH::BroadPhaseLayer> queryBroadPhaseLayers
-            = getQueryBroadPhaseLayers(queryObjectLayers, mBPLayerInterface);
-        MultiBroadPhaseLayerFilter broadphaseLayerFilter(queryBroadPhaseLayers);
-        MultiObjectLayerFilter objectLayerFilter(queryObjectLayers);
+        const std::uint32_t queryBroadPhaseMask = getQueryBroadPhaseMask(queryObjectMask, mBPLayerInterface);
+        if (queryBroadPhaseMask == 0)
+        {
+            RayCastingResult result;
+            result.mHit = false;
+            return result;
+        }
+        MaskedBroadPhaseLayerFilter broadphaseLayerFilter(queryBroadPhaseMask);
+        MaskedObjectLayerFilter objectLayerFilter(queryObjectMask);
 
         ClosestConvexResultCallback callback(transFrom.GetTranslation());
         mPhysicsSystem.GetNarrowPhaseQuery().CastShape(
