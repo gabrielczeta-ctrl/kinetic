@@ -1206,6 +1206,14 @@ namespace MWPhysics
                 if (std::binary_search(mIgnoredBodies->begin(), mIgnoredBodies->end(), inBodyID))
                     return;
 
+                // Bool-only callers need to know just if any actor occupies the area.
+                if (mOccupiedResult == nullptr)
+                {
+                    mHasHit = true;
+                    ForceEarlyOut();
+                    return;
+                }
+
                 // If an output array is specified, get body ptrholder
                 if (mOccupiedResult)
                 {
