@@ -936,7 +936,6 @@ namespace Nif
         struct BoneTransform
         {
             osg::Vec3f mTranslation;
-            // FIXME: this and some other quaternions are meant to be read in direct order
             osg::Quat mRotation;
             osg::Vec3f mScale;
 
