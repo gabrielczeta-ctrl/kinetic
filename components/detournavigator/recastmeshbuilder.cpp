@@ -342,7 +342,7 @@ namespace DetourNavigator
                 // transformed[1] = vertices[1];
                 // transformed[2] = vertices[2];
 
-                // TODO: FIXME: think we can remove this aabb test, as jolt does it. check after restoring test suite!
+                // Keep world-space tile culling here: Jolt triangle walking uses shape-local query bounds.
                 if (TestTriangleAgainstAabb2(transformed.data(), boundsMin, boundsMax))
                     processTriangle(transformed.data(), 0, triangleIndex);
             }
