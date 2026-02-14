@@ -288,7 +288,7 @@ namespace MWPhysics
         , mTimeAccum(0.f)
         , mDebugDrawer(debugDrawer)
         , mLockingPolicy(jobSystem->GetMaxConcurrency() <= 1 ? LockingPolicy::NoLocks : LockingPolicy::AllowSharedLocks)
-        , mNumThreads(std::max(1u, jobSystem->GetMaxConcurrency() - 1))
+        , mNumThreads(static_cast<unsigned>(std::max(1, jobSystem->GetMaxConcurrency() - 1)))
         , mNumJobs(0)
         , mRemainingSteps(0)
         , mLOSCacheExpiry(Settings::physics().mLineofsightKeepInactiveCache)
