@@ -1,16 +1,16 @@
 #include "physicsshapemanager.hpp"
 
 #include <array>
-#include <cstring>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 
 #include <osg/Drawable>
 #include <osg/Geometry>
 #include <osg/NodeVisitor>
 #include <osg/Transform>
-#include <osg/TriangleIndexFunctor>
 #include <osg/TriangleFunctor>
+#include <osg/TriangleIndexFunctor>
 
 #include <components/misc/osguservalues.hpp>
 #include <components/misc/pathhelpers.hpp>
@@ -32,10 +32,7 @@ namespace Resource
 {
     struct CollectTriangleIndices
     {
-        void operator()(unsigned int i0, unsigned int i1, unsigned int i2)
-        {
-            mTriangles.push_back({ i0, i1, i2 });
-        }
+        void operator()(unsigned int i0, unsigned int i1, unsigned int i2) { mTriangles.push_back({ i0, i1, i2 }); }
 
         const std::vector<std::array<unsigned int, 3>>& getTriangles() const { return mTriangles; }
 
@@ -69,8 +66,8 @@ namespace Resource
         triangleMesh.mIndexedTriangles.reserve(triangleMesh.mIndexedTriangles.size() + triangles.size());
         const auto indexBase = static_cast<std::uint32_t>(baseVertex);
         for (const std::array<unsigned int, 3>& triangle : triangles)
-            triangleMesh.mIndexedTriangles.emplace_back(indexBase + triangle[0], indexBase + triangle[1],
-                indexBase + triangle[2]);
+            triangleMesh.mIndexedTriangles.emplace_back(
+                indexBase + triangle[0], indexBase + triangle[1], indexBase + triangle[2]);
 
         return true;
     }
