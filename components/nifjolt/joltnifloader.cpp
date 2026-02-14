@@ -1,6 +1,7 @@
 #include "joltnifloader.hpp"
 
 #include <cassert>
+#include <optional>
 #include <sstream>
 #include <tuple>
 #include <variant>
@@ -267,17 +268,30 @@ namespace NifJolt
         if (const Nif::NiNode* ninode = dynamic_cast<const Nif::NiNode*>(&node))
         {
             const Nif::Parent currentParent{ *ninode, parent };
-            for (const auto& child : ninode->mChildren)
+            std::optional<std::size_t> switchChildIndex;
+            if (node.mRecordType == Nif::RC_NiSwitchNode || node.mRecordType == Nif::RC_NiFltAnimationNode)
             {
+                if (const auto* switchNode = dynamic_cast<const Nif::NiSwitchNode*>(&node))
+                {
+                    switchChildIndex = switchNode->mInitialIndex;
+                    if (!ninode->mChildren.empty() && *switchChildIndex >= ninode->mChildren.size())
+                        switchChildIndex = 0;
+                }
+            }
+
+            for (std::size_t childIndex = 0; childIndex < ninode->mChildren.size(); ++childIndex)
+            {
+                if (switchChildIndex && childIndex != *switchChildIndex)
+                    continue;
+
+                const auto& child = ninode->mChildren[childIndex];
                 if (!child.empty())
                 {
                     assert(std::find(child->mParents.begin(), child->mParents.end(), ninode) != child->mParents.end());
                     handleNode(child.get(), &currentParent, args);
                 }
-                // For NiSwitchNodes and NiFltAnimationNodes, only use the first child
-                // TODO: must synchronize with the rendering scene graph somehow
-                // Doing this for NiLODNodes is unsafe (the first level might not be the closest)
-                if (node.mRecordType == Nif::RC_NiSwitchNode || node.mRecordType == Nif::RC_NiFltAnimationNode)
+
+                if (switchChildIndex)
                     break;
             }
         }
