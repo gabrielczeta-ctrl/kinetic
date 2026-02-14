@@ -78,14 +78,6 @@ namespace
         0, -25, -100, -100, -100, // row 4
     } };
 
-    constexpr std::array<float, 5 * 5> defaultHeightfieldDataScalar{ {
-        0, 0, 0, 0, 0, // row 0
-        0, -25, -25, -25, -25, // row 1
-        0, -25, -100, -100, -100, // row 2
-        0, -25, -100, -100, -100, // row 3
-        0, -25, -100, -100, -100, // row 4
-    } };
-
     template <std::size_t size>
     std::unique_ptr<JPH::RotatedTranslatedShape> makeSquareHeightfieldTerrainShape(
         const std::array<float, size>& values)
