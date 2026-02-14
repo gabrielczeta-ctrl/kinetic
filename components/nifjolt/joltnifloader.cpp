@@ -336,8 +336,22 @@ namespace NifJolt
             createdRef = scaledSettings.Create();
         }
 
-        // TODO: determine if has any animation in collision object at all so parent can be mutable
-        mShapeMutable = true;
+        if (args.mAnimated && !mShapeMutable)
+        {
+            mShapeMutable = true;
+
+            const auto promoteToMutable = [](std::unique_ptr<JPH::CompoundShapeSettings>& shapeSettings) {
+                if (!shapeSettings)
+                    return;
+
+                auto mutableSettings = std::make_unique<JPH::MutableCompoundShapeSettings>();
+                mutableSettings->mSubShapes = shapeSettings->mSubShapes;
+                shapeSettings = std::move(mutableSettings);
+            };
+
+            promoteToMutable(mCompoundShape);
+            promoteToMutable(mAvoidCompoundShape);
+        }
 
         if (!args.mAvoid)
         {
