@@ -1038,11 +1038,6 @@ namespace MWPhysics
     {
         for (auto& [_, object] : mObjects)
             object->commitPositionChange();
-
-        // NOTE: disabled as last step in simulation sets actor positions if changed
-        // TODO: evaluate if this is needed at all, if not, remove
-        // for (auto& [_, actor] : mActors)
-        //     actor->updateCollisionObjectPosition();
     }
 
     void PhysicsSystem::moveActors()
