@@ -118,7 +118,10 @@ namespace Resource
         {
             // NOTE: this assumes OSG-based physics shapes are not animated
             if (!mTriangleMesh)
+            {
                 mTriangleMesh.reset(new JPH::MeshShapeSettings);
+                mTriangleMesh->mBuildQuality = JPH::MeshShapeSettings::EBuildQuality::FavorRuntimePerformance;
+            }
 
             osg::Matrixf worldMat = osg::computeLocalToWorld(getNodePath());
 

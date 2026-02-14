@@ -307,6 +307,7 @@ namespace Nif
 
         // This makes a perhaps dangerous assumption that NiSkinPartition will never have more than 65536 triangles.
         JPH::MeshShapeSettings* mesh = new JPH::MeshShapeSettings;
+        mesh->mBuildQuality = JPH::MeshShapeSettings::EBuildQuality::FavorRuntimePerformance;
         triBasedGeomToJPHMeshShape(*mesh, *data);
         for (const auto triangles : triangleLists)
             trianglesToJPHMeshShape(*mesh, *triangles);
@@ -343,6 +344,7 @@ namespace Nif
             stripsLists.push_back(&data->mStrips);
 
         JPH::MeshShapeSettings* mesh = new JPH::MeshShapeSettings;
+        mesh->mBuildQuality = JPH::MeshShapeSettings::EBuildQuality::FavorRuntimePerformance;
         triBasedGeomToJPHMeshShape(*mesh, *data);
         for (const auto triangles : triangleLists)
             trianglesToJPHMeshShape(*mesh, *triangles);
