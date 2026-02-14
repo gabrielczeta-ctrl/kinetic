@@ -290,21 +290,21 @@ namespace MWRender
         JPH::DebugRenderer::ECullMode inCullMode, JPH::DebugRenderer::ECastShadow inCastShadow,
         JPH::DebugRenderer::EDrawMode inDrawMode)
     {
-        Mat44 model_matrix = inModelMatrix.ToMat44();
+        Mat44 modelMatrix = inModelMatrix.ToMat44();
 
         // Draw all geometry LODs
-        const Array<LOD>& geometry_lods = inGeometry->mLODs;
-        for (size_t lod = 0; lod < geometry_lods.size(); ++lod)
+        const Array<LOD>& geometryLods = inGeometry->mLODs;
+        for (size_t lod = 0; lod < geometryLods.size(); ++lod)
         {
             // Handle for a batch of triangles
-            BatchImpl* batchPtr = static_cast<BatchImpl*>(geometry_lods[lod].mTriangleBatch.GetPtr());
+            BatchImpl* batchPtr = static_cast<BatchImpl*>(geometryLods[lod].mTriangleBatch.GetPtr());
             osg::ref_ptr<osg::MatrixTransform> transformNode = new osg::MatrixTransform();
 
             // Set the transformation matrix for this instance
             osg::Matrix mat = osg::Matrix::identity();
             for (uint8_t x = 0; x < 4; x++)
                 for (uint8_t y = 0; y < 4; y++)
-                    mat(x, y) = model_matrix(y, x);
+                    mat(x, y) = modelMatrix(y, x);
 
             transformNode->setMatrix(mat);
             transformNode->addChild(batchPtr->mGeometry.get());

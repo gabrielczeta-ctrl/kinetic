@@ -87,8 +87,9 @@ namespace Resource
         void setMatrix(const osg::Matrixf& matrix) { mMatrix = matrix; }
 
         void inline operator()(const osg::Vec3& v1, const osg::Vec3& v2, const osg::Vec3& v3,
-            bool _temp = false) // Note: unused temp argument left here for OSG versions less than 3.5.6
+            bool temp = false) // Note: unused temp argument left here for OSG versions less than 3.5.6
         {
+            (void)temp;
             if (mTriMesh)
             {
                 uint32_t sizeC = mTriMesh->mTriangleVertices.size();
