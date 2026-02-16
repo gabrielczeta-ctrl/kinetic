@@ -23,7 +23,6 @@
 #include <array>
 #include <cassert>
 #include <cmath>
-#include <cxxabi.h>
 #include <sstream>
 #include <vector>
 
@@ -35,7 +34,8 @@ namespace DetourNavigator
         {
             osg::Vec3d pos(vec.x, vec.y, vec.z);
             osg::Vec3d result = pos * mat;
-            return JPH::Float3(result.x(), result.y(), result.z());
+            return JPH::Float3(
+                static_cast<float>(result.x()), static_cast<float>(result.y()), static_cast<float>(result.z()));
         }
 
         template <class TriangleBatchWalker>

@@ -479,7 +479,7 @@ Ubuntu_Clang_Tidy_other:
   needs:
     - Ubuntu_Clang_Tidy_components
   variables:
-    BUILD_TARGETS: components-tests bsatool esmtool openmw-launcher openmw-iniimporter openmw-essimporter openmw-wizard niftest openmw_test_suite openmw-navmeshtool openmw-physicsobjecttool
+    BUILD_TARGETS: components-tests bsatool esmtool openmw-launcher openmw-iniimporter openmw-essimporter openmw-wizard niftest openmw-navmeshtool openmw-physicsobjecttool
   timeout: 3h
 
 .Ubuntu_Clang_tests:
@@ -707,7 +707,7 @@ macOS15_Xcode16_arm64:
   group_name: "group-one"
 
 .variables-for-split-jobs: &target-group-two
-  targets: "bsatool components-tests esmtool niftest openmw-cs openmw-cs-tests openmw_detournavigator_navmeshtilescache_benchmark openmw_esm_refid_benchmark openmw_settings_access_benchmark openmw-bulletobjecttool openmw-essimporter openmw-iniimporter openmw-launcher openmw-navmeshtool openmw-wizard"
+  targets: "bsatool components-tests esmtool niftest openmw-cs openmw-cs-tests openmw_detournavigator_navmeshtilescache_benchmark openmw_esm_refid_benchmark openmw_settings_access_benchmark openmw-physicsobjecttool openmw-essimporter openmw-iniimporter openmw-launcher openmw-navmeshtool openmw-wizard"
   group_name: "group-two"
 
 .Windows_Ninja_Base:

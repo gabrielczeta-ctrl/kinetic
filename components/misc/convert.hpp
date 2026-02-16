@@ -22,7 +22,7 @@ namespace Misc::Convert
 
     inline osg::Vec3f makeOsgVec3f(const ESM::Pathgrid::Point& value)
     {
-        return osg::Vec3f(value.mX, value.mY, value.mZ);
+        return osg::Vec3f(static_cast<float>(value.mX), static_cast<float>(value.mY), static_cast<float>(value.mZ));
     }
 
     template <typename T>
@@ -37,10 +37,36 @@ namespace Misc::Convert
         return T(vec.x(), vec.y(), vec.z());
     }
 
+    template <>
+    inline JPH::Vec3 toJolt<JPH::Vec3>(const osg::Vec3d& vec)
+    {
+        return JPH::Vec3(static_cast<float>(vec.x()), static_cast<float>(vec.y()), static_cast<float>(vec.z()));
+    }
+
+    template <>
+    inline JPH::Float3 toJolt<JPH::Float3>(const osg::Vec3d& vec)
+    {
+        return JPH::Float3(static_cast<float>(vec.x()), static_cast<float>(vec.y()), static_cast<float>(vec.z()));
+    }
+
     template <typename T>
     inline T toJolt(const JPH::RVec3& vec)
     {
         return T(vec.GetX(), vec.GetY(), vec.GetZ());
+    }
+
+    template <>
+    inline JPH::Vec3 toJolt<JPH::Vec3>(const JPH::RVec3& vec)
+    {
+        return JPH::Vec3(
+            static_cast<float>(vec.GetX()), static_cast<float>(vec.GetY()), static_cast<float>(vec.GetZ()));
+    }
+
+    template <>
+    inline JPH::Float3 toJolt<JPH::Float3>(const JPH::RVec3& vec)
+    {
+        return JPH::Float3(
+            static_cast<float>(vec.GetX()), static_cast<float>(vec.GetY()), static_cast<float>(vec.GetZ()));
     }
 
     template <typename T>
@@ -51,7 +77,8 @@ namespace Misc::Convert
 
     inline JPH::Quat toJolt(const osg::Quat& quat)
     {
-        return JPH::Quat(quat.x(), quat.y(), quat.z(), quat.w());
+        return JPH::Quat(static_cast<float>(quat.x()), static_cast<float>(quat.y()), static_cast<float>(quat.z()),
+            static_cast<float>(quat.w()));
     }
 
     inline osg::Matrixd toOsgNoScale(const JPH::Mat44& joltMatrix)
@@ -73,13 +100,15 @@ namespace Misc::Convert
 
     inline osg::Vec3f toOsg(const JPH::RVec3& vec)
     {
-        return osg::Vec3f(vec.GetX(), vec.GetY(), vec.GetZ());
+        return osg::Vec3f(
+            static_cast<float>(vec.GetX()), static_cast<float>(vec.GetY()), static_cast<float>(vec.GetZ()));
     }
 
 #ifdef JPH_DOUBLE_PRECISION
     inline osg::Vec3f toOsg(const JPH::Vec3& vec)
     {
-        return osg::Vec3f(vec.GetX(), vec.GetY(), vec.GetZ());
+        return osg::Vec3f(
+            static_cast<float>(vec.GetX()), static_cast<float>(vec.GetY()), static_cast<float>(vec.GetZ()));
     }
 #endif
 

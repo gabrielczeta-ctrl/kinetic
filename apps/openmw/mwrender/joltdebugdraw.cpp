@@ -192,8 +192,8 @@ namespace MWRender
 
     void JoltDebugDrawer::DrawLine(JPH::RVec3Arg inFrom, JPH::RVec3Arg inTo, JPH::ColorArg inColor)
     {
-        mLinesVertices->push_back(osg::Vec3f(inFrom.GetX(), inFrom.GetY(), inFrom.GetZ()));
-        mLinesVertices->push_back(osg::Vec3f(inTo.GetX(), inTo.GetY(), inTo.GetZ()));
+        mLinesVertices->push_back(Misc::Convert::toOsg(inFrom));
+        mLinesVertices->push_back(Misc::Convert::toOsg(inTo));
         mLinesColors->push_back({ (float)inColor.r / 255.0f, (float)inColor.g / 255.0f, (float)inColor.b / 255.0f, 1 });
         mLinesColors->push_back({ (float)inColor.r / 255.0f, (float)inColor.g / 255.0f, (float)inColor.b / 255.0f, 1 });
     }

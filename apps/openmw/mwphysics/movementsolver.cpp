@@ -69,11 +69,11 @@ namespace MWPhysics
                     mDelta = delta;
                 }
 
-                float early_out = inResult.GetEarlyOutFraction();
-                if (early_out < GetEarlyOutFraction())
+                float earlyOut = inResult.GetEarlyOutFraction();
+                if (earlyOut < GetEarlyOutFraction())
                 {
                     // Update early out fraction to this hit
-                    UpdateEarlyOutFraction(early_out);
+                    UpdateEarlyOutFraction(earlyOut);
                 }
             }
 

@@ -89,7 +89,7 @@ namespace Resource
             (void)temp;
             if (mTriMesh)
             {
-                uint32_t sizeC = mTriMesh->mTriangleVertices.size();
+                const std::uint32_t sizeC = static_cast<std::uint32_t>(mTriMesh->mTriangleVertices.size());
                 mTriMesh->mTriangleVertices.push_back(Misc::Convert::toJolt<JPH::Float3>(mMatrix.preMult(v1)));
                 mTriMesh->mTriangleVertices.push_back(Misc::Convert::toJolt<JPH::Float3>(mMatrix.preMult(v2)));
                 mTriMesh->mTriangleVertices.push_back(Misc::Convert::toJolt<JPH::Float3>(mMatrix.preMult(v3)));

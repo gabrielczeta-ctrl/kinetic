@@ -28,7 +28,7 @@ namespace MWPhysics
         float mFraction;
 
         void doTrace(const JPH::BodyID actor, const osg::Vec3f& start, const osg::Vec3f& end,
-            const JPH::PhysicsSystem* world, const int collisionMask, bool attempt_short_trace = false);
+            const JPH::PhysicsSystem* world, const int collisionMask, bool attemptShortTrace = false);
         void findGround(const Actor* actor, const osg::Vec3f& start, const osg::Vec3f& end,
             const JPH::PhysicsSystem* physicsSystem);
     };

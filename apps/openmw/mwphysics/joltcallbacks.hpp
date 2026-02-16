@@ -23,11 +23,11 @@ namespace MWPhysics
         virtual void AddHit(const JPH::ShapeCastResult& inResult) override
         {
             // Test if this collision is closer/deeper than the previous one
-            float early_out = inResult.GetEarlyOutFraction();
-            if (early_out < GetEarlyOutFraction())
+            float earlyOut = inResult.GetEarlyOutFraction();
+            if (earlyOut < GetEarlyOutFraction())
             {
                 // Update early out fraction to this hit
-                UpdateEarlyOutFraction(early_out);
+                UpdateEarlyOutFraction(earlyOut);
 
                 // Get the contact properties
                 mHitCollisionObject = inResult.mBodyID2;

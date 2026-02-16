@@ -317,7 +317,7 @@ namespace MWPhysics
     std::tuple<unsigned, float> PhysicsTaskScheduler::calculateStepConfig(float timeAccum) const
     {
         int maxAllowedSteps = 2;
-        int numSteps = timeAccum / mDefaultPhysicsDt;
+        int numSteps = static_cast<int>(timeAccum / mDefaultPhysicsDt);
 
         // adjust maximum step count based on whether we're likely physics bottlenecked or not
         // if maxAllowedSteps ends up higher than numSteps, we will not invoke delta time
@@ -338,7 +338,7 @@ namespace MWPhysics
             maxAllowedSteps = 1;
         // physics is fairly cheap; limit based on expense
         if (budgetMeasurement < 0.5)
-            maxAllowedSteps = std::ceil(1.0 / budgetMeasurement);
+            maxAllowedSteps = static_cast<int>(std::ceil(1.0 / budgetMeasurement));
         // limit to a reasonable amount
         maxAllowedSteps = std::min(10, maxAllowedSteps);
 
@@ -372,7 +372,7 @@ namespace MWPhysics
         osg::Timer_t frameStart, unsigned int frameNumber, osg::Stats& stats)
     {
         // This function run in the main thread to prepare data for job dispatch
-        double timeStart = mTimer->tick();
+        osg::Timer_t timeStart = mTimer->tick();
 
         // start by finishing previous background computation
         syncSimulation();
@@ -544,10 +544,12 @@ namespace MWPhysics
 
     bool PhysicsTaskScheduler::hasLineOfSight(const Actor* actor1, const Actor* actor2)
     {
+        const float actor1EyeHeight = static_cast<float>(actor1->getHalfExtents().z() * 0.9);
+        const float actor2EyeHeight = static_cast<float>(actor2->getHalfExtents().z() * 0.9);
         JPH::RVec3 from = Misc::Convert::toJolt<JPH::RVec3>(
-            actor1->getCollisionObjectPosition() + osg::Vec3f(0, 0, actor1->getHalfExtents().z() * 0.9)); // eye level
+            actor1->getCollisionObjectPosition() + osg::Vec3f(0.0f, 0.0f, actor1EyeHeight)); // eye level
         JPH::RVec3 to = Misc::Convert::toJolt<JPH::RVec3>(
-            actor2->getCollisionObjectPosition() + osg::Vec3f(0, 0, actor2->getHalfExtents().z() * 0.9));
+            actor2->getCollisionObjectPosition() + osg::Vec3f(0.0f, 0.0f, actor2EyeHeight));
 
         auto diff = to - from;
         JPH::RRayCast ray(from, Misc::Convert::toJolt<JPH::Vec3>(diff));

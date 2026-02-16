@@ -54,12 +54,12 @@ namespace DetourNavigator
         m_flipQuadEdges = flipQuadEdges;
         m_useDiamondSubdivision = false;
         m_useZigzagSubdivision = false;
-        m_localScaling.Set(double(1.), double(1.), double(1.));
-        m_localAabbMin.Set(0, 0, m_minHeight);
-        m_localAabbMax.Set(m_width, m_length, m_maxHeight);
+        m_localScaling.Set(1.0f, 1.0f, 1.0f);
+        m_localAabbMin.Set(0.0f, 0.0f, static_cast<float>(m_minHeight));
+        m_localAabbMax.Set(static_cast<float>(m_width), static_cast<float>(m_length), static_cast<float>(m_maxHeight));
 
         // remember origin (defined as exact middle of aabb)
-        m_localOrigin = double(0.5) * (m_localAabbMin + m_localAabbMax);
+        m_localOrigin = 0.5f * (m_localAabbMin + m_localAabbMax);
     }
 
     void HeightfieldMeshBuilder::getAabb(JPH::Vec3& aabbMin, JPH::Vec3& aabbMax) const
@@ -82,10 +82,12 @@ namespace DetourNavigator
         assert(x < m_heightStickWidth);
         assert(y < m_heightStickLength);
 
-        double height = getRawHeightFieldValue(x, y);
+        const float height = getRawHeightFieldValue(x, y);
+        const float xOffset = static_cast<float>((-m_width / 2.0) + static_cast<double>(x));
+        const float yOffset = static_cast<float>((-m_length / 2.0) + static_cast<double>(y));
 
-        vertex.x = m_localScaling.GetX() * ((-m_width / double(2.0)) + x);
-        vertex.y = m_localScaling.GetY() * ((-m_length / double(2.0)) + y);
+        vertex.x = m_localScaling.GetX() * xOffset;
+        vertex.y = m_localScaling.GetY() * yOffset;
         vertex.z = m_localScaling.GetZ() * (height - m_localOrigin.GetZ());
     }
 

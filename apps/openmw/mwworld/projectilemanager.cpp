@@ -125,10 +125,10 @@ namespace
         if (projectileEffects.mList.size()
             > 1) // insert a VFX_Multiple projectile if there are multiple projectile effects
         {
-            const ESM::RefId ID = ESM::RefId::stringRefId("VFX_Multiple" + std::to_string(effects->mList.size()));
+            const ESM::RefId vfxId = ESM::RefId::stringRefId("VFX_Multiple" + std::to_string(effects->mList.size()));
             std::vector<ESM::RefId>::iterator it;
             it = projectileIDs.begin();
-            it = projectileIDs.insert(it, ID);
+            it = projectileIDs.insert(it, vfxId);
         }
         return projectileEffects;
     }
@@ -190,7 +190,8 @@ namespace MWWorld
     class RotateCallback : public SceneUtil::NodeCallback<RotateCallback, osg::PositionAttitudeTransform*>
     {
     public:
-        RotateCallback(const osg::Vec3f& axis = osg::Vec3f(0, -1, 0), float rotateSpeed = osg::PI * 2)
+        RotateCallback(
+            const osg::Vec3f& axis = osg::Vec3f(0, -1, 0), float rotateSpeed = static_cast<float>(osg::PI * 2.0))
             : mAxis(axis)
             , mRotateSpeed(rotateSpeed)
         {

@@ -436,8 +436,8 @@ namespace NifJolt
             if (args.mCollisionSwitchRecordIndex.has_value())
                 mShape->mCollisionSwitches.emplace(niGeometry.mRecordIndex, *args.mCollisionSwitchRecordIndex);
 
-            mCompoundShape->AddShape(JPH::Vec3(osgPos.x(), osgPos.y(), osgPos.z()),
-                JPH::Quat(osgQuat.x(), osgQuat.y(), osgQuat.z(), osgQuat.w()), createdRef.Get());
+            mCompoundShape->AddShape(
+                JPH::Vec3(osgPos.x(), osgPos.y(), osgPos.z()), Misc::Convert::toJolt(osgQuat), createdRef.Get());
         }
         else
         {
@@ -455,8 +455,8 @@ namespace NifJolt
                 }
             }
 
-            mAvoidCompoundShape->AddShape(JPH::Vec3(osgPos.x(), osgPos.y(), osgPos.z()),
-                JPH::Quat(osgQuat.x(), osgQuat.y(), osgQuat.z(), osgQuat.w()), createdRef.Get());
+            mAvoidCompoundShape->AddShape(
+                JPH::Vec3(osgPos.x(), osgPos.y(), osgPos.z()), Misc::Convert::toJolt(osgQuat), createdRef.Get());
         }
 
         // `childShape` is no longer needed after `Create()`, let unique_ptr clean it up.

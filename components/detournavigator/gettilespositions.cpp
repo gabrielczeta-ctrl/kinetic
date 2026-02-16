@@ -54,9 +54,10 @@ namespace DetourNavigator
         const int cellSize, const osg::Vec3f& shift, const RecastSettings& settings)
     {
         const int halfCellSize = cellSize / 2;
+        const auto halfCellSizeF = static_cast<osg::Vec3f::value_type>(halfCellSize);
 
-        osg::Vec3f aabbMin = shift + osg::Vec3f(-halfCellSize, -halfCellSize, 0);
-        osg::Vec3f aabbMax = shift + osg::Vec3f(halfCellSize, halfCellSize, 0);
+        osg::Vec3f aabbMin = shift + osg::Vec3f(-halfCellSizeF, -halfCellSizeF, 0.0f);
+        osg::Vec3f aabbMax = shift + osg::Vec3f(halfCellSizeF, halfCellSizeF, 0.0f);
 
         aabbMin.set(std::min(aabbMin.x(), aabbMax.x()), std::min(aabbMin.y(), aabbMax.y()), aabbMin.z());
         aabbMax.set(std::max(aabbMin.x(), aabbMax.x()), std::max(aabbMin.y(), aabbMax.y()), aabbMax.z());

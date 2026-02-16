@@ -70,8 +70,9 @@ namespace MWPhysics
     }
 
     void ActorTracer::doTrace(const JPH::BodyID actor, const osg::Vec3f& start, const osg::Vec3f& end,
-        const JPH::PhysicsSystem* physicsSystem, const int collisionMask, bool attempt_short_trace)
+        const JPH::PhysicsSystem* physicsSystem, const int collisionMask, bool attemptShortTrace)
     {
+        (void)attemptShortTrace;
         const JPH::RVec3 jphStart = Misc::Convert::toJolt<JPH::RVec3>(start);
         JPH::RVec3 jphEnd = Misc::Convert::toJolt<JPH::RVec3>(end);
 
