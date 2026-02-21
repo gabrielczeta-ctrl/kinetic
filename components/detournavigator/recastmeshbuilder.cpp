@@ -280,8 +280,12 @@ namespace DetourNavigator
         const float stepSize = getHeightfieldScale(cellSize, size);
         const int halfCellSize = cellSize / 2;
         const auto local = [&](float v, float axisShift) { return (v - axisShift + halfCellSize) / stepSize; };
-        const auto index = [&](float v, int add)
-        { return std::clamp<int>(static_cast<int>(v) + add, 0, static_cast<int>(size)); };
+        const auto index = [&](float v, int add) -> std::size_t {
+            const int value = static_cast<int>(v) + add;
+            if (value <= 0)
+                return 0;
+            return std::min(static_cast<std::size_t>(value), size);
+        };
         const std::size_t minX = index(std::round(local(intersection->mMin.x(), shift.x())), -1);
         const std::size_t minY = index(std::round(local(intersection->mMin.y(), shift.y())), -1);
         const std::size_t maxX = index(std::round(local(intersection->mMax.x(), shift.x())), 1);
