@@ -28,7 +28,8 @@ namespace MWPhysics
         JPH::Vec3 terrainScale(scaling, 1.0f, scaling); // NOTE: jolt heightfield is Y up, its rotated below
 
         // Create height field
-        JPH::HeightFieldShapeSettings shapeSettings(heights, terrainOffset, terrainScale, verts);
+        JPH::HeightFieldShapeSettings shapeSettings(
+            heights, terrainOffset, terrainScale, static_cast<JPH::uint32>(verts));
         shapeSettings.mMinHeightValue = minH;
         shapeSettings.mMaxHeightValue = maxH;
         shapeSettings.mBitsPerSample = 8;

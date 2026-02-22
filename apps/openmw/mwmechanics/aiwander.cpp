@@ -129,7 +129,8 @@ namespace MWMechanics
                     if (std::abs(allowedPositions[j].x() - point.x()) <= 0.5
                         && std::abs(allowedPositions[j].y() - point.y()) <= 0.5)
                     {
-                        allowedPositions.erase(allowedPositions.begin() + j);
+                        allowedPositions.erase(
+                            allowedPositions.begin() + static_cast<std::vector<osg::Vec3f>::difference_type>(j));
                         break;
                     }
                 }
@@ -376,7 +377,7 @@ namespace MWMechanics
     /*
      * Commands actor to walk to a random location near original spawn location.
      */
-    void AiWander::wanderNearStart(const MWWorld::Ptr& actor, AiWanderStorage& storage, int wanderDistance)
+    void AiWander::wanderNearStart(const MWWorld::Ptr& actor, AiWanderStorage& storage, unsigned wanderDistance)
     {
         const auto currentPosition = actor.getRefData().getPosition().asVec3();
 
@@ -651,7 +652,8 @@ namespace MWMechanics
         // Choose a different position and delete this one from possible positions because it is uncreachable:
         if (path.empty())
         {
-            storage.mAllowedPositions.erase(storage.mAllowedPositions.begin() + randomAllowedPositionIndex);
+            storage.mAllowedPositions.erase(storage.mAllowedPositions.begin()
+                + static_cast<std::vector<osg::Vec3f>::difference_type>(randomAllowedPositionIndex));
             return;
         }
 
@@ -671,7 +673,8 @@ namespace MWMechanics
 
         if (!mPathFinder.isPathConstructed())
         {
-            storage.mAllowedPositions.erase(storage.mAllowedPositions.begin() + randomAllowedPositionIndex);
+            storage.mAllowedPositions.erase(storage.mAllowedPositions.begin()
+                + static_cast<std::vector<osg::Vec3f>::difference_type>(randomAllowedPositionIndex));
             return;
         }
 
@@ -680,7 +683,8 @@ namespace MWMechanics
         mUsePathgrid = true;
         // Remove this position as an option and add back the previously used position (stops NPC from picking the
         // same position):
-        storage.mAllowedPositions.erase(storage.mAllowedPositions.begin() + randomAllowedPositionIndex);
+        storage.mAllowedPositions.erase(storage.mAllowedPositions.begin()
+            + static_cast<std::vector<osg::Vec3f>::difference_type>(randomAllowedPositionIndex));
         // check if mCurrentPosition was taken out of mAllowedPositions
         if (storage.mTrimCurrentPosition && storage.mAllowedPositions.size() > 1)
             storage.mTrimCurrentPosition = false;
@@ -817,7 +821,7 @@ namespace MWMechanics
                     break;
 
                 // Will try an another neighboring node
-                points.erase(points.begin() + randomIndex);
+                points.erase(points.begin() + static_cast<ESM::Pathgrid::PointList::difference_type>(randomIndex));
             }
 
             // there is no free space, nowhere to move
@@ -959,7 +963,8 @@ namespace MWMechanics
             }
         }
         storage.mCurrentPosition = storage.mAllowedPositions[index];
-        storage.mAllowedPositions.erase(storage.mAllowedPositions.begin() + index);
+        storage.mAllowedPositions.erase(
+            storage.mAllowedPositions.begin() + static_cast<std::vector<osg::Vec3f>::difference_type>(index));
     }
 
     void AiWander::writeState(ESM::AiSequence::AiSequence& sequence) const
@@ -976,7 +981,7 @@ namespace MWMechanics
         wander->mData.mTimeOfDay = static_cast<uint8_t>(mTimeOfDay);
         wander->mDurationData.mRemainingDuration = remainingDuration;
         assert(mIdle.size() == 8);
-        for (int i = 0; i < 8; ++i)
+        for (std::size_t i = 0; i < 8; ++i)
             wander->mData.mIdle[i] = mIdle[i];
         wander->mData.mShouldRepeat = mOptions.mRepeat;
         wander->mStoredInitialActorPosition = mStoredInitialActorPosition;

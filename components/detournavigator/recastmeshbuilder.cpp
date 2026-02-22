@@ -242,7 +242,8 @@ namespace DetourNavigator
     void RecastMeshBuilder::addObject(
         const JPH::CompoundShape& shape, const osg::Matrixd& transform, const AreaType areaType)
     {
-        for (int i = 0, num = shape.GetNumSubShapes(); i < num; ++i)
+        const JPH::uint num = shape.GetNumSubShapes();
+        for (JPH::uint i = 0; i < num; ++i)
         {
             auto childTransform = getSubShapeTransform(shape.GetSubShape(i));
             addObject(*shape.GetSubShape(i).mShape.GetPtr(), childTransform * transform, areaType);

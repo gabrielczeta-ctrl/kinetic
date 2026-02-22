@@ -46,8 +46,8 @@ namespace MWGui
 
     static std::vector<char> sLogCircularBuffer;
     static std::mutex sBufferMutex;
-    static int64_t sLogStartIndex;
-    static int64_t sLogEndIndex;
+    static std::size_t sLogStartIndex;
+    static std::size_t sLogEndIndex;
     static bool hasPrefix = false;
 
     void DebugWindow::startLogRecording()
@@ -77,7 +77,7 @@ namespace MWGui
             }
             bool bufferOverflow = false;
             std::lock_guard lock(sBufferMutex);
-            const int64_t bufSize = sLogCircularBuffer.size();
+            const std::size_t bufSize = sLogCircularBuffer.size();
             auto addChar = [&](char c) {
                 sLogCircularBuffer[sLogEndIndex++] = c;
                 if (sLogEndIndex == bufSize)
@@ -117,7 +117,7 @@ namespace MWGui
             return; // Don't change text while player is trying to copy something
 
         std::string addition;
-        const int64_t bufSize = sLogCircularBuffer.size();
+        const std::size_t bufSize = sLogCircularBuffer.size();
         {
             if (sLogStartIndex < sLogEndIndex)
                 addition = std::string(sLogCircularBuffer.data() + sLogStartIndex, sLogEndIndex - sLogStartIndex);
@@ -131,7 +131,7 @@ namespace MWGui
 
         size_t scrollPos = mLogView->getVScrollPosition();
         bool scrolledToTheEnd = scrollPos + 1 >= mLogView->getVScrollRange();
-        int64_t newSizeEstimation = mLogView->getTextLength() + addition.size();
+        const std::size_t newSizeEstimation = mLogView->getTextLength() + addition.size();
         if (newSizeEstimation > bufSize)
             mLogView->eraseText(0, newSizeEstimation - bufSize);
         mLogView->addText(addition);

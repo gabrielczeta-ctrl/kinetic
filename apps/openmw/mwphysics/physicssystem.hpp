@@ -326,7 +326,7 @@ namespace MWPhysics
 
         float mTimeAccum;
 
-        unsigned int mProjectileId;
+        int mProjectileId;
 
         float mTimeAccumJolt = 0.0f;
         float mWaterHeight;

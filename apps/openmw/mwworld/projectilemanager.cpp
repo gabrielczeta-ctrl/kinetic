@@ -802,9 +802,9 @@ namespace MWWorld
         if (reader.mActorIdConverter)
         {
             for (ProjectileState& projectile : mProjectiles)
-                reader.mActorIdConverter->convert(projectile.mCaster, projectile.mCaster.mIndex);
+                reader.mActorIdConverter->convert(projectile.mCaster, static_cast<int>(projectile.mCaster.mIndex));
             for (MagicBoltState& bolt : mMagicBolts)
-                reader.mActorIdConverter->convert(bolt.mCaster, bolt.mCaster.mIndex);
+                reader.mActorIdConverter->convert(bolt.mCaster, static_cast<int>(bolt.mCaster.mIndex));
         }
     }
 

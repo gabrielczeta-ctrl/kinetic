@@ -93,7 +93,8 @@ namespace
         JPH::Vec3 terrainOffset(0.0f, 0, 0.0f);
         JPH::Vec3 terrainScale(128.0f, 1.0f, -128.0f); // NOTE: jolt heightfield is Y up, its rotated below
 
-        JPH::HeightFieldShapeSettings settings(values.data(), terrainOffset, terrainScale, width);
+        JPH::HeightFieldShapeSettings settings(
+            values.data(), terrainOffset, terrainScale, static_cast<JPH::uint32>(width));
         settings.mMinHeightValue = -greater;
         settings.mMaxHeightValue = greater;
         settings.mBlockSize = 2;
@@ -116,7 +117,7 @@ namespace
         surface.mHeights = values.data();
         surface.mMinHeight = -greater;
         surface.mMaxHeight = greater;
-        surface.mSize = static_cast<int>(std::sqrt(size));
+        surface.mSize = static_cast<std::size_t>(std::sqrt(size));
         return surface;
     }
 

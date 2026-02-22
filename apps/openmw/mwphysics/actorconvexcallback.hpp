@@ -8,6 +8,8 @@
 #include <components/debug/debuglog.hpp>
 #include <components/misc/convert.hpp>
 
+#include <osg/Vec3f>
+
 #include "../mwrender/joltdebugdraw.hpp"
 
 #include "joltlayers.hpp"
@@ -22,12 +24,12 @@ namespace MWPhysics
             : mClosestHitFraction(0.0f)
             , mMinCollisionDot(0.0f)
             , mHitCollisionLayer(0)
-            , mHitPointWorld(JPH::RVec3(0.0, 0.0, 0.0))
+            , mHitPointWorld(0.0f, 0.0f, 0.0f)
             , mHitNormalWorld(JPH::Vec3(0.0, 0.0, 0.0))
             , mMotion(JPH::Vec3(0.0, 0.0, 0.0))
             , mPhysicsSystem(nullptr)
-            , mSelfCenterWorld(JPH::RVec3(0.0, 0.0, 0.0))
-            , mOrigin(JPH::RVec3(0.0, 0.0, 0.0))
+            , mSelfCenterWorld(0.0f, 0.0f, 0.0f)
+            , mOrigin(0.0f, 0.0f, 0.0f)
         {
         }
 
@@ -36,12 +38,12 @@ namespace MWPhysics
             : mMinCollisionDot(minCollisionDot)
             , mMe(actor)
             , mHitCollisionLayer(0)
-            , mHitPointWorld(JPH::RVec3(0.0, 0.0, 0.0))
-            , mHitNormalWorld(JPH::RVec3(0.0, 0.0, 0.0))
+            , mHitPointWorld(0.0f, 0.0f, 0.0f)
+            , mHitNormalWorld(JPH::Vec3(0.0f, 0.0f, 0.0f))
             , mMotion(motion)
             , mPhysicsSystem(inPhysicsSystem)
-            , mSelfCenterWorld(selfCenterWorld)
-            , mOrigin(origin)
+            , mSelfCenterWorld(Misc::Convert::toOsg(selfCenterWorld))
+            , mOrigin(Misc::Convert::toOsg(origin))
         {
         }
 
@@ -76,7 +78,7 @@ namespace MWPhysics
                 bool isOverlapping = inResult.mPenetrationDepth != 0.0f;
                 if (isOverlapping)
                 {
-                    auto originA = Misc::Convert::toOsg(mSelfCenterWorld);
+                    auto originA = mSelfCenterWorld;
                     auto originB = Misc::Convert::toOsg(body->GetCenterOfMassTransform().GetTranslation());
                     osg::Vec3f motion = Misc::Convert::toOsg(mMotion);
                     osg::Vec3f normal = (originA - originB);
@@ -94,7 +96,7 @@ namespace MWPhysics
                             // Get the contact properties
                             mHitCollisionObject = body;
                             mHitCollisionLayer = collisionGroup;
-                            mHitPointWorld = mOrigin + inResult.mContactPointOn2;
+                            mHitPointWorld = mOrigin + Misc::Convert::toOsg(inResult.mContactPointOn2);
                             mHitNormalWorld = Misc::Convert::toJolt<JPH::Vec3>(normal);
                             mClosestHitFraction = 0.0f;
                             ForceEarlyOut();
@@ -121,7 +123,7 @@ namespace MWPhysics
                 // Get the contact properties
                 mHitCollisionObject = body;
                 mHitCollisionLayer = collisionGroup;
-                mHitPointWorld = mOrigin + inResult.mContactPointOn2;
+                mHitPointWorld = mOrigin + Misc::Convert::toOsg(inResult.mContactPointOn2);
                 mHitNormalWorld = hitNormalWorld;
                 mClosestHitFraction = inResult.mFraction;
             }
@@ -135,14 +137,14 @@ namespace MWPhysics
         const JPH::Body* mHitCollisionObject = nullptr;
 
         JPH::ObjectLayer mHitCollisionLayer;
-        JPH::RVec3 mHitPointWorld;
+        osg::Vec3f mHitPointWorld;
         JPH::Vec3 mHitNormalWorld;
         JPH::Vec3 mMotion;
 
     private:
         const JPH::PhysicsSystem* mPhysicsSystem;
-        JPH::RVec3 mSelfCenterWorld;
-        JPH::RVec3 mOrigin;
+        osg::Vec3f mSelfCenterWorld;
+        osg::Vec3f mOrigin;
     };
 }
 

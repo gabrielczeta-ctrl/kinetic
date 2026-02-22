@@ -5,6 +5,8 @@
 #include <Jolt/Physics/Collision/CollideShape.h>
 #include <Jolt/Physics/Collision/Shape/Shape.h>
 
+#include <osg/Vec3f>
+
 namespace MWPhysics
 {
     class ClosestConvexResultCallback : public JPH::CastShapeCollector
@@ -13,10 +15,10 @@ namespace MWPhysics
         JPH::BodyID mHitCollisionObject;
         float mClosestHitFraction;
         JPH::Vec3 mHitNormalWorld;
-        JPH::RVec3 mHitPointWorld;
+        osg::Vec3f mHitPointWorld;
 
         explicit ClosestConvexResultCallback(JPH::RVec3 origin)
-            : mOrigin(origin)
+            : mOrigin(Misc::Convert::toOsg(origin))
         {
         }
 
@@ -31,7 +33,7 @@ namespace MWPhysics
 
                 // Get the contact properties
                 mHitCollisionObject = inResult.mBodyID2;
-                mHitPointWorld = mOrigin + inResult.mContactPointOn2;
+                mHitPointWorld = mOrigin + Misc::Convert::toOsg(inResult.mContactPointOn2);
                 mHitNormalWorld = -inResult.mPenetrationAxis.Normalized();
                 mClosestHitFraction = inResult.mFraction;
             }
@@ -40,15 +42,14 @@ namespace MWPhysics
         bool hasHit() const { return !mHitCollisionObject.IsInvalid(); }
 
     protected:
-        JPH::RVec3 mOrigin;
+        osg::Vec3f mOrigin;
     };
 
     class ContactTestResultCallback : public JPH::CollideShapeCollector
     {
     public:
-        explicit ContactTestResultCallback(const JPH::PhysicsSystem* physicsSystem, JPH::BodyID& me, JPH::RVec3 origin)
+        explicit ContactTestResultCallback(const JPH::PhysicsSystem* physicsSystem, JPH::BodyID& me)
             : mPhysicsSystem(physicsSystem)
-            , mOrigin(origin)
             , mMe(me)
         {
         }
@@ -82,7 +83,6 @@ namespace MWPhysics
 
     protected:
         const JPH::PhysicsSystem* mPhysicsSystem;
-        JPH::RVec3 mOrigin;
         JPH::BodyID mMe;
     };
 }

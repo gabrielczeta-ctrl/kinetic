@@ -19,7 +19,8 @@ namespace DetourNavigator
         {
             assert(static_cast<std::size_t>(shape.GetNumSubShapes()) == children.size());
             bool result = false;
-            for (int i = 0, num = shape.GetNumSubShapes(); i < num; ++i)
+            const JPH::uint num = shape.GetNumSubShapes();
+            for (JPH::uint i = 0; i < num; ++i)
             {
                 assert(shape.GetSubShape(i).mShape
                     == std::addressof(*children[static_cast<std::size_t>(i)].getShape().GetPtr()));
@@ -32,7 +33,8 @@ namespace DetourNavigator
         std::vector<ChildRecastMeshObject> makeChildrenObjects(const JPH::CompoundShape& shape, const AreaType areaType)
         {
             std::vector<ChildRecastMeshObject> result;
-            for (int i = 0, num = shape.GetNumSubShapes(); i < num; ++i)
+            const JPH::uint num = shape.GetNumSubShapes();
+            for (JPH::uint i = 0; i < num; ++i)
             {
                 auto shapeTransform = getSubShapeTransform(shape.GetSubShape(i));
                 result.emplace_back(shape.GetSubShape(i), shapeTransform, areaType);

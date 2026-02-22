@@ -164,7 +164,7 @@ namespace MWPhysics
             auto nodePathFound = mRecIndexToNodePath.find(recordIndex);
             if (nodePathFound == mRecIndexToNodePath.end())
             {
-                NifOsg::FindGroupByRecordIndex visitor(recordIndex);
+                NifOsg::FindGroupByRecordIndex visitor(static_cast<unsigned int>(recordIndex));
                 mPtr.getRefData().getBaseNode()->accept(visitor);
                 if (!visitor.mFound)
                     return nullptr;
@@ -193,7 +193,8 @@ namespace MWPhysics
 
             assert(static_cast<int>(compound->GetNumSubShapes()) > shapeIndex);
 
-            const JPH::CompoundShape::SubShape& subShape = compound->GetSubShape(shapeIndex);
+            const JPH::uint shapeIndexUnsigned = static_cast<JPH::uint>(shapeIndex);
+            const JPH::CompoundShape::SubShape& subShape = compound->GetSubShape(shapeIndexUnsigned);
             JPH::RefConst<JPH::Shape> childShape = subShape.mShape;
             auto subShapePosition = subShape.GetPositionCOM();
             auto subShapeRotation = subShape.GetRotation();
@@ -209,7 +210,7 @@ namespace MWPhysics
                     static const JPH::Quat disabledRotation = JPH::Quat::sIdentity();
                     if (subShapePosition != disabledPosition || subShapeRotation != disabledRotation)
                     {
-                        compound->ModifyShape(shapeIndex, disabledPosition, disabledRotation);
+                        compound->ModifyShape(shapeIndexUnsigned, disabledPosition, disabledRotation);
                         result = true;
                     }
                     continue;
@@ -234,12 +235,12 @@ namespace MWPhysics
             {
                 const JPH::Shape* baseSubshape = isScaledSubshape ? scaledPtr->GetInnerShape() : childShape.GetPtr();
                 JPH::ScaledShape* newShape = new JPH::ScaledShape(baseSubshape, newScale);
-                compound->ModifyShape(shapeIndex, origin, rotation, newShape);
+                compound->ModifyShape(shapeIndexUnsigned, origin, rotation, newShape);
                 result = true;
             }
             else if (subShapeRotation != rotation || origin != subShapePosition)
             {
-                compound->ModifyShape(shapeIndex, origin, rotation);
+                compound->ModifyShape(shapeIndexUnsigned, origin, rotation);
                 result = true;
             }
         }

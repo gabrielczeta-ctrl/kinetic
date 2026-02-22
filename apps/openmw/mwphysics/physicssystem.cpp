@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdarg>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -261,8 +262,11 @@ namespace MWPhysics
                 case LockingPolicy::NoLocks:
                     return 0;
                 case LockingPolicy::AllowSharedLocks:
-                    return static_cast<unsigned>(
-                        std::clamp<int>(Settings::physics().mAsyncNumThreads, 0, std::thread::hardware_concurrency()));
+                {
+                    const int configuredThreads = Settings::physics().mAsyncNumThreads;
+                    const unsigned requested = configuredThreads > 0 ? static_cast<unsigned>(configuredThreads) : 0u;
+                    return std::min(requested, std::thread::hardware_concurrency());
+                }
             }
 
             throw std::runtime_error("Unsupported LockingPolicy: "
@@ -540,7 +544,7 @@ namespace MWPhysics
         result.mHit = callback.hasHit();
         if (result.mHit)
         {
-            result.mHitPos = Misc::Convert::toOsg(callback.mHitPointWorld);
+            result.mHitPos = callback.mHitPointWorld;
             result.mHitNormal = Misc::Convert::toOsg(callback.mHitNormalWorld);
             if (auto* ptrHolder = static_cast<PtrHolder*>(mTaskScheduler->getUserPointer(callback.mHitCollisionObject)))
                 result.mHitObject = ptrHolder->getPtr();
@@ -666,8 +670,10 @@ namespace MWPhysics
         // This sets layer filters to avoid collisions with static geometry in those cases, and allows with
         // actors->actors etc if needed this is important to prevent Jolt comlaining that two triangle mesh shapes
         // cannot collide
+        const JPH::ObjectLayer collisionLayer = static_cast<JPH::ObjectLayer>(
+            std::clamp(collisionGroup, 0, static_cast<int>(std::numeric_limits<JPH::ObjectLayer>::max())));
         JPH::DefaultBroadPhaseLayerFilter broadphaseLayerFilter
-            = mPhysicsSystem.GetDefaultBroadPhaseLayerFilter(static_cast<JPH::ObjectLayer>(collisionGroup));
+            = mPhysicsSystem.GetDefaultBroadPhaseLayerFilter(collisionLayer);
         MaskedObjectLayerFilter objectLayerFilter(collisionMask);
 
         JPH::CollideShapeSettings settings;
@@ -678,7 +684,7 @@ namespace MWPhysics
         // WARNING: you cannot collide mesh->mesh shapes in Jolt, so this should filter to avoid that (only collide with
         // actors etc)
         auto scale = JPH::Vec3::sReplicate(1.0f);
-        ContactTestResultCallback resultCallback(&mPhysicsSystem, me, transform.GetTranslation());
+        ContactTestResultCallback resultCallback(&mPhysicsSystem, me);
         mPhysicsSystem.GetNarrowPhaseQuery().CollideShape(shape, scale, transform, settings, JPH::RVec3::sZero(),
             resultCallback, broadphaseLayerFilter, objectLayerFilter);
         return resultCallback.mResult;

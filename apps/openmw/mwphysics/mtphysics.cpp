@@ -510,7 +510,7 @@ namespace MWPhysics
         const int numLOS = static_cast<int>(mLOSCache.size());
         while ((job = mNextLOS.fetch_add(1, std::memory_order_relaxed)) < numLOS)
         {
-            auto& req = mLOSCache[job];
+            auto& req = mLOSCache[static_cast<std::size_t>(job)];
             auto actorPtr1 = req.mActors[0].lock();
             auto actorPtr2 = req.mActors[1].lock();
 
@@ -574,7 +574,7 @@ namespace MWPhysics
             // Before any jobs spawned for this sim step
             afterPreStep();
 
-            const uint32_t jobCount = mNumJobs;
+            const uint32_t jobCount = static_cast<uint32_t>(mNumJobs);
             const uint32_t groupSize = std::clamp((jobCount + mNumThreads - 1) / mNumThreads, 2u, 32u);
             const uint32_t groupCount = (jobCount + groupSize - 1) / groupSize;
 

@@ -143,7 +143,7 @@ namespace MWMechanics
         void onChooseActionStatePerFrameActions(const MWWorld::Ptr& actor, AiWanderStorage& storage);
         bool reactionTimeActions(const MWWorld::Ptr& actor, AiWanderStorage& storage, ESM::Position& pos);
         inline bool isPackageCompleted() const;
-        void wanderNearStart(const MWWorld::Ptr& actor, AiWanderStorage& storage, int wanderDistance);
+        void wanderNearStart(const MWWorld::Ptr& actor, AiWanderStorage& storage, unsigned wanderDistance);
         bool destinationIsAtWater(const MWWorld::Ptr& actor, const osg::Vec3f& destination);
         void completeManualWalking(const MWWorld::Ptr& actor, AiWanderStorage& storage);
         bool isNearAllowedPosition(const MWWorld::Ptr& actor, const AiWanderStorage& storage, float distance) const;

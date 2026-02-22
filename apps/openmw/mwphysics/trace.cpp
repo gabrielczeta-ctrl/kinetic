@@ -84,7 +84,7 @@ namespace MWPhysics
             mFraction = traceCallback.mClosestHitFraction;
             mPlaneNormal = Misc::Convert::toOsg(traceCallback.mHitNormalWorld);
             mEndPos = (end - start) * mFraction + start;
-            mHitPoint = Misc::Convert::toOsg(traceCallback.mHitPointWorld);
+            mHitPoint = traceCallback.mHitPointWorld;
             mHitObject = traceCallback.mHitCollisionObject;
             mHitObjectLayer = traceCallback.mHitCollisionLayer;
         }

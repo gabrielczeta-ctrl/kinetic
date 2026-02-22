@@ -1,5 +1,6 @@
 #include "node.hpp"
 
+#include <algorithm>
 #include <cstdint>
 
 #include <Jolt/Jolt.h>
@@ -21,11 +22,12 @@ namespace
     {
         // FIXME: copying vertices/indices individually is unreasonable
         const std::vector<osg::Vec3f>& vertices = data.mVertices;
-        mesh.mTriangleVertices.reserve(static_cast<int>(vertices.size()));
+        mesh.mTriangleVertices.reserve(vertices.size());
         for (const osg::Vec3f& vertex : vertices)
             mesh.mTriangleVertices.push_back(Misc::Convert::toJolt<JPH::Float3>(vertex));
 
-        mesh.mIndexedTriangles.reserve(static_cast<int>(data.mNumTriangles));
+        mesh.mIndexedTriangles.reserve(
+            data.mNumTriangles > 0 ? static_cast<std::size_t>(data.mNumTriangles) : std::size_t{ 0 });
     }
 
     void trianglesToJPHMeshShape(JPH::MeshShapeSettings& mesh, const std::vector<unsigned short>& triangles)

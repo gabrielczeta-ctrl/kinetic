@@ -222,12 +222,17 @@ namespace MWRender
         primitive->mGeometry = new osg::Geometry();
 
         // Each triangle has 3 vertices
-        int inVertexCount = inTriangleCount * 3;
+        const int inVertexCount = inTriangleCount * 3;
+        const std::size_t vertexCount = static_cast<std::size_t>(inVertexCount);
+        const auto toUIntCount = [](std::size_t value) {
+            constexpr auto maxCount = static_cast<std::size_t>(std::numeric_limits<unsigned int>::max());
+            return static_cast<unsigned int>(std::min(value, maxCount));
+        };
 
         // Create a vertex array
-        osg::ref_ptr<osg::Vec3Array> vertices = new osg::Vec3Array(inVertexCount);
+        osg::ref_ptr<osg::Vec3Array> vertices = new osg::Vec3Array(toUIntCount(vertexCount));
         osg::ref_ptr<osg::DrawElementsUInt> indices
-            = new osg::DrawElementsUInt(osg::PrimitiveSet::TRIANGLES, inVertexCount);
+            = new osg::DrawElementsUInt(osg::PrimitiveSet::TRIANGLES, toUIntCount(vertexCount));
 
         for (int i = 0; i < inTriangleCount; ++i)
         {
@@ -235,8 +240,10 @@ namespace MWRender
             for (int j = 0; j < 3; ++j) // Each triangle has 3 vertices
             {
                 const JPH::DebugRenderer::Vertex& vertex = triangle.mV[j];
-                (*vertices)[i * 3 + j].set(vertex.mPosition.x, vertex.mPosition.y, vertex.mPosition.z);
-                (*indices)[i * 3 + j] = i * 3 + j; // Direct mapping of vertex to index
+                const std::size_t index = static_cast<std::size_t>(i * 3 + j);
+                (*vertices)[index].set(static_cast<float>(vertex.mPosition.x), static_cast<float>(vertex.mPosition.y),
+                    static_cast<float>(vertex.mPosition.z));
+                (*indices)[index] = static_cast<unsigned int>(i * 3 + j); // Direct mapping of vertex to index
             }
         }
 
@@ -257,25 +264,31 @@ namespace MWRender
     {
         if (inVertices == nullptr || inVertexCount == 0 || inIndices == nullptr || inIndexCount == 0)
             return mEmptyBatch;
+        const auto toUIntCount = [](std::size_t value) {
+            constexpr auto maxCount = static_cast<std::size_t>(std::numeric_limits<unsigned int>::max());
+            return static_cast<unsigned int>(std::min(value, maxCount));
+        };
 
         // Create a new OSG geometry object
         BatchImpl* primitive = new BatchImpl(); // always a triangle list topology
         primitive->mGeometry = new osg::Geometry();
 
         // Create a vertex array and fill it with the vertices from inVertices
-        osg::ref_ptr<osg::Vec3Array> vertices = new osg::Vec3Array(inVertexCount);
+        osg::ref_ptr<osg::Vec3Array> vertices
+            = new osg::Vec3Array(toUIntCount(static_cast<std::size_t>(inVertexCount)));
         for (int i = 0; i < inVertexCount; ++i)
         {
             const JPH::DebugRenderer::Vertex& vertex = inVertices[i];
-            (*vertices)[i].set(vertex.mPosition.x, vertex.mPosition.y, vertex.mPosition.z);
+            (*vertices)[static_cast<std::size_t>(i)].set(static_cast<float>(vertex.mPosition.x),
+                static_cast<float>(vertex.mPosition.y), static_cast<float>(vertex.mPosition.z));
         }
 
         // Create a new DrawElementsUInt object for the indices
-        osg::ref_ptr<osg::DrawElementsUInt> indices
-            = new osg::DrawElementsUInt(osg::PrimitiveSet::TRIANGLES, inIndexCount);
+        osg::ref_ptr<osg::DrawElementsUInt> indices = new osg::DrawElementsUInt(
+            osg::PrimitiveSet::TRIANGLES, toUIntCount(static_cast<std::size_t>(inIndexCount)));
         for (int i = 0; i < inIndexCount; ++i)
         {
-            (*indices)[i] = inIndices[i];
+            (*indices)[static_cast<std::size_t>(i)] = inIndices[i];
         }
 
         primitive->mGeometry->setVertexArray(vertices.get());
