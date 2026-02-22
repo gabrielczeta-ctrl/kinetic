@@ -607,7 +607,7 @@ namespace MWPhysics
             }
 
             // Wait for step to complete
-            barrier->AddJobs(handles.data(), static_cast<uint>(handles.size()));
+            barrier->AddJobs(handles.data(), static_cast<JPH::uint>(handles.size()));
             mJobSystem->WaitForJobs(barrier);
             mJobSystem->DestroyBarrier(barrier);
 

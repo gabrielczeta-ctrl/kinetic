@@ -1,3 +1,9 @@
+#include <components/debug/debugging.hpp>
+#include <components/misc/strings/conversion.hpp>
+#include <components/settings/parser.hpp>
+#include <components/settings/values.hpp>
+#include <components/testing/util.hpp>
+
 #include <gtest/gtest.h>
 
 // clang-format off
@@ -6,21 +12,12 @@
 #include <Jolt/RegisterTypes.h>
 // clang-format on
 
-#include "components/misc/strings/conversion.hpp"
-#include "components/settings/parser.hpp"
-#include "components/settings/values.hpp"
-
 #include <filesystem>
 
-#ifdef WIN32
-// we cannot use GTEST_API_ before main if we're building standalone exe application,
-// and we're linking GoogleTest / GoogleMock as DLLs and not linking gtest_main / gmock_main
 int main(int argc, char** argv)
 {
-#else
-GTEST_API_ int main(int argc, char** argv)
-{
-#endif
+    Log::sMinDebugLevel = Debug::getDebugLevel();
+
     JPH::RegisterDefaultAllocator();
     JPH::Factory::sInstance = new JPH::Factory();
     JPH::RegisterTypes();
@@ -39,5 +36,8 @@ GTEST_API_ int main(int argc, char** argv)
 
     testing::InitGoogleTest(&argc, argv);
 
-    return RUN_ALL_TESTS();
+    const int result = RUN_ALL_TESTS();
+    if (result == 0)
+        std::filesystem::remove_all(TestingOpenMW::outputDir());
+    return result;
 }
