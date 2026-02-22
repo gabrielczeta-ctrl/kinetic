@@ -382,7 +382,7 @@ namespace MWPhysics
         updateStats(frameStart, frameNumber, stats);
 
         auto [numSteps, newDelta] = calculateStepConfig(timeAccum);
-        timeAccum -= numSteps * newDelta;
+        timeAccum -= static_cast<float>(numSteps) * newDelta;
 
         // init
         const Visitors::InitPosition vis{ mPhysicsSystem };
@@ -397,7 +397,7 @@ namespace MWPhysics
         mPhysicsDt = newDelta;
         mSimulations = &simulations;
         mAdvanceSimulation = (mRemainingSteps != 0);
-        mNumJobs = mSimulations->size();
+        mNumJobs = static_cast<int>(mSimulations->size());
         mNextLOS.store(0, std::memory_order_relaxed);
 
         if (mAdvanceSimulation)
@@ -607,7 +607,7 @@ namespace MWPhysics
             }
 
             // Wait for step to complete
-            barrier->AddJobs(handles.data(), handles.size());
+            barrier->AddJobs(handles.data(), static_cast<uint>(handles.size()));
             mJobSystem->WaitForJobs(barrier);
             mJobSystem->DestroyBarrier(barrier);
 

@@ -392,9 +392,10 @@ namespace MWMechanics
 
         do
         {
+            const float wanderDistanceF = static_cast<float>(wanderDistance);
 
             // Determine a random location within radius of original position
-            const float wanderRadius = (0.2f + Misc::Rng::rollClosedProbability(prng) * 0.8f) * wanderDistance;
+            const float wanderRadius = (0.2f + Misc::Rng::rollClosedProbability(prng) * 0.8f) * wanderDistanceF;
             if (!isWaterCreature && !isFlyingCreature)
             {
                 // findRandomPointAroundCircle uses wanderDistance as limit for random and not as exact distance
@@ -405,13 +406,14 @@ namespace MWMechanics
                 if (destination.has_value())
                 {
                     osg::Vec3f direction = *destination - mInitialActorPosition;
-                    if (direction.length() > wanderDistance)
+                    if (direction.length() > wanderDistanceF)
                     {
                         direction.normalize();
                         const osg::Vec3f adjustedDestination = mInitialActorPosition + direction * wanderRadius;
                         destination = DetourNavigator::raycast(
                             *navigator, agentBounds, currentPosition, adjustedDestination, navigatorFlags);
-                        if (destination.has_value() && (*destination - mInitialActorPosition).length() > wanderDistance)
+                        if (destination.has_value()
+                            && (*destination - mInitialActorPosition).length() > wanderDistanceF)
                             continue;
                     }
                 }
@@ -802,7 +804,7 @@ namespace MWMechanics
                 for (int j = 1; j <= 3; j++)
                 {
                     // move for 5-15% towards random neighboring node
-                    dest = dest + dir * (j * 5 * length / 100.f);
+                    dest = dest + dir * (static_cast<float>(j) * 5.0f * length / 100.0f);
 
                     isOccupied = MWBase::Environment::get().getMechanicsManager()->isAnyActorInRange(
                         converter.toWorldVec3(dest), 60);
@@ -886,7 +888,8 @@ namespace MWMechanics
             for (size_t counter = 0; counter < pathgrid->mPoints.size(); counter++)
             {
                 const osg::Vec3f nodePos = Misc::Convert::makeOsgVec3f(pathgrid->mPoints[counter]);
-                if ((npcPos - nodePos).length2() <= mDistance * mDistance
+                const float mDistanceF = static_cast<float>(mDistance);
+                if ((npcPos - nodePos).length2() <= mDistanceF * mDistanceF
                     && getPathGridGraph(pathgrid).isPointConnected(closestPointIndex, counter))
                 {
                     storage.mAllowedPositions.push_back(

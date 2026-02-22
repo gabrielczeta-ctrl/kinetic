@@ -550,7 +550,7 @@ namespace MWMechanics
         bool targetUsesRanged = false;
         float rangeAttackOfTarget = ActionWeapon(targetWeapon).getCombatRange(targetUsesRanged);
 
-        if (mMovement.mPosition[0])
+        if (mMovement.mPosition[0] != 0.0f)
         {
             mTimerCombatMove = 0.1f + 0.1f * Misc::Rng::rollClosedProbability(prng);
             mCombatMove = true;
@@ -675,7 +675,8 @@ namespace MWMechanics
                         MWBase::Environment::get().getDialogueManager()->say(actor, ESM::RefId::stringRefId("attack"));
                     }
                 }
-                mAttackCooldown = std::min(baseDelay + 0.01f * Misc::Rng::roll0to99(prng), baseDelay + 0.9f);
+                mAttackCooldown
+                    = std::min(baseDelay + 0.01f * static_cast<float>(Misc::Rng::roll0to99(prng)), baseDelay + 0.9f);
             }
             else
                 mAttackCooldown -= AI_REACTION_TIME;
@@ -736,10 +737,10 @@ namespace
             int thrust = (weapon->mData.mThrust[0] + weapon->mData.mThrust[1]) / 2;
 
             auto& prng = MWBase::Environment::get().getWorld()->getPrng();
-            float roll = Misc::Rng::rollClosedProbability(prng) * (slash + chop + thrust);
-            if (roll <= slash)
+            const float roll = Misc::Rng::rollClosedProbability(prng) * static_cast<float>(slash + chop + thrust);
+            if (roll <= static_cast<float>(slash))
                 return "slash";
-            else if (roll <= (slash + thrust))
+            else if (roll <= static_cast<float>(slash + thrust))
                 return "thrust";
             else
                 return "chop";

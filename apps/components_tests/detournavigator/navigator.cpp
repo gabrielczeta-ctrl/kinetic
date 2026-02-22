@@ -34,7 +34,10 @@
 
 MATCHER_P3(Vec3fEq, x, y, z, "")
 {
-    return std::abs(arg.x() - x) < 1e-3 && std::abs(arg.y() - y) < 1e-3 && std::abs(arg.z() - z) < 1e-3;
+    const float xf = static_cast<float>(x);
+    const float yf = static_cast<float>(y);
+    const float zf = static_cast<float>(z);
+    return std::abs(arg.x() - xf) < 1e-3f && std::abs(arg.y() - yf) < 1e-3f && std::abs(arg.z() - zf) < 1e-3f;
 }
 
 MATCHER_P4(Vec3fEq, x, y, z, precision, "")

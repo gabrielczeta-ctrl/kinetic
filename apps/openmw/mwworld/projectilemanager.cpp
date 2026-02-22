@@ -111,7 +111,7 @@ namespace
         }
 
         if (count != 0)
-            speed /= count;
+            speed /= static_cast<float>(count);
 
         // the particle texture is only used if there is only one projectile
         if (projectileEffects.mList.size() == 1)

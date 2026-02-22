@@ -667,7 +667,7 @@ namespace MWPhysics
         // actors->actors etc if needed this is important to prevent Jolt comlaining that two triangle mesh shapes
         // cannot collide
         JPH::DefaultBroadPhaseLayerFilter broadphaseLayerFilter
-            = mPhysicsSystem.GetDefaultBroadPhaseLayerFilter(collisionGroup);
+            = mPhysicsSystem.GetDefaultBroadPhaseLayerFilter(static_cast<JPH::ObjectLayer>(collisionGroup));
         MaskedObjectLayerFilter objectLayerFilter(collisionMask);
 
         JPH::CollideShapeSettings settings;
@@ -998,7 +998,7 @@ namespace MWPhysics
             const MWMechanics::MagicEffects& effects = stats.getMagicEffects();
 
             bool waterCollision = false;
-            if (cell->getCell()->hasWater() && effects.getOrDefault(ESM::MagicEffect::WaterWalking).getMagnitude())
+            if (cell->getCell()->hasWater() && effects.getOrDefault(ESM::MagicEffect::WaterWalking).getMagnitude() > 0)
             {
                 if (physicActor->getCollisionMode()
                     || !world->isUnderwater(ptr.getCell(), ptr.getRefData().getPosition().asVec3()))

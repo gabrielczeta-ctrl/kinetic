@@ -2920,11 +2920,12 @@ namespace MWWorld
         {
             const ESM::Spell* spell = mStore.get<ESM::Spell>().find(selectedSpell);
             int spellCost = MWMechanics::calcSpellCost(*spell);
+            const float spellCostF = static_cast<float>(spellCost);
 
             // Check mana
             bool godmode = (isPlayer && mGodMode);
             MWMechanics::DynamicStat<float> magicka = stats.getMagicka();
-            if (spellCost > 0 && magicka.getCurrent() < spellCost && !godmode)
+            if (spellCost > 0 && magicka.getCurrent() < spellCostF && !godmode)
             {
                 message = "#{sMagicInsufficientSP}";
                 result = MWWorld::SpellCastState::InsufficientMagicka;
@@ -2941,7 +2942,7 @@ namespace MWWorld
             if (result == MWWorld::SpellCastState::Success && !godmode)
             {
                 // Reduce mana
-                magicka.setCurrent(magicka.getCurrent() - spellCost);
+                magicka.setCurrent(magicka.getCurrent() - spellCostF);
                 stats.setMagicka(magicka);
 
                 // Reduce fatigue (note that in the vanilla game, both GMSTs are 0, and there's no fatigue loss)
@@ -2952,7 +2953,7 @@ namespace MWWorld
                 MWMechanics::DynamicStat<float> fatigue = stats.getFatigue();
                 const float normalizedEncumbrance = actor.getClass().getNormalizedEncumbrance(actor);
 
-                float fatigueLoss = spellCost * (fFatigueSpellBase + normalizedEncumbrance * fFatigueSpellMult);
+                float fatigueLoss = spellCostF * (fFatigueSpellBase + normalizedEncumbrance * fFatigueSpellMult);
                 fatigue.setCurrent(fatigue.getCurrent() - fatigueLoss);
                 stats.setFatigue(fatigue);
             }
@@ -3506,7 +3507,7 @@ namespace MWWorld
         else if (type == World::Detect_Enchantment)
             dist = effects.getOrDefault(ESM::MagicEffect::DetectEnchantment).getMagnitude();
 
-        if (!dist)
+        if (dist <= 0.0f)
             return;
 
         dist = feetToGameUnits(dist);
@@ -3562,8 +3563,9 @@ namespace MWWorld
         static float fCrimeGoldTurnInMult
             = mStore.get<ESM::GameSetting>().find("fCrimeGoldTurnInMult")->mValue.getFloat();
 
-        int discount = static_cast<int>(bounty * fCrimeGoldDiscountMult);
-        int turnIn = static_cast<int>(bounty * fCrimeGoldTurnInMult);
+        const float bountyF = static_cast<float>(bounty);
+        int discount = static_cast<int>(bountyF * fCrimeGoldDiscountMult);
+        int turnIn = static_cast<int>(bountyF * fCrimeGoldTurnInMult);
 
         if (bounty > 0)
         {

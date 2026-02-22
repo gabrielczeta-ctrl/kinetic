@@ -739,7 +739,8 @@ namespace MWWorld
             CellStore& cell = mWorld.getWorldModel().getExterior(
                 ESM::ExteriorCellLocation(it->mData.mX, it->mData.mY, ESM::Cell::sDefaultWorldspaceId));
             const osg::Vec3f position
-                = osg::Vec3f(it->mData.mX + 0.5f, it->mData.mY + 0.5f, 0) * Constants::CellSizeInUnits;
+                = osg::Vec3f(static_cast<float>(it->mData.mX) + 0.5f, static_cast<float>(it->mData.mY) + 0.5f, 0.0f)
+                * Constants::CellSizeInUnits;
             const osg::Vec2i cellPosition(it->mData.mX, it->mData.mY);
 
             const DetourNavigator::CellGridBounds cellGridBounds{

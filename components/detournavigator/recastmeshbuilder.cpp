@@ -98,7 +98,7 @@ namespace DetourNavigator
 
         float getHeightfieldScale(int cellSize, std::size_t dataSize)
         {
-            return static_cast<float>(cellSize) / (dataSize - 1);
+            return static_cast<float>(cellSize) / static_cast<float>(dataSize - 1);
         }
 
         bool isNan(const RecastMeshTriangle& triangle)
@@ -182,7 +182,8 @@ namespace DetourNavigator
         const osg::Vec2f tileShift = osg::Vec2f(heightfield.mMinX, heightfield.mMinY) * scale;
         const osg::Vec2f localShift = aabbShift + tileShift;
         const float cellSize = static_cast<float>(heightfield.mCellSize);
-        const osg::Vec3f cellShift(heightfield.mCellPosition.x() * cellSize, heightfield.mCellPosition.y() * cellSize,
+        const osg::Vec3f cellShift(static_cast<float>(heightfield.mCellPosition.x()) * cellSize,
+            static_cast<float>(heightfield.mCellPosition.y()) * cellSize,
             (heightfield.mMinHeight + heightfield.mMaxHeight) * 0.5f);
         return makeMesh(std::move(triangles), cellShift + osg::Vec3f(localShift.x(), localShift.y(), 0));
     }
@@ -278,7 +279,7 @@ namespace DetourNavigator
         const osg::Vec3f shift = PhysicsSystemHelpers::getHeightfieldShift(
             cellPosition.x(), cellPosition.y(), cellSize, minHeight, maxHeight);
         const float stepSize = getHeightfieldScale(cellSize, size);
-        const int halfCellSize = cellSize / 2;
+        const float halfCellSize = static_cast<float>(cellSize) * 0.5f;
         const auto local = [&](float v, float axisShift) { return (v - axisShift + halfCellSize) / stepSize; };
         const auto index = [&](float v, int add) -> std::size_t {
             const int value = static_cast<int>(v) + add;
