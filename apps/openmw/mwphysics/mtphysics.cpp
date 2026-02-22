@@ -507,7 +507,7 @@ namespace MWPhysics
     {
         MaybeExclusiveLock lock(mLOSCacheMutex, mLockingPolicy);
         int job = 0;
-        int numLOS = mLOSCache.size();
+        const int numLOS = static_cast<int>(mLOSCache.size());
         while ((job = mNextLOS.fetch_add(1, std::memory_order_relaxed)) < numLOS)
         {
             auto& req = mLOSCache[job];

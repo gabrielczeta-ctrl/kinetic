@@ -143,8 +143,9 @@ namespace
                 = MWBase::Environment::get().getESMStore()->get<ESM::MagicEffect>().find(enam.mData.mEffectID);
             lightDiffuseColor += magicEffect->getColor();
         }
-        int numberOfEffects = effects.mList.size();
-        lightDiffuseColor /= numberOfEffects;
+        const float numberOfEffects = static_cast<float>(effects.mList.size());
+        if (numberOfEffects > 0.0f)
+            lightDiffuseColor /= numberOfEffects;
 
         return lightDiffuseColor;
     }
