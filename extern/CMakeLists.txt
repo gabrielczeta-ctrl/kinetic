@@ -4,6 +4,12 @@ set_directory_properties(PROPERTIES EXCLUDE_FROM_ALL on)
 set(CMAKE_CXX_CLANG_TIDY "")
 
 if(NOT OPENMW_USE_SYSTEM_JOLT)
+    if(MSVC)
+        # Keep Jolt runtime selection aligned with OpenMW (/MD on CI/MSVC).
+        # Jolt defaults this to ON, which causes /MT vs /MD linker mismatches.
+        set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+    endif()
+
     set(JPH_DEBUG_RENDERER ON CACHE BOOL "")
     set(JPH_PROFILE_ENABLED OFF CACHE BOOL "")
     add_definitions(-DJPH_DEBUG_RENDERER=1)

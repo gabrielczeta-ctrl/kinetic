@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <limits>
 
 #include <osg/Geometry>
 #include <osg/Group>
@@ -86,7 +87,7 @@ namespace MWRender
                 new osg::PolygonMode(osg::PolygonMode::FRONT_AND_BACK, osg::PolygonMode::LINE),
                 osg::StateAttribute::ON);
             stateSet->setAttributeAndModes(new osg::PolygonOffset(
-                SceneUtil::AutoDepth::isReversed() ? 1.0 : -1.0, SceneUtil::AutoDepth::isReversed() ? 1.0 : -1.0));
+                SceneUtil::AutoDepth::isReversed() ? 1.0f : -1.0f, SceneUtil::AutoDepth::isReversed() ? 1.0f : -1.0f));
             osg::ref_ptr<osg::Material> material = new osg::Material;
             material->setColorMode(osg::Material::AMBIENT_AND_DIFFUSE);
             stateSet->setAttribute(material);
@@ -165,8 +166,12 @@ namespace MWRender
             mPhysicsSystem->DrawConstraintLimits(static_cast<JPH::DebugRenderer*>(this));
             mPhysicsSystem->DrawConstraintReferenceFrame(static_cast<JPH::DebugRenderer*>(this));
             showCollisions();
-            mLinesDrawArrays->setCount(mLinesVertices->size());
-            mTrisDrawArrays->setCount(mTrisVertices->size());
+            const auto toGLsizei = [](std::size_t value) {
+                constexpr auto maxCount = static_cast<std::size_t>(std::numeric_limits<GLsizei>::max());
+                return static_cast<GLsizei>(std::min(value, maxCount));
+            };
+            mLinesDrawArrays->setCount(toGLsizei(mLinesVertices->size()));
+            mTrisDrawArrays->setCount(toGLsizei(mTrisVertices->size()));
             mLinesVertices->dirty();
             mTrisVertices->dirty();
             mLinesColors->dirty();

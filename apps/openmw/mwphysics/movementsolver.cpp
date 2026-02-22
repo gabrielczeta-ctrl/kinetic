@@ -525,7 +525,7 @@ namespace MWPhysics
         // use vanilla-accurate collision hull position hack (do same hitbox offset hack as movement solver)
         // if vanilla compatibility didn't matter, the "correct" collision hull position would be
         // physicActor->getScaledMeshTranslation()
-        const auto verticalHalfExtent = osg::Vec3f(0.0, 0.0, actor.mHalfExtentsZ);
+        const auto verticalHalfExtent = osg::Vec3f(0.0f, 0.0f, actor.mHalfExtentsZ);
 
         // use a 3d approximation of the movement vector to better judge player intent
         auto velocity = (osg::Quat(actor.mRotation.x(), osg::Vec3f(-1, 0, 0))
