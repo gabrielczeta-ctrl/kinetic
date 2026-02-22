@@ -350,7 +350,7 @@ namespace
     TEST_F(DetourNavigatorNavigatorTest, only_one_heightfield_per_cell_is_allowed)
     {
         const HeightfieldSurface surface1 = makeSquareHeightfieldSurface(defaultHeightfieldData);
-        const int cellSize1 = heightfieldTileSize * (surface1.mSize - 1);
+        const int cellSize1 = heightfieldTileSize * static_cast<int>(surface1.mSize - 1);
 
         const std::array<float, 5 * 5> heightfieldData2{ {
             -25, -25, -25, -25, -25, // row 0
@@ -360,7 +360,7 @@ namespace
             -25, -25, -25, -25, -25, // row 4
         } };
         const HeightfieldSurface surface2 = makeSquareHeightfieldSurface(heightfieldData2);
-        const int cellSize2 = heightfieldTileSize * (surface2.mSize - 1);
+        const int cellSize2 = heightfieldTileSize * static_cast<int>(surface2.mSize - 1);
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addHeightfield(mCellPosition, cellSize1, surface1, nullptr);
@@ -656,8 +656,9 @@ namespace
         for (std::size_t i = 0; i < boxes.size(); ++i)
         {
             boxes[i].shape().SetEmbedded();
+            const double offset = static_cast<double>(i) * 10.0;
             const osg::Matrixd transform
-                = osg::Matrixd::translate(osg::Vec3d(shift.x() + i * 10, shift.y() + i * 10, i * 10));
+                = osg::Matrixd::translate(osg::Vec3d(shift.x() + offset, shift.y() + offset, offset));
             mNavigator->addObject(
                 ObjectId(&boxes[i].shape()), ObjectShapes(boxes[i].instance(), mObjectTransform), transform, nullptr);
         }
@@ -666,8 +667,9 @@ namespace
 
         for (std::size_t i = 0; i < boxes.size(); ++i)
         {
+            const double offset = static_cast<double>(i) * 10.0 + 1.0;
             const osg::Matrixd transform
-                = osg::Matrixd::translate(osg::Vec3d(shift.x() + i * 10 + 1, shift.y() + i * 10 + 1, i * 10 + 1));
+                = osg::Matrixd::translate(osg::Vec3d(shift.x() + offset, shift.y() + offset, offset));
             mNavigator->updateObject(
                 ObjectId(&boxes[i].shape()), ObjectShapes(boxes[i].instance(), mObjectTransform), transform, nullptr);
         }
@@ -698,7 +700,8 @@ namespace
         for (std::size_t i = 0; i < shapes.size(); ++i)
         {
             shapes[i].shape().SetEmbedded();
-            const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(i * 32, i * 32, i * 32));
+            const float offset = static_cast<float>(i) * 32.0f;
+            const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(offset, offset, offset));
             mNavigator->addObject(
                 ObjectId(&shapes[i].shape()), ObjectShapes(shapes[i].instance(), mObjectTransform), transform, nullptr);
         }
@@ -708,7 +711,8 @@ namespace
         const auto start = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < shapes.size(); ++i)
         {
-            const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(i * 32 + 1, i * 32 + 1, i * 32 + 1));
+            const float offset = static_cast<float>(i) * 32.0f + 1.0f;
+            const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(offset, offset, offset));
             mNavigator->updateObject(
                 ObjectId(&shapes[i].shape()), ObjectShapes(shapes[i].instance(), mObjectTransform), transform, nullptr);
         }
@@ -717,7 +721,8 @@ namespace
 
         for (std::size_t i = 0; i < shapes.size(); ++i)
         {
-            const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(i * 32 + 2, i * 32 + 2, i * 32 + 2));
+            const float offset = static_cast<float>(i) * 32.0f + 2.0f;
+            const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(offset, offset, offset));
             mNavigator->updateObject(
                 ObjectId(&shapes[i].shape()), ObjectShapes(shapes[i].instance(), mObjectTransform), transform, nullptr);
         }
