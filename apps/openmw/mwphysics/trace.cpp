@@ -15,7 +15,8 @@
 namespace MWPhysics
 {
     ActorConvexCallback sweepHelper(const JPH::BodyID actor, const JPH::RVec3& from, const JPH::RVec3& to,
-        const JPH::PhysicsSystem* physicsSystem, bool actorFilter, const int collisionMask)
+        const JPH::PhysicsSystem* physicsSystem, bool actorFilter, const int collisionMask,
+        JPH::EBackFaceMode trianglesBackFaceMode)
     {
         const JPH::RVec3 correctMotion = to - from;
 
@@ -29,10 +30,9 @@ namespace MWPhysics
             JPH::RMat44 transFrom(trans);
             transFrom.SetTranslation(from);
 
-            // Vanilla-like behaviour of ignoring backfaces for triangles meshes
-            // but for convex shapes (i.e actors) we should check backfaces
+            // Convex shapes (actors) should always check backfaces. Triangle behavior depends on query type.
             JPH::ShapeCastSettings settings;
-            settings.mBackFaceModeTriangles = JPH::EBackFaceMode::IgnoreBackFaces;
+            settings.mBackFaceModeTriangles = trianglesBackFaceMode;
             settings.mBackFaceModeConvex = JPH::EBackFaceMode::CollideWithBackFaces;
 
             JPH::Vec3 scale = JPH::Vec3::sReplicate(1.0f);
@@ -76,7 +76,8 @@ namespace MWPhysics
         const JPH::RVec3 jphStart = Misc::Convert::toJolt<JPH::RVec3>(start);
         JPH::RVec3 jphEnd = Misc::Convert::toJolt<JPH::RVec3>(end);
 
-        const auto traceCallback = sweepHelper(actor, jphStart, jphEnd, physicsSystem, false, collisionMask);
+        const auto traceCallback = sweepHelper(
+            actor, jphStart, jphEnd, physicsSystem, false, collisionMask, JPH::EBackFaceMode::IgnoreBackFaces);
 
         // Copy the hit data over to our trace results struct:
         if (traceCallback.hasHit())
@@ -104,7 +105,8 @@ namespace MWPhysics
         const Actor* actor, const osg::Vec3f& start, const osg::Vec3f& end, const JPH::PhysicsSystem* physicsSystem)
     {
         const auto traceCallback = sweepHelper(actor->getPhysicsBody(), Misc::Convert::toJolt<JPH::RVec3>(start),
-            Misc::Convert::toJolt<JPH::RVec3>(end), physicsSystem, true, actor->getCollisionMask());
+            Misc::Convert::toJolt<JPH::RVec3>(end), physicsSystem, true, actor->getCollisionMask(),
+            JPH::EBackFaceMode::CollideWithBackFaces);
         if (traceCallback.hasHit())
         {
             mFraction = traceCallback.mClosestHitFraction;

@@ -115,44 +115,21 @@ namespace MWPhysics
         MaskedBroadPhaseLayerFilter broadphaseLayerFilter(broadPhaseMask);
         MaskedObjectLayerFilter objectLayerFilter(Layers::WORLD | Layers::HEIGHTMAP);
 
-        // It is important to ignore backfaces for this check, as all actor collision should
-        JPH::RayCastSettings settings;
-        settings.SetBackFaceMode(JPH::EBackFaceMode::IgnoreBackFaces);
-
-        // Cast ray and return closest hit
-        class TraceHitCollector : public JPH::CastRayCollector
+        // Cast ray and return closest hit.
+        JPH::RayCastResult hit;
+        const bool rayHit
+            = physicsSystem->GetNarrowPhaseQuery().CastRay(ray, hit, broadphaseLayerFilter, objectLayerFilter);
+        if (rayHit)
         {
-        public:
-            virtual void AddHit(const JPH::RayCastResult& inResult) override
-            {
-                mFraction = inResult.mFraction;
-                mSubShapeID2 = inResult.mSubShapeID2;
-                mBodyID = inResult.mBodyID;
-                mHit = true;
-                ForceEarlyOut(); // Only collect a single hit
-            }
-
-            bool mHit = false;
-            float mFraction = 1.0f;
-            JPH::BodyID mBodyID;
-            JPH::SubShapeID mSubShapeID2;
-        };
-
-        TraceHitCollector collector;
-        physicsSystem->GetNarrowPhaseQuery().CastRay(
-            ray, settings, collector, broadphaseLayerFilter, objectLayerFilter);
-
-        if (collector.mHit)
-        {
-            JPH::RVec3 hitPointWorld = ray.GetPointOnRay(collector.mFraction);
+            JPH::RVec3 hitPointWorld = ray.GetPointOnRay(hit.mFraction);
             if (((Misc::Convert::toOsg(hitPointWorld) - tracer.mEndPos + offset).length2() > 35 * 35
                     || !isWalkableSlope(tracer.mPlaneNormal)))
             {
-                JPH::BodyLockRead lock(physicsSystem->GetBodyLockInterface(), collector.mBodyID);
+                JPH::BodyLockRead lock(physicsSystem->GetBodyLockInterface(), hit.mBodyID);
                 if (lock.Succeeded())
                 {
                     const JPH::Body& hitBody = lock.GetBody();
-                    const JPH::Vec3 normal = hitBody.GetWorldSpaceSurfaceNormal(collector.mSubShapeID2, hitPointWorld);
+                    const JPH::Vec3 normal = hitBody.GetWorldSpaceSurfaceNormal(hit.mSubShapeID2, hitPointWorld);
                     actor->setOnSlope(!isWalkableSlope(Misc::Convert::toOsg(normal)));
                     return Misc::Convert::toOsg(hitPointWorld) + osg::Vec3f(0.f, 0.f, sGroundOffset);
                 }
