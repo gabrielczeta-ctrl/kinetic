@@ -6,8 +6,6 @@
 #include <components/misc/convert.hpp>
 #include <components/physicshelpers/collisionobject.hpp>
 
-#include "../mwworld/class.hpp"
-
 #include "actor.hpp"
 #include "joltlayers.hpp"
 #include "mtphysics.hpp"
@@ -133,8 +131,6 @@ namespace MWPhysics
             }
             case Layers::WATER:
             {
-                if (mCaster.isEmpty() || !mCaster.getClass().isActor())
-                    return;
                 setHitWater();
                 break;
             }
