@@ -76,7 +76,7 @@ namespace MWPhysics
                 mResult.emplace_back(ContactPoint{ holder->getPtr(), Misc::Convert::toOsg(inResult.mContactPointOn2),
                     Misc::Convert::toOsg(inResult.mPenetrationAxis.Normalized()) });
 
-            // NOTE: unlike other jolt collectors, dont early out here as we want ALL HITS
+            // NOTE: unlike other jolt collectors, dont call UpdateEarlyOutFraction in this method as we want ALL HITS
         }
 
         std::vector<ContactPoint> mResult;
