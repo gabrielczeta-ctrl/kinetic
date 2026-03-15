@@ -105,8 +105,8 @@ modules:
       - "-DCMAKE_BUILD_TYPE=Release"
     sources:
       - type: archive
-        url: https://github.com/jrouwe/JoltPhysics/archive/b8012e1ac1f3f2a859127ef05c097ee5f6194dcd.zip
-        sha256: 3f22e7d8bd6498c6283a278d35b9354e6500e5b844cf3572db2b085b41df9998
+        url: https://github.com/jrouwe/JoltPhysics/archive/refs/tags/v5.5.0.zip
+        sha256: 4ab8853237bcb65b6162e2cf5001a05dc53d5128c2e8eedb5052b76e99de4617
 
   - name: mygui
     buildsystem: cmake-ninja
