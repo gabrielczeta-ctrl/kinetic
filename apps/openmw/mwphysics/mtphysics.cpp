@@ -305,6 +305,7 @@ namespace MWPhysics
         , mTimeBegin(0)
         , mTimeEnd(0)
         , mFrameStart(0)
+        , mHasPendingTimingStats(false)
         , mSimulationBarrier(nullptr)
     {
         Log(Debug::Info) << "Using " << mNumThreads << " async physics threads";
@@ -404,6 +405,7 @@ namespace MWPhysics
         {
             mWorldFrameData = std::make_unique<WorldFrameData>();
             mBudgetCursor += 1;
+            mHasPendingTimingStats = true;
 
             // Resets simulation timers
             mAsyncStartTime = mTimer->tick();
@@ -624,11 +626,12 @@ namespace MWPhysics
     {
         if (!stats.collectStats("engine"))
             return;
-        if (mFrameNumber == frameNumber - 1)
+        if (mHasPendingTimingStats && mFrameNumber == frameNumber - 1)
         {
             stats.setAttribute(mFrameNumber, "physicsworker_time_begin", mTimer->delta_s(mFrameStart, mTimeBegin));
             stats.setAttribute(mFrameNumber, "physicsworker_time_taken", mTimer->delta_s(mTimeBegin, mTimeEnd));
             stats.setAttribute(mFrameNumber, "physicsworker_time_end", mTimer->delta_s(mFrameStart, mTimeEnd));
+            mHasPendingTimingStats = false;
         }
         mFrameStart = frameStart;
         mTimeBegin = mTimer->tick();

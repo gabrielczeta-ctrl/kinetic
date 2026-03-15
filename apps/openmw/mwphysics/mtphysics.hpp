@@ -132,6 +132,7 @@ namespace MWPhysics
         osg::Timer_t mTimeBegin;
         osg::Timer_t mTimeEnd;
         osg::Timer_t mFrameStart;
+        bool mHasPendingTimingStats;
 
         JPH::JobSystem::Barrier* mSimulationBarrier;
     };
