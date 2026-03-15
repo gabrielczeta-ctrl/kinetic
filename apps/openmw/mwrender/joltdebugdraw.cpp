@@ -333,6 +333,7 @@ namespace MWRender
     void JoltDebugDrawer::DrawText3D(
         JPH::RVec3Arg inPosition, const std::string_view& inString, JPH::ColorArg inColor, float inHeight)
     {
-        // No implementation
+        // TODO: This could be implemented for better physics debugging, but given OpenMW's lack of actual physics
+        // I don't think its a worth it right now for the cost of implementing this.
     }
 }
