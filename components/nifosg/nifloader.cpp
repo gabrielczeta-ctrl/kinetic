@@ -329,7 +329,7 @@ namespace NifOsg
             }
 
             Nif::ExtraList extraList = seq->getExtraList();
-            if (extraList.empty())
+            if (extraList.empty() || extraList[0].empty())
             {
                 Log(Debug::Warning) << "NIFFile Warning: NiSequenceStreamHelper has no text keys. File: "
                                     << nif.getFilename();
@@ -350,6 +350,9 @@ namespace NifOsg
             for (size_t i = 1; i < extraList.size() && !ctrl.empty(); i++, (ctrl = ctrl->mNext))
             {
                 Nif::ExtraPtr extra = extraList[i];
+                if (extra.empty())
+                    continue;
+
                 if (extra->mRecordType != Nif::RC_NiStringExtraData
                     || ctrl->mRecordType != Nif::RC_NiKeyframeController)
                 {
@@ -696,6 +699,9 @@ namespace NifOsg
 
             for (const auto& e : nifNode->getExtraList())
             {
+                if (e.empty())
+                    continue;
+
                 if (e->mRecordType == Nif::RC_NiTextKeyExtraData && args.mTextKeys)
                 {
                     const Nif::NiTextKeyExtraData* tk = static_cast<const Nif::NiTextKeyExtraData*>(e.getPtr());
@@ -1481,6 +1487,12 @@ namespace NifOsg
             if (niGeometry->mData.empty())
                 return;
 
+            const Nif::NiGeometryData* niGeometryData = niGeometry->mData.getPtr();
+
+            const auto& vertices = niGeometryData->mVertices;
+            if (vertices.empty())
+                return;
+
             bool hasPartitions = false;
             if (!niGeometry->mSkin.empty())
             {
@@ -1508,7 +1520,6 @@ namespace NifOsg
                 }
             }
 
-            const Nif::NiGeometryData* niGeometryData = niGeometry->mData.getPtr();
             if (!hasPartitions)
             {
                 if (niGeometry->mRecordType == Nif::RC_NiTriShape || nifNode->mRecordType == Nif::RC_BSLODTriShape)
@@ -1546,11 +1557,10 @@ namespace NifOsg
                 }
             }
 
-            const auto& vertices = niGeometryData->mVertices;
             const auto& normals = niGeometryData->mNormals;
             const auto& colors = niGeometryData->mColors;
-            if (!vertices.empty())
-                geometry->setVertexArray(new osg::Vec3Array(static_cast<unsigned>(vertices.size()), vertices.data()));
+
+            geometry->setVertexArray(new osg::Vec3Array(static_cast<unsigned>(vertices.size()), vertices.data()));
             if (!normals.empty())
                 geometry->setNormalArray(new osg::Vec3Array(static_cast<unsigned>(normals.size()), normals.data()),
                     osg::Array::BIND_PER_VERTEX);
@@ -1599,7 +1609,7 @@ namespace NifOsg
             osg::ref_ptr<osg::Geometry> geom(new osg::Geometry);
             handleNiGeometryData(nifNode, parent, geom, parentNode, composite, boundTextures, animflags);
             // If the record had no valid geometry data in it, early-out
-            if (geom->empty())
+            if (geom->empty() || geom->getVertexArray() == nullptr)
                 return;
 
             osg::ref_ptr<osg::Drawable> drawable = geom;
@@ -1615,16 +1625,15 @@ namespace NifOsg
                 const Nif::NiAVObjectList& bones = skin->mBones;
 
                 // Assign bone weights
-                std::vector<SceneUtil::RigGeometry::BoneInfo> boneInfo;
-                std::vector<SceneUtil::RigGeometry::VertexWeights> influences;
-                boneInfo.resize(bones.size());
-                influences.resize(bones.size());
+                std::vector<SceneUtil::RigGeometry::BoneInfo> boneInfo(bones.size());
+                std::vector<SceneUtil::RigGeometry::BoneWeights> influences(geom->getVertexArray()->getNumElements());
                 for (std::size_t i = 0; i < bones.size(); ++i)
                 {
                     boneInfo[i].mName = Misc::StringUtils::lowerCase(bones[i].getPtr()->mName);
                     boneInfo[i].mInvBindMatrix = data->mBones[i].mTransform.toMatrix();
                     boneInfo[i].mBoundSphere = data->mBones[i].mBoundSphere;
-                    influences[i] = data->mBones[i].mWeights;
+                    for (const auto& [vertex, weight] : data->mBones[i].mWeights)
+                        influences.at(vertex).emplace_back(i, weight);
                 }
                 rig->setBoneInfo(std::move(boneInfo));
                 rig->setInfluences(influences);
@@ -1747,7 +1756,7 @@ namespace NifOsg
                 if (hasColors)
                     colors.emplace_back(elem.mVertColor[0], elem.mVertColor[1], elem.mVertColor[2], elem.mVertColor[3]);
                 if (hasUV)
-                    uvlist.emplace_back(halfToFloat(elem.mUV[0]), 1.0f - halfToFloat(elem.mUV[1]));
+                    uvlist.emplace_back(halfToFloat(elem.mUV[0]), halfToFloat(elem.mUV[1]));
             }
 
             if (!vertices.empty())
@@ -2051,7 +2060,6 @@ namespace NifOsg
             }
 
             image->setMipmapLevels(mipmapOffsets);
-            image->flipVertical();
 
             return image;
         }

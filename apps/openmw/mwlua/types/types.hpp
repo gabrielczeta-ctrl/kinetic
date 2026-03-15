@@ -29,9 +29,13 @@ namespace MWLua
 
     // used in initTypesPackage
     void addActivatorBindings(sol::table activator, const Context& context);
+    ESM::Activator tableToActivator(const sol::table& rec);
+    void addMutableActivatorType(sol::state_view& lua);
     void addBookBindings(sol::table book, const Context& context);
     void addContainerBindings(sol::table container, const Context& context);
     void addDoorBindings(sol::table door, const Context& context);
+    ESM::Door tableToDoor(const sol::table& rec);
+    void addMutableDoorType(sol::state_view& lua);
     void addItemBindings(sol::table item, const Context& context);
     void addActorBindings(sol::table actor, const Context& context);
     void addWeaponBindings(sol::table weapon, const Context& context);
@@ -43,12 +47,16 @@ namespace MWLua
     void addApparatusBindings(sol::table apparatus, const Context& context);
     void addRepairBindings(sol::table repair, const Context& context);
     void addMiscellaneousBindings(sol::table miscellaneous, const Context& context);
+    ESM::Miscellaneous tableToMisc(const sol::table& rec);
+    void addMutableMiscType(sol::state_view& lua);
     void addPotionBindings(sol::table potion, const Context& context);
     void addIngredientBindings(sol::table ingredient, const Context& context);
     void addArmorBindings(sol::table armor, const Context& context);
     void addLockableBindings(sol::table lockable);
     void addClothingBindings(sol::table clothing, const Context& context);
     void addStaticBindings(sol::table stat, const Context& context);
+    ESM::Static tableToStatic(const sol::table& rec);
+    void addMutableStaticType(sol::state_view& lua);
     void addLightBindings(sol::table light, const Context& context);
     void addLevelledCreatureBindings(sol::table list, const Context& context);
 

@@ -176,10 +176,12 @@
 -- * @{openmw.types#ClothingRecord},
 -- * @{openmw.types#ContainerRecord},
 -- * @{openmw.types#CreatureRecord},
+-- * @{openmw.types#DoorRecord},
 -- * @{openmw.types#LightRecord},
 -- * @{openmw.types#MiscellaneousRecord},
 -- * @{openmw.types#NpcRecord},
 -- * @{openmw.types#PotionRecord},
+-- * @{openmw.types#StaticRecord},
 -- * @{openmw.types#WeaponRecord}
 -- @function [parent=#world] createRecord
 -- @param #any record A record to be registered in the database. Must be one of the supported types. The id field is not used, one will be generated for you.
