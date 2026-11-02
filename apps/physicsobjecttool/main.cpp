@@ -13,17 +13,21 @@
 #include <components/misc/strings/conversion.hpp>
 #include <components/platform/platform.hpp>
 #include <components/resource/bgsmfilemanager.hpp>
-#include <components/resource/bulletshape.hpp>
-#include <components/resource/bulletshapemanager.hpp>
-#include <components/resource/foreachbulletobject.hpp>
+#include <components/resource/foreachphysicsobject.hpp>
 #include <components/resource/imagemanager.hpp>
 #include <components/resource/niffilemanager.hpp>
+#include <components/resource/physicsshape.hpp>
+#include <components/resource/physicsshapemanager.hpp>
 #include <components/resource/scenemanager.hpp>
 #include <components/settings/settings.hpp>
 #include <components/toutf8/toutf8.hpp>
 #include <components/version/version.hpp>
 #include <components/vfs/manager.hpp>
 #include <components/vfs/registerarchives.hpp>
+
+#include <Jolt/Core/Factory.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/RegisterTypes.h>
 
 #include <boost/program_options.hpp>
 
@@ -49,10 +53,12 @@ namespace
 
     using StringsVector = std::vector<std::string>;
 
-    constexpr std::string_view applicationName = "BulletObjectTool";
+    constexpr std::string_view applicationName = "PhysicsObjectTool";
 
     bpo::options_description makeOptionsDescription()
     {
+        using Fallback::FallbackMap;
+
         bpo::options_description result;
         auto addOption = result.add_options();
         addOption("help", "print help message");
@@ -85,8 +91,7 @@ namespace
             "\n\twin1251 - Cyrillic alphabet such as Russian, Bulgarian, Serbian Cyrillic and other languages\n"
             "\n\twin1252 - Western European (Latin) alphabet, used by default");
 
-        addOption("fallback",
-            bpo::value<Fallback::FallbackMap>()->default_value(Fallback::FallbackMap(), "")->multitoken()->composing(),
+        addOption("fallback", bpo::value<FallbackMap>()->default_value(FallbackMap(), "")->multitoken()->composing(),
             "fallback values");
 
         Files::ConfigurationManager::addCommonOptions(result);
@@ -106,9 +111,13 @@ namespace
         }
     };
 
-    int runBulletObjectTool(int argc, char* argv[])
+    int runPhysicsObjectTool(int argc, char* argv[])
     {
         Platform::init();
+
+        JPH::RegisterDefaultAllocator();
+        JPH::Factory::sInstance = new JPH::Factory();
+        JPH::RegisterTypes();
 
         bpo::options_description desc = makeOptionsDescription();
 
@@ -176,11 +185,11 @@ namespace
         Resource::NifFileManager nifFileManager(&vfs, &encoder.getStatelessEncoder());
         Resource::BgsmFileManager bgsmFileManager(&vfs, expiryDelay);
         Resource::SceneManager sceneManager(&vfs, &imageManager, &nifFileManager, &bgsmFileManager, expiryDelay);
-        Resource::BulletShapeManager bulletShapeManager(&vfs, &sceneManager, &nifFileManager, expiryDelay);
+        Resource::PhysicsShapeManager physicsShapeManager(&vfs, &sceneManager, &nifFileManager, expiryDelay);
 
-        Resource::forEachBulletObject(
-            readers, vfs, bulletShapeManager, esmData, [](const ESM::Cell& cell, const Resource::BulletObject& object) {
-                Log(Debug::Verbose) << "Found bullet object in " << (cell.isExterior() ? "exterior" : "interior")
+        Resource::forEachPhysicsObject(readers, vfs, physicsShapeManager, esmData,
+            [](const ESM::Cell& cell, const Resource::PhysicsObject& object) {
+                Log(Debug::Verbose) << "Found physics object in " << (cell.isExterior() ? "exterior" : "interior")
                                     << " cell \"" << cell.getDescription() << "\":"
                                     << " fileName=\"" << object.mShape->mFileName << '"'
                                     << " fileHash=" << Misc::StringUtils::toHex(object.mShape->mFileHash)
@@ -202,5 +211,5 @@ namespace
 
 int main(int argc, char* argv[])
 {
-    return Debug::wrapApplication(runBulletObjectTool, argc, argv, applicationName);
+    return Debug::wrapApplication(runPhysicsObjectTool, argc, argv, applicationName);
 }

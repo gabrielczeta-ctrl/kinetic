@@ -20,9 +20,9 @@
 #include <components/files/multidircollection.hpp>
 #include <components/platform/platform.hpp>
 #include <components/resource/bgsmfilemanager.hpp>
-#include <components/resource/bulletshapemanager.hpp>
 #include <components/resource/imagemanager.hpp>
 #include <components/resource/niffilemanager.hpp>
+#include <components/resource/physicsshapemanager.hpp>
 #include <components/resource/scenemanager.hpp>
 #include <components/sceneutil/workqueue.hpp>
 #include <components/settings/values.hpp>
@@ -32,6 +32,9 @@
 #include <components/vfs/registerarchives.hpp>
 
 #include <osg/Vec3f>
+
+#include <Jolt/Core/Factory.h>
+#include <Jolt/RegisterTypes.h>
 
 #include <boost/program_options.hpp>
 
@@ -136,6 +139,10 @@ namespace NavMeshTool
         {
             Platform::init();
 
+            JPH::RegisterDefaultAllocator();
+            JPH::Factory::sInstance = new JPH::Factory();
+            JPH::RegisterTypes();
+
             bpo::options_description desc = makeOptionsDescription();
 
             bpo::parsed_options options = bpo::command_line_parser(argc, argv).options(desc).allow_unregistered().run();
@@ -233,7 +240,7 @@ namespace NavMeshTool
             Resource::NifFileManager nifFileManager(&vfs, &encoder.getStatelessEncoder());
             Resource::BgsmFileManager bgsmFileManager(&vfs, expiryDelay);
             Resource::SceneManager sceneManager(&vfs, &imageManager, &nifFileManager, &bgsmFileManager, expiryDelay);
-            Resource::BulletShapeManager bulletShapeManager(&vfs, &sceneManager, &nifFileManager, expiryDelay);
+            Resource::PhysicsShapeManager physicsShapeManager(&vfs, &sceneManager, &nifFileManager, expiryDelay);
             DetourNavigator::RecastGlobalAllocator::init();
             DetourNavigator::Settings navigatorSettings
                 = DetourNavigator::makeSettingsFromSettingsManager(Debug::getRecastMaxLogLevel());
@@ -259,7 +266,7 @@ namespace NavMeshTool
                 for (const auto& [worldspace, cells] : worldspaceCells)
                 {
                     const WorldspaceData worldspaceData = gatherWorldspaceData(navigatorSettings, readers, vfs,
-                        bulletShapeManager, esmData, writeBinaryLog, worldspace, cells);
+                        physicsShapeManager, esmData, writeBinaryLog, worldspace, cells);
 
                     const GenerateAllNavMeshTilesOptions generateAllNavMeshTilesOptions{
                         .mRemoveUnusedTiles = removeUnusedTiles,

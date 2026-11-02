@@ -109,14 +109,14 @@ namespace DetourNavigator
         mCellGridBounds = cellGridBounds;
     }
 
-    bool NavMeshManager::addObject(const ObjectId id, const CollisionShape& shape, const btTransform& transform,
+    bool NavMeshManager::addObject(const ObjectId id, const CollisionShape& shape, const osg::Matrixd& transform,
         const AreaType areaType, const UpdateGuard* guard)
     {
         return mRecastMeshManager.addObject(id, shape, transform, areaType, guard);
     }
 
     bool NavMeshManager::updateObject(
-        const ObjectId id, const btTransform& transform, const AreaType areaType, const UpdateGuard* guard)
+        const ObjectId id, const osg::Matrixd& transform, const AreaType areaType, const UpdateGuard* guard)
     {
         return mRecastMeshManager.updateObject(id, transform, areaType, guard);
     }

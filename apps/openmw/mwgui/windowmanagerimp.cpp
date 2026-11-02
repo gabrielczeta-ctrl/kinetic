@@ -16,9 +16,6 @@
 #include <MyGUI_PointerManager.h>
 #include <MyGUI_UString.h>
 
-// For BT_NO_PROFILE
-#include <LinearMath/btQuickprof.h>
-
 #include <SDL_clipboard.h>
 #include <SDL_keyboard.h>
 
@@ -209,7 +206,7 @@ namespace MWGui
         int dw, dh;
         SDL_GL_GetDrawableSize(window, &dw, &dh);
 
-        mScalingFactor = Settings::gui().mScalingFactor * (dw / w);
+        mScalingFactor = Settings::gui().mScalingFactor * (static_cast<float>(dw) / static_cast<float>(w));
         constexpr VFS::Path::NormalizedView resourcePath("mygui");
         mGuiPlatform = std::make_unique<MyGUIPlatform::Platform>(viewer, guiRoot, resourceSystem->getImageManager(),
             resourceSystem->getVFS(), mScalingFactor, resourcePath, logpath / "MyGUI.log");
@@ -1349,8 +1346,10 @@ namespace MWGui
         for (const auto& [window, settings] : mTrackedWindows)
         {
             const WindowRectSettingValues& rect = settings.mIsMaximized ? settings.mMaximized : settings.mRegular;
-            window->setPosition(MyGUI::IntPoint(static_cast<int>(rect.mX * x), static_cast<int>(rect.mY * y)));
-            window->setSize(MyGUI::IntSize(static_cast<int>(rect.mW * x), static_cast<int>(rect.mH * y)));
+            window->setPosition(MyGUI::IntPoint(
+                static_cast<int>(rect.mX * static_cast<float>(x)), static_cast<int>(rect.mY * static_cast<float>(y))));
+            window->setSize(MyGUI::IntSize(
+                static_cast<int>(rect.mW * static_cast<float>(x)), static_cast<int>(rect.mH * static_cast<float>(y))));
 
             WindowBase::clampWindowCoordinates(window);
         }
@@ -1629,8 +1628,8 @@ namespace MWGui
         x = static_cast<float>(pos.left);
         y = static_cast<float>(pos.top);
         const MyGUI::IntSize& viewSize = MyGUI::RenderManager::getInstance().getViewSize();
-        x /= viewSize.width;
-        y /= viewSize.height;
+        x /= static_cast<float>(viewSize.width);
+        y /= static_cast<float>(viewSize.height);
     }
 
     bool WindowManager::getWorldMouseOver()
@@ -1952,10 +1951,10 @@ namespace MWGui
         const WindowRectSettingValues& rect = settings.mIsMaximized ? settings.mMaximized : settings.mRegular;
 
         MyGUI::Window* window = layout->mMainWidget->castType<MyGUI::Window>();
-        window->setPosition(
-            MyGUI::IntPoint(static_cast<int>(rect.mX * viewSize.width), static_cast<int>(rect.mY * viewSize.height)));
-        window->setSize(
-            MyGUI::IntSize(static_cast<int>(rect.mW * viewSize.width), static_cast<int>(rect.mH * viewSize.height)));
+        window->setPosition(MyGUI::IntPoint(static_cast<int>(rect.mX * static_cast<float>(viewSize.width)),
+            static_cast<int>(rect.mY * static_cast<float>(viewSize.height))));
+        window->setSize(MyGUI::IntSize(static_cast<int>(rect.mW * static_cast<float>(viewSize.width)),
+            static_cast<int>(rect.mH * static_cast<float>(viewSize.height))));
 
         window->eventWindowChangeCoord += MyGUI::newDelegate(this, &WindowManager::onWindowChangeCoord);
         WindowBase::clampWindowCoordinates(window);
@@ -1974,10 +1973,10 @@ namespace MWGui
         const WindowRectSettingValues& rect = settings.mIsMaximized ? settings.mRegular : settings.mMaximized;
 
         MyGUI::IntSize viewSize = MyGUI::RenderManager::getInstance().getViewSize();
-        const int x = static_cast<int>(rect.mX * viewSize.width);
-        const int y = static_cast<int>(rect.mY * viewSize.height);
-        const int w = static_cast<int>(rect.mW * viewSize.width);
-        const int h = static_cast<int>(rect.mH * viewSize.height);
+        const int x = static_cast<int>(rect.mX * static_cast<float>(viewSize.width));
+        const int y = static_cast<int>(rect.mY * static_cast<float>(viewSize.height));
+        const int w = static_cast<int>(rect.mW * static_cast<float>(viewSize.width));
+        const int h = static_cast<int>(rect.mH * static_cast<float>(viewSize.height));
         window->setCoord(x, y, w, h);
 
         settings.mIsMaximized.set(!settings.mIsMaximized.get());
@@ -2001,10 +2000,10 @@ namespace MWGui
         const WindowSettingValues& settings = it->second;
 
         MyGUI::IntSize viewSize = MyGUI::RenderManager::getInstance().getViewSize();
-        settings.mRegular.mX.set(window->getPosition().left / static_cast<float>(viewSize.width));
-        settings.mRegular.mY.set(window->getPosition().top / static_cast<float>(viewSize.height));
-        settings.mRegular.mW.set(window->getSize().width / static_cast<float>(viewSize.width));
-        settings.mRegular.mH.set(window->getSize().height / static_cast<float>(viewSize.height));
+        settings.mRegular.mX.set(static_cast<float>(window->getPosition().left) / static_cast<float>(viewSize.width));
+        settings.mRegular.mY.set(static_cast<float>(window->getPosition().top) / static_cast<float>(viewSize.height));
+        settings.mRegular.mW.set(static_cast<float>(window->getSize().width) / static_cast<float>(viewSize.width));
+        settings.mRegular.mH.set(static_cast<float>(window->getSize().height) / static_cast<float>(viewSize.height));
 
         settings.mIsMaximized.set(false);
     }
@@ -2315,7 +2314,7 @@ namespace MWGui
 
     void WindowManager::setBlindness(const int percent)
     {
-        mBlindnessFader->notifyAlphaChanged(percent / 100.f);
+        mBlindnessFader->notifyAlphaChanged(static_cast<float>(percent) / 100.f);
     }
 
     void WindowManager::activateHitOverlay(bool interrupt)

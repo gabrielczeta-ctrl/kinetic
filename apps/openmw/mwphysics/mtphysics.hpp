@@ -10,13 +10,20 @@
 #include <thread>
 #include <unordered_set>
 
-#include <BulletCollision/CollisionDispatch/btCollisionWorld.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Body/BodyManager.h>
+#include <Jolt/Physics/PhysicsSystem.h>
 
 #include <osg/Timer>
 
 #include "components/misc/budgetmeasurement.hpp"
 #include "physicssystem.hpp"
 #include "ptrholder.hpp"
+
+namespace JPH
+{
+    class JobSystem;
+}
 
 namespace Misc
 {
@@ -25,7 +32,7 @@ namespace Misc
 
 namespace MWRender
 {
-    class DebugDrawer;
+    class JoltDebugDrawer;
 }
 
 namespace MWPhysics
@@ -33,14 +40,14 @@ namespace MWPhysics
     enum class LockingPolicy
     {
         NoLocks,
-        ExclusiveLocksOnly,
         AllowSharedLocks,
     };
 
     class PhysicsTaskScheduler
     {
     public:
-        PhysicsTaskScheduler(float physicsDt, btCollisionWorld* collisionWorld, MWRender::DebugDrawer* debugDrawer);
+        PhysicsTaskScheduler(float physicsDt, JPH::PhysicsSystem* physicsSystem, MWRender::JoltDebugDrawer* debugDrawer,
+            JPH::JobSystem* jobSystem);
         ~PhysicsTaskScheduler();
 
         /// @brief move actors taking into account desired movements and collisions
@@ -52,61 +59,56 @@ namespace MWPhysics
             unsigned int frameNumber, osg::Stats& stats);
 
         void resetSimulation(const ActorMap& actors);
+        void syncSimulation();
 
-        // Thread safe wrappers
-        void rayTest(const btVector3& rayFromWorld, const btVector3& rayToWorld,
-            btCollisionWorld::RayResultCallback& resultCallback) const;
-        void convexSweepTest(const btConvexShape* castShape, const btTransform& from, const btTransform& to,
-            btCollisionWorld::ConvexResultCallback& resultCallback) const;
-        void contactTest(btCollisionObject* colObj, btCollisionWorld::ContactResultCallback& resultCallback);
-        std::optional<btVector3> getHitPoint(const btTransform& from, btCollisionObject* target);
-        void aabbTest(const btVector3& aabbMin, const btVector3& aabbMax, btBroadphaseAabbCallback& callback);
-        void getAabb(const btCollisionObject* obj, btVector3& min, btVector3& max);
-        void setCollisionFilterMask(btCollisionObject* collisionObject, int collisionFilterMask);
-        void addCollisionObject(btCollisionObject* collisionObject, int collisionFilterGroup, int collisionFilterMask);
-        void removeCollisionObject(btCollisionObject* collisionObject);
-        void updateSingleAabb(const std::shared_ptr<PtrHolder>& ptr, bool immediate = false);
-        bool getLineOfSight(const std::shared_ptr<Actor>& actor1, const std::shared_ptr<Actor>& actor2);
+        void addCollisionObject(JPH::Body* joltBody, bool activate = false);
+        void removeCollisionObject(JPH::Body* collisionObject);
+        void destroyCollisionObject(JPH::Body* collisionObject);
+        JPH::Body* createPhysicsBody(JPH::BodyCreationSettings& settings);
+
+        std::shared_mutex& getSimulationMutex() { return mSimulationMutex; }
+
         void debugDraw();
-        void* getUserPointer(const btCollisionObject* object) const;
+        bool getLineOfSight(const std::shared_ptr<Actor>& actor1, const std::shared_ptr<Actor>& actor2);
+        void* getUserPointer(const JPH::BodyID object) const;
         void releaseSharedStates(); // destroy all objects whose destructor can't be safely called from
                                     // ~PhysicsTaskScheduler()
+
+        inline const JPH::BodyLockInterfaceLocking& getBodyLockInterface() const
+        {
+            return mPhysicsSystem->GetBodyLockInterface();
+        }
+
+        inline JPH::BodyInterface& getBodyInterface() { return mPhysicsSystem->GetBodyInterface(); }
 
     private:
         class WorkersSync;
 
+        void waitForSimulationBarrier();
         void doSimulation();
-        void worker();
         void updateActorsPositions();
         bool hasLineOfSight(const Actor* actor1, const Actor* actor2);
         void refreshLOSCache();
-        void updateAabbs();
         void updatePtrAabb(const std::shared_ptr<PtrHolder>& ptr);
         void updateStats(osg::Timer_t frameStart, unsigned int frameNumber, osg::Stats& stats);
         std::tuple<unsigned, float> calculateStepConfig(float timeAccum) const;
         void afterPreStep();
         void afterPostStep();
         void afterPostSim();
-        void syncWithMainThread();
-        void waitForWorkers();
         void prepareWork(float& timeAccum, std::vector<Simulation>& simulations, osg::Timer_t frameStart,
             unsigned int frameNumber, osg::Stats& stats);
 
+        JPH::PhysicsSystem* mPhysicsSystem;
+        JPH::JobSystem* mJobSystem;
+
         std::unique_ptr<WorldFrameData> mWorldFrameData;
         std::vector<Simulation>* mSimulations = nullptr;
-        std::unordered_set<const btCollisionObject*> mCollisionObjects;
         float mDefaultPhysicsDt;
         float mPhysicsDt;
         float mTimeAccum;
-        btCollisionWorld* mCollisionWorld;
-        MWRender::DebugDrawer* mDebugDrawer;
+        MWRender::JoltDebugDrawer* mDebugDrawer;
         std::vector<LOSRequest> mLOSCache;
         std::set<std::weak_ptr<PtrHolder>, std::owner_less<std::weak_ptr<PtrHolder>>> mUpdateAabb;
-
-        // TODO: use std::experimental::flex_barrier or std::barrier once it becomes a thing
-        std::unique_ptr<Misc::Barrier> mPreStepBarrier;
-        std::unique_ptr<Misc::Barrier> mPostStepBarrier;
-        std::unique_ptr<Misc::Barrier> mPostSimBarrier;
 
         LockingPolicy mLockingPolicy;
         unsigned mNumThreads;
@@ -114,14 +116,10 @@ namespace MWPhysics
         unsigned mRemainingSteps;
         int mLOSCacheExpiry;
         bool mAdvanceSimulation;
-        std::atomic<int> mNextJob;
         std::atomic<int> mNextLOS;
-        std::vector<std::thread> mThreads;
 
         mutable std::shared_mutex mSimulationMutex;
-        mutable std::shared_mutex mCollisionWorldMutex;
         mutable std::shared_mutex mLOSCacheMutex;
-        mutable std::mutex mUpdateAabbMutex;
 
         unsigned int mFrameNumber;
         const osg::Timer* mTimer;
@@ -134,8 +132,9 @@ namespace MWPhysics
         osg::Timer_t mTimeBegin;
         osg::Timer_t mTimeEnd;
         osg::Timer_t mFrameStart;
+        bool mHasPendingTimingStats;
 
-        std::unique_ptr<WorkersSync> mWorkersSync;
+        JPH::JobSystem::Barrier* mSimulationBarrier;
     };
 
 }

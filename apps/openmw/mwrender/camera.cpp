@@ -51,8 +51,7 @@ namespace MWRender
     Camera::Camera(osg::Camera* camera)
         : mHeightScale(1.f)
         , mCollisionType(
-              (MWPhysics::CollisionType::CollisionType_Default & ~MWPhysics::CollisionType::CollisionType_Actor)
-              | MWPhysics::CollisionType_CameraOnly)
+              (MWPhysics::CollisionMask_Default & ~MWPhysics::Layers::ACTOR) | MWPhysics::Layers::CAMERA_ONLY)
         , mCamera(camera)
         , mAnimation(nullptr)
         , mFirstPersonView(true)

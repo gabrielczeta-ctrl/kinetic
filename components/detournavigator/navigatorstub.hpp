@@ -29,22 +29,23 @@ namespace DetourNavigator
         {
         }
 
-        void addObject(const ObjectId /*id*/, const ObjectShapes& /*shapes*/, const btTransform& /*transform*/,
+        void addObject(const ObjectId /*id*/, const ObjectShapes& /*shapes*/, const osg::Matrixd& /*transform*/,
             const UpdateGuard* /*guard*/) override
         {
         }
 
-        void addObject(const ObjectId /*id*/, const DoorShapes& /*shapes*/, const btTransform& /*transform*/,
+        void addObject(const ObjectId /*id*/, const DoorShapes& /*shapes*/, const osg::Matrixd& /*transform*/,
+            const UpdateGuard* /*guard*/) override
+        {
+            assert(false);
+        }
+
+        void updateObject(const ObjectId /*id*/, const ObjectShapes& /*shapes*/, const osg::Matrixd& /*transform*/,
             const UpdateGuard* /*guard*/) override
         {
         }
 
-        void updateObject(const ObjectId /*id*/, const ObjectShapes& /*shapes*/, const btTransform& /*transform*/,
-            const UpdateGuard* /*guard*/) override
-        {
-        }
-
-        void updateObject(const ObjectId /*id*/, const DoorShapes& /*shapes*/, const btTransform& /*transform*/,
+        void updateObject(const ObjectId /*id*/, const DoorShapes& /*shapes*/, const osg::Matrixd& /*transform*/,
             const UpdateGuard* /*guard*/) override
         {
         }

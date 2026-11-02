@@ -1,116 +1,116 @@
 #include "trace.h"
 
+#include <components/debug/debuglog.hpp>
 #include <components/misc/convert.hpp>
 
-#include <BulletCollision/CollisionDispatch/btCollisionWorld.h>
-#include <BulletCollision/CollisionShapes/btConvexShape.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Collision/ShapeCast.h>
+#include <Jolt/Physics/PhysicsSystem.h>
 
 #include "actor.hpp"
 #include "actorconvexcallback.hpp"
-#include "collisiontype.hpp"
+#include "joltfilters.hpp"
+#include "joltlayers.hpp"
 
 namespace MWPhysics
 {
-
-    ActorConvexCallback sweepHelper(const btCollisionObject* actor, const btVector3& from, const btVector3& to,
-        const btCollisionWorld* world, bool actorFilter)
+    ActorConvexCallback sweepHelper(const JPH::BodyID actor, const JPH::RVec3& from, const JPH::RVec3& to,
+        const JPH::PhysicsSystem* physicsSystem, bool actorFilter, const int collisionMask,
+        JPH::EBackFaceMode trianglesBackFaceMode)
     {
-        const btTransform& trans = actor->getWorldTransform();
-        btTransform transFrom(trans);
-        btTransform transTo(trans);
-        transFrom.setOrigin(from);
-        transTo.setOrigin(to);
+        const JPH::RVec3 correctMotion = to - from;
 
-        const btCollisionShape* shape = actor->getCollisionShape();
-        assert(shape->isConvex());
-
-        const btVector3 motion
-            = from - to; // FIXME: this is backwards; means ActorConvexCallback is doing dot product tests backwards too
-        ActorConvexCallback traceCallback(actor, motion, btScalar(0.0), world);
-        // Inherit the actor's collision group and mask
-        traceCallback.m_collisionFilterGroup = actor->getBroadphaseHandle()->m_collisionFilterGroup;
-        traceCallback.m_collisionFilterMask = actor->getBroadphaseHandle()->m_collisionFilterMask;
-        if (actorFilter)
-            traceCallback.m_collisionFilterMask &= ~CollisionType_Actor;
-
-        world->convexSweepTest(static_cast<const btConvexShape*>(shape), transFrom, transTo, traceCallback);
-        return traceCallback;
-    }
-
-    void ActorTracer::doTrace(const btCollisionObject* actor, const osg::Vec3f& start, const osg::Vec3f& end,
-        const btCollisionWorld* world, bool attemptShortTrace)
-    {
-        const btVector3 btstart = Misc::Convert::toBullet(start);
-        btVector3 btend = Misc::Convert::toBullet(end);
-
-        // Because Bullet's collision trace tests touch *all* geometry in its path, a lot of long collision tests
-        // will unnecessarily test against complex meshes that are dozens of units away. This wouldn't normally be
-        // a problem, but bullet isn't the fastest in the world when it comes to doing tests against triangle meshes.
-        // Therefore, we try out a short trace first, then only fall back to the full length trace if needed.
-        // This trace needs to be at least a couple units long, but there's no one particular ideal length.
-        // The length of 2.1 chosen here is a "works well in practice after testing a few random lengths" value.
-        // (Also, we only do this short test if the intended collision trace is long enough for it to make sense.)
-        const float fallbackLength = 2.1f;
-        bool doingShortTrace = false;
-        // For some reason, typical scenes perform a little better if we increase the threshold length for the length
-        // test. (Multiplying by 2 in 'square distance' units gives us about 1.4x the threshold length. In benchmarks
-        // this was
-        //  slightly better for the performance of normal scenes than 4.0, and just plain better than 1.0.)
-        if (attemptShortTrace && (btend - btstart).length2() > fallbackLength * fallbackLength * 2.0)
+        JPH::BodyLockRead lock(physicsSystem->GetBodyLockInterface(), actor);
+        if (lock.Succeeded())
         {
-            btend = btstart + (btend - btstart).normalized() * fallbackLength;
-            doingShortTrace = true;
+            const JPH::Body& actorBody = lock.GetBody();
+            const JPH::ShapeRefC shapeRef = actorBody.GetShape();
+            const JPH::RMat44& trans = actorBody.GetWorldTransform();
+
+            JPH::RMat44 transFrom(trans);
+            transFrom.SetTranslation(from);
+
+            // Convex shapes (actors) should always check backfaces. Triangle behavior depends on query type.
+            JPH::ShapeCastSettings settings;
+            settings.mBackFaceModeTriangles = trianglesBackFaceMode;
+            settings.mBackFaceModeConvex = JPH::EBackFaceMode::CollideWithBackFaces;
+
+            JPH::Vec3 scale = JPH::Vec3::sReplicate(1.0f);
+            JPH::RShapeCast shapeCast(
+                shapeRef.GetPtr(), scale, transFrom, Misc::Convert::toJolt<JPH::Vec3>(correctMotion));
+
+            // Inherit the actor's collision mask
+            int actualMask = collisionMask;
+            if (actorFilter)
+                actualMask &= ~Layers::ACTOR;
+
+            // Inherit the actor's collision group
+            JPH::DefaultBroadPhaseLayerFilter broadphaseLayerFilter
+                = physicsSystem->GetDefaultBroadPhaseLayerFilter(actorBody.GetObjectLayer());
+            MaskedObjectLayerFilter objectLayerFilter(actualMask);
+
+            // Ignore actor's own body
+            JPH::IgnoreSingleBodyFilter bodyFilter(actor);
+
+            const JPH::RVec3 castStart = shapeCast.mCenterOfMassStart.GetTranslation();
+            ActorConvexCallback collector(
+                actor, physicsSystem, castStart, castStart, 0.0, Misc::Convert::toJolt<JPH::Vec3>(correctMotion));
+            lock.ReleaseLock();
+            physicsSystem->GetNarrowPhaseQuery().CastShape(shapeCast, settings,
+                shapeCast.mCenterOfMassStart.GetTranslation(), collector, broadphaseLayerFilter, objectLayerFilter,
+                bodyFilter);
+
+            return collector;
         }
 
-        const auto traceCallback = sweepHelper(actor, btstart, btend, world, false);
+        // Shouldn't happen, but just incase lock fails (body invalid or something bad happens)
+        Log(Debug::Error) << "Unable to lock body for sweep helper";
+        ActorConvexCallback collector;
+        return collector;
+    }
+
+    void ActorTracer::doTrace(const JPH::BodyID actor, const osg::Vec3f& start, const osg::Vec3f& end,
+        const JPH::PhysicsSystem* physicsSystem, const int collisionMask, bool attemptShortTrace)
+    {
+        (void)attemptShortTrace;
+        const JPH::RVec3 jphStart = Misc::Convert::toJolt<JPH::RVec3>(start);
+        JPH::RVec3 jphEnd = Misc::Convert::toJolt<JPH::RVec3>(end);
+
+        const auto traceCallback = sweepHelper(
+            actor, jphStart, jphEnd, physicsSystem, false, collisionMask, JPH::EBackFaceMode::IgnoreBackFaces);
 
         // Copy the hit data over to our trace results struct:
         if (traceCallback.hasHit())
         {
-            mFraction = static_cast<float>(traceCallback.m_closestHitFraction);
-            // ensure fraction is correct (covers intended distance traveled instead of actual distance traveled)
-            if (doingShortTrace && (end - start).length2() > 0.0)
-                mFraction *= static_cast<float>((btend - btstart).length() / (end - start).length());
-            mPlaneNormal = Misc::Convert::toOsg(traceCallback.m_hitNormalWorld);
+            mFraction = traceCallback.mClosestHitFraction;
+            mPlaneNormal = Misc::Convert::toOsg(traceCallback.mHitNormalWorld);
             mEndPos = (end - start) * mFraction + start;
-            mHitPoint = Misc::Convert::toOsg(traceCallback.m_hitPointWorld);
-            mHitObject = traceCallback.m_hitCollisionObject;
+            mHitPoint = traceCallback.mHitPointWorld;
+            mHitObject = traceCallback.mHitCollisionObject;
+            mHitObjectLayer = traceCallback.mHitCollisionLayer;
         }
         else
         {
-            if (doingShortTrace)
-            {
-                btend = Misc::Convert::toBullet(end);
-                const auto newTraceCallback = sweepHelper(actor, btstart, btend, world, false);
-
-                if (newTraceCallback.hasHit())
-                {
-                    mFraction = static_cast<float>(newTraceCallback.m_closestHitFraction);
-                    mPlaneNormal = Misc::Convert::toOsg(newTraceCallback.m_hitNormalWorld);
-                    mEndPos = (end - start) * mFraction + start;
-                    mHitPoint = Misc::Convert::toOsg(newTraceCallback.m_hitPointWorld);
-                    mHitObject = newTraceCallback.m_hitCollisionObject;
-                    return;
-                }
-            }
             // fallthrough
             mEndPos = end;
             mPlaneNormal = osg::Vec3f(0.0f, 0.0f, 1.0f);
             mFraction = 1.0f;
             mHitPoint = end;
             mHitObject = nullptr;
+            mHitObjectLayer = 0;
         }
     }
 
     void ActorTracer::findGround(
-        const Actor* actor, const osg::Vec3f& start, const osg::Vec3f& end, const btCollisionWorld* world)
+        const Actor* actor, const osg::Vec3f& start, const osg::Vec3f& end, const JPH::PhysicsSystem* physicsSystem)
     {
-        const auto traceCallback = sweepHelper(
-            actor->getCollisionObject(), Misc::Convert::toBullet(start), Misc::Convert::toBullet(end), world, true);
+        const auto traceCallback = sweepHelper(actor->getPhysicsBody(), Misc::Convert::toJolt<JPH::RVec3>(start),
+            Misc::Convert::toJolt<JPH::RVec3>(end), physicsSystem, true, actor->getCollisionMask(),
+            JPH::EBackFaceMode::CollideWithBackFaces);
         if (traceCallback.hasHit())
         {
-            mFraction = static_cast<float>(traceCallback.m_closestHitFraction);
-            mPlaneNormal = Misc::Convert::toOsg(traceCallback.m_hitNormalWorld);
+            mFraction = traceCallback.mClosestHitFraction;
+            mPlaneNormal = Misc::Convert::toOsg(traceCallback.mHitNormalWorld);
             mEndPos = (end - start) * mFraction + start;
         }
         else

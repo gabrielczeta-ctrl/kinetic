@@ -41,7 +41,7 @@ namespace MWClass
     ContainerCustomData::ContainerCustomData(const ESM::Container& container, MWWorld::CellStore* cell)
     {
         auto& prng = MWBase::Environment::get().getWorld()->getPrng();
-        unsigned int seed = Misc::Rng::rollDice(std::numeric_limits<int>::max(), prng);
+        const unsigned int seed = static_cast<unsigned int>(Misc::Rng::rollDice(std::numeric_limits<int>::max(), prng));
         // setting ownership not needed, since taking items from a container inherits the
         // container's owner automatically
         mStore.fillNonRandom(container.mInventory, ESM::RefId(), seed);
@@ -124,7 +124,7 @@ namespace MWClass
     void Container::insertObjectPhysics(const MWWorld::Ptr& ptr, const std::string& model, const osg::Quat& rotation,
         MWPhysics::PhysicsSystem& physics) const
     {
-        physics.addObject(ptr, VFS::Path::toNormalized(model), rotation, MWPhysics::CollisionType_World);
+        physics.addObject(ptr, VFS::Path::toNormalized(model), rotation, MWPhysics::Layers::WORLD);
     }
 
     VFS::Path::NormalizedView Container::getModel(const MWWorld::ConstPtr& ptr) const

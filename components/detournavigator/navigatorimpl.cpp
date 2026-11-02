@@ -7,6 +7,9 @@
 #include <components/misc/convert.hpp>
 #include <components/misc/coordinateconverter.hpp>
 
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Collision/Shape/Shape.h>
+
 namespace DetourNavigator
 {
     NavigatorImpl::NavigatorImpl(const Settings& settings, std::unique_ptr<NavMeshDb>&& db)
@@ -40,18 +43,18 @@ namespace DetourNavigator
     }
 
     void NavigatorImpl::addObject(
-        const ObjectId id, const ObjectShapes& shapes, const btTransform& transform, const UpdateGuard* guard)
+        const ObjectId id, const ObjectShapes& shapes, const osg::Matrixd& transform, const UpdateGuard* guard)
     {
         addObjectImpl(id, shapes, transform, guard);
     }
 
     bool NavigatorImpl::addObjectImpl(
-        const ObjectId id, const ObjectShapes& shapes, const btTransform& transform, const UpdateGuard* guard)
+        const ObjectId id, const ObjectShapes& shapes, const osg::Matrixd& transform, const UpdateGuard* guard)
     {
         const CollisionShape collisionShape(
             shapes.mShapeInstance, *shapes.mShapeInstance->mCollisionShape, shapes.mTransform);
         bool result = mNavMeshManager.addObject(id, collisionShape, transform, AreaType_ground, guard);
-        if (const btCollisionShape* const avoidShape = shapes.mShapeInstance->mAvoidCollisionShape.get())
+        if (const JPH::Shape* const avoidShape = shapes.mShapeInstance->mAvoidCollisionShape.GetPtr())
         {
             const ObjectId avoidId(avoidShape);
             const CollisionShape avoidCollisionShape(shapes.mShapeInstance, *avoidShape, shapes.mTransform);
@@ -65,7 +68,7 @@ namespace DetourNavigator
     }
 
     void NavigatorImpl::addObject(
-        const ObjectId id, const DoorShapes& shapes, const btTransform& transform, const UpdateGuard* guard)
+        const ObjectId id, const DoorShapes& shapes, const osg::Matrixd& transform, const UpdateGuard* guard)
     {
         if (addObjectImpl(id, static_cast<const ObjectShapes&>(shapes), transform, guard))
         {
@@ -77,10 +80,10 @@ namespace DetourNavigator
     }
 
     void NavigatorImpl::updateObject(
-        const ObjectId id, const ObjectShapes& shapes, const btTransform& transform, const UpdateGuard* guard)
+        const ObjectId id, const ObjectShapes& shapes, const osg::Matrixd& transform, const UpdateGuard* guard)
     {
         mNavMeshManager.updateObject(id, transform, AreaType_ground, guard);
-        if (const btCollisionShape* const avoidShape = shapes.mShapeInstance->mAvoidCollisionShape.get())
+        if (const JPH::Shape* const avoidShape = shapes.mShapeInstance->mAvoidCollisionShape.GetPtr())
         {
             const ObjectId avoidId(avoidShape);
             if (mNavMeshManager.updateObject(avoidId, transform, AreaType_null, guard))
@@ -89,7 +92,7 @@ namespace DetourNavigator
     }
 
     void NavigatorImpl::updateObject(
-        const ObjectId id, const DoorShapes& shapes, const btTransform& transform, const UpdateGuard* guard)
+        const ObjectId id, const DoorShapes& shapes, const osg::Matrixd& transform, const UpdateGuard* guard)
     {
         return updateObject(id, static_cast<const ObjectShapes&>(shapes), transform, guard);
     }

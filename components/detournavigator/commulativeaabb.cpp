@@ -1,27 +1,29 @@
-#include "commulativeaabb.hpp"
+#include <Jolt/Jolt.h>
 
-#include <components/bullethelpers/aabb.hpp>
+#include <components/physicshelpers/aabb.hpp>
+
+#include "commulativeaabb.hpp"
 
 namespace DetourNavigator
 {
-    CommulativeAabb::CommulativeAabb(std::size_t lastChangeRevision, const btAABB& aabb)
+    CommulativeAabb::CommulativeAabb(std::size_t lastChangeRevision, const JPH::AABox& aabb)
         : mLastChangeRevision(lastChangeRevision)
         , mAabb(aabb)
     {
     }
 
-    bool CommulativeAabb::update(std::size_t lastChangeRevision, const btAABB& aabb)
+    bool CommulativeAabb::update(std::size_t lastChangeRevision, const JPH::AABox& aabb)
     {
         if (mLastChangeRevision != lastChangeRevision)
         {
             mLastChangeRevision = lastChangeRevision;
-            // btAABB doesn't have copy-assignment operator
-            mAabb.m_min = aabb.m_min;
-            mAabb.m_max = aabb.m_max;
+            mAabb = aabb;
             return true;
         }
-        const btAABB currentAabb = mAabb;
-        mAabb.merge(aabb);
+
+        const JPH::AABox currentAabb = mAabb;
+        mAabb.Encapsulate(aabb);
+
         return currentAabb != mAabb;
     }
 }

@@ -1,17 +1,23 @@
 #include "recastmeshbuilder.hpp"
 #include "exceptions.hpp"
+#include "heightfieldmeshbuilder.hpp"
+#include "recastmeshobject.hpp"
 
-#include <components/bullethelpers/heightfield.hpp>
-#include <components/bullethelpers/processtrianglecallback.hpp>
-#include <components/bullethelpers/transformboundingbox.hpp>
+#include <components/debug/debuglog.hpp>
 #include <components/misc/convert.hpp>
+#include <components/physicshelpers/heightfield.hpp>
+#include <components/physicshelpers/transformboundingbox.hpp>
 
-#include <BulletCollision/CollisionShapes/btBoxShape.h>
-#include <BulletCollision/CollisionShapes/btCompoundShape.h>
-#include <BulletCollision/CollisionShapes/btConcaveShape.h>
-#include <BulletCollision/CollisionShapes/btHeightfieldTerrainShape.h>
-#include <LinearMath/btAabbUtil2.h>
-#include <LinearMath/btTransform.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/Math/Real.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/CompoundShape.h>
+#include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
+#include <Jolt/Physics/Collision/Shape/ScaledShape.h>
+
+#include <osg/Matrixf>
 
 #include <algorithm>
 #include <array>
@@ -22,11 +28,66 @@
 
 namespace DetourNavigator
 {
-    using BulletHelpers::makeProcessTriangleCallback;
-
     namespace
     {
-        RecastMeshTriangle makeRecastMeshTriangle(const btVector3* vertices, const AreaType areaType)
+        JPH::Float3 joltTransformMult(const JPH::Float3& vec, const osg::Matrixd& mat)
+        {
+            osg::Vec3d pos(vec.x, vec.y, vec.z);
+            osg::Vec3d result = pos * mat;
+            return JPH::Float3(
+                static_cast<float>(result.x()), static_cast<float>(result.y()), static_cast<float>(result.z()));
+        }
+
+        template <class TriangleBatchWalker>
+        void walkShapeTriangles(const JPH::Shape& shape, const JPH::AABox& bounds, TriangleBatchWalker&& walkerFunc,
+            const JPH::Vec3 translation = JPH::Vec3::sZero(), const JPH::Quat rotation = JPH::Quat::sIdentity(),
+            const JPH::Vec3 localScale = JPH::Vec3::sReplicate(1.0f))
+        {
+            // Start iterating all triangles of the shape
+            JPH::Shape::GetTrianglesContext context;
+            shape.GetTrianglesStart(context, bounds, translation, rotation, localScale);
+
+            int triangleIndex = 0;
+            constexpr int cMaxTrianglesInBatch = 256;
+            JPH::Float3 vertices[3 * cMaxTrianglesInBatch];
+            for (;;)
+            {
+                // Get the next batch of triangles and vertices
+                int triCount = shape.GetTrianglesNext(context, cMaxTrianglesInBatch, vertices);
+                assert(triCount >= 0);
+                if (triCount == 0)
+                    break;
+
+                walkerFunc(vertices, triCount, triangleIndex);
+                triangleIndex += triCount;
+            }
+        }
+
+        inline bool TestTriangleAgainstAabb2(
+            const JPH::Float3* vertices, const JPH::Vec3& aabbMin, const JPH::Vec3& aabbMax)
+        {
+            const JPH::Float3& p1 = vertices[0];
+            const JPH::Float3& p2 = vertices[1];
+            const JPH::Float3& p3 = vertices[2];
+
+            if (std::min(std::min(p1.x, p2.x), p3.x) > aabbMax.GetX())
+                return false;
+            if (std::max(std::max(p1.x, p2.x), p3.x) < aabbMin.GetX())
+                return false;
+
+            if (std::min(std::min(p1.z, p2.z), p3.z) > aabbMax.GetZ())
+                return false;
+            if (std::max(std::max(p1.z, p2.z), p3.z) < aabbMin.GetZ())
+                return false;
+
+            if (std::min(std::min(p1.y, p2.y), p3.y) > aabbMax.GetY())
+                return false;
+            if (std::max(std::max(p1.y, p2.y), p3.y) < aabbMin.GetY())
+                return false;
+            return true;
+        }
+
+        RecastMeshTriangle makeRecastMeshTriangle(const JPH::Float3* vertices, const AreaType areaType)
         {
             RecastMeshTriangle result;
             result.mAreaType = areaType;
@@ -37,7 +98,7 @@ namespace DetourNavigator
 
         float getHeightfieldScale(int cellSize, std::size_t dataSize)
         {
-            return static_cast<float>(cellSize) / (dataSize - 1);
+            return static_cast<float>(cellSize) / static_cast<float>(dataSize - 1);
         }
 
         bool isNan(const RecastMeshTriangle& triangle)
@@ -48,6 +109,7 @@ namespace DetourNavigator
                     return true;
             return false;
         }
+
     }
 
     Mesh makeMesh(std::vector<RecastMeshTriangle>&& triangles, const osg::Vec3f& shift)
@@ -97,37 +159,31 @@ namespace DetourNavigator
 
     Mesh makeMesh(const Heightfield& heightfield)
     {
-        using BulletHelpers::makeProcessTriangleCallback;
         using Misc::Convert::toOsg;
 
-        constexpr int upAxis = 2;
-        constexpr bool flipQuadEdges = false;
-#if BT_BULLET_VERSION < 310
-        std::vector<btScalar> heights(heightfield.mHeights.begin(), heightfield.mHeights.end());
-        btHeightfieldTerrainShape shape(static_cast<int>(heightfield.mHeights.size() / heightfield.mLength),
-            static_cast<int>(heightfield.mLength), heights.data(), 1, heightfield.mMinHeight, heightfield.mMaxHeight,
-            upAxis, PHY_FLOAT, flipQuadEdges);
-#else
-        btHeightfieldTerrainShape shape(static_cast<int>(heightfield.mHeights.size() / heightfield.mLength),
+        HeightfieldMeshBuilder shape(static_cast<int>(heightfield.mHeights.size() / heightfield.mLength),
             static_cast<int>(heightfield.mLength), heightfield.mHeights.data(), heightfield.mMinHeight,
-            heightfield.mMaxHeight, upAxis, flipQuadEdges);
-#endif
+            heightfield.mMaxHeight);
+
         const float scale = getHeightfieldScale(heightfield.mCellSize, heightfield.mOriginalSize);
-        shape.setLocalScaling(btVector3(scale, scale, 1));
-        btVector3 aabbMin;
-        btVector3 aabbMax;
-        shape.getAabb(btTransform::getIdentity(), aabbMin, aabbMax);
+        shape.setLocalScaling(JPH::Vec3(scale, scale, 1));
+        JPH::Vec3 aabbMin;
+        JPH::Vec3 aabbMax;
+        shape.getAabb(aabbMin, aabbMax);
         std::vector<RecastMeshTriangle> triangles;
-        auto callback = makeProcessTriangleCallback([&](btVector3* vertices, int, int) {
+
+        TriangleProcessFunc callback = [&](JPH::Float3* vertices, int, int) {
             triangles.emplace_back(makeRecastMeshTriangle(vertices, AreaType_ground));
-        });
-        shape.processAllTriangles(&callback, aabbMin, aabbMax);
-        const btVector3 aabbShift = (aabbMax - aabbMin) * 0.5;
+        };
+        shape.processAllTriangles(callback, aabbMin, aabbMax);
+
+        const osg::Vec2f aabbShift
+            = (osg::Vec2f(aabbMax.GetX(), aabbMax.GetY()) - osg::Vec2f(aabbMin.GetX(), aabbMin.GetY())) * 0.5;
         const osg::Vec2f tileShift = osg::Vec2f(heightfield.mMinX, heightfield.mMinY) * scale;
-        const osg::Vec2f localShift
-            = osg::Vec2f(static_cast<float>(aabbShift.x()), static_cast<float>(aabbShift.y())) + tileShift;
+        const osg::Vec2f localShift = aabbShift + tileShift;
         const float cellSize = static_cast<float>(heightfield.mCellSize);
-        const osg::Vec3f cellShift(heightfield.mCellPosition.x() * cellSize, heightfield.mCellPosition.y() * cellSize,
+        const osg::Vec3f cellShift(static_cast<float>(heightfield.mCellPosition.x()) * cellSize,
+            static_cast<float>(heightfield.mCellPosition.y()) * cellSize,
             (heightfield.mMinHeight + heightfield.mMaxHeight) * 0.5f);
         return makeMesh(std::move(triangles), cellShift + osg::Vec3f(localShift.x(), localShift.y(), 0));
     }
@@ -137,83 +193,70 @@ namespace DetourNavigator
     {
     }
 
-    void RecastMeshBuilder::addObject(const btCollisionShape& shape, const btTransform& transform,
-        const AreaType areaType, osg::ref_ptr<const Resource::BulletShape> source,
-        const ObjectTransform& objectTransform)
+    void RecastMeshBuilder::addObject(const JPH::Shape& shape, const osg::Matrixd& transform, const AreaType areaType,
+        osg::ref_ptr<const Resource::PhysicsShape> source, const ObjectTransform& objectTransform)
     {
         addObject(shape, transform, areaType);
         mSources.push_back(MeshSource{ std::move(source), objectTransform, areaType });
     }
 
-    void RecastMeshBuilder::addObject(
-        const btCollisionShape& shape, const btTransform& transform, const AreaType areaType)
+    void RecastMeshBuilder::addObject(const JPH::Shape& shape, const osg::Matrixd& transform, const AreaType areaType)
     {
-        if (shape.isCompound())
-            return addObject(static_cast<const btCompoundShape&>(shape), transform, areaType);
-        else if (shape.getShapeType() == TERRAIN_SHAPE_PROXYTYPE)
-            return addObject(static_cast<const btHeightfieldTerrainShape&>(shape), transform, areaType);
-        else if (shape.isConcave())
-            return addObject(static_cast<const btConcaveShape&>(shape), transform, areaType);
-        else if (shape.getShapeType() == BOX_SHAPE_PROXYTYPE)
-            return addObject(static_cast<const btBoxShape&>(shape), transform, areaType);
-        std::ostringstream message;
-        message << "Unsupported shape type: " << BroadphaseNativeTypes(shape.getShapeType());
-        throw InvalidArgument(message.str());
-    }
+        auto shapeType = shape.GetType();
 
-    void RecastMeshBuilder::addObject(
-        const btCompoundShape& shape, const btTransform& transform, const AreaType areaType)
-    {
-        for (int i = 0, num = shape.getNumChildShapes(); i < num; ++i)
-            addObject(*shape.getChildShape(i), transform * shape.getChildTransform(i), areaType);
-    }
+        if (shapeType == JPH::EShapeType::Compound)
+            return addObject(static_cast<const JPH::CompoundShape&>(shape), transform, areaType);
 
-    void RecastMeshBuilder::addObject(
-        const btConcaveShape& shape, const btTransform& transform, const AreaType areaType)
-    {
-        return addObject(shape, transform, makeProcessTriangleCallback([&](btVector3* vertices, int, int) {
+        if (shapeType == JPH::EShapeType::HeightField)
+            return addObject(static_cast<const JPH::HeightFieldShape&>(shape), transform, areaType);
+
+        const JPH::ScaledShape* scaledShape = dynamic_cast<const JPH::ScaledShape*>(&shape);
+        if (scaledShape)
+            return addObject(*scaledShape->GetInnerShape(),
+                osg::Matrixd::scale(Misc::Convert::toOsg(scaledShape->GetScale())) * transform, areaType);
+
+        const JPH::RotatedTranslatedShape* rotatedTranslatedShape
+            = dynamic_cast<const JPH::RotatedTranslatedShape*>(&shape);
+        if (rotatedTranslatedShape)
+            return addObject(static_cast<const JPH::RotatedTranslatedShape&>(shape), transform, areaType);
+
+        TriangleProcessFunc callback = [&](JPH::Float3* vertices, int, int) {
             RecastMeshTriangle triangle = makeRecastMeshTriangle(vertices, areaType);
             std::reverse(triangle.mVertices.begin(), triangle.mVertices.end());
             mTriangles.emplace_back(triangle);
-        }));
+        };
+        return addObject(shape, transform, callback);
     }
 
     void RecastMeshBuilder::addObject(
-        const btHeightfieldTerrainShape& shape, const btTransform& transform, const AreaType areaType)
+        const JPH::RotatedTranslatedShape& shape, const osg::Matrixd& transform, const AreaType areaType)
     {
-        addObject(shape, transform, makeProcessTriangleCallback([&](btVector3* vertices, int, int) {
-            mTriangles.emplace_back(makeRecastMeshTriangle(vertices, areaType));
-        }));
+        auto subPos = shape.GetPosition();
+        auto subRot = shape.GetRotation();
+        osg::Matrixd childTransform
+            = osg::Matrixd(osg::Quat(subRot.GetX(), subRot.GetY(), subRot.GetZ(), subRot.GetW()));
+        childTransform.setTrans(osg::Vec3f(subPos.GetX(), subPos.GetY(), subPos.GetZ()));
+        addObject(*shape.GetInnerShape(), childTransform * transform, areaType);
     }
 
-    void RecastMeshBuilder::addObject(const btBoxShape& shape, const btTransform& transform, const AreaType areaType)
+    void RecastMeshBuilder::addObject(
+        const JPH::CompoundShape& shape, const osg::Matrixd& transform, const AreaType areaType)
     {
-        constexpr std::array<int, 36> indices{ {
-            0, 2, 3, // triangle 0
-            3, 1, 0, // triangle 1
-            0, 4, 6, // triangle 2
-            6, 2, 0, // triangle 3
-            0, 1, 5, // triangle 4
-            5, 4, 0, // triangle 5
-            7, 5, 1, // triangle 6
-            1, 3, 7, // triangle 7
-            7, 3, 2, // triangle 8
-            2, 6, 7, // triangle 9
-            7, 6, 4, // triangle 10
-            4, 5, 7, // triangle 11
-        } };
-
-        for (std::size_t i = 0; i < indices.size(); i += 3)
+        const JPH::uint num = shape.GetNumSubShapes();
+        for (JPH::uint i = 0; i < num; ++i)
         {
-            std::array<btVector3, 3> vertices;
-            for (std::size_t j = 0; j < 3; ++j)
-            {
-                btVector3 position;
-                shape.getVertex(indices[i + j], position);
-                vertices[j] = transform(position);
-            }
-            mTriangles.emplace_back(makeRecastMeshTriangle(vertices.data(), areaType));
+            auto childTransform = getSubShapeTransform(shape.GetSubShape(i));
+            addObject(*shape.GetSubShape(i).mShape.GetPtr(), childTransform * transform, areaType);
         }
+    }
+
+    void RecastMeshBuilder::addObject(
+        const JPH::HeightFieldShape& shape, const osg::Matrixd& transform, const AreaType areaType)
+    {
+        TriangleProcessFunc callback = [&](JPH::Float3* vertices, int, int) {
+            mTriangles.emplace_back(makeRecastMeshTriangle(vertices, areaType));
+        };
+        addObject(shape, transform, callback);
     }
 
     void RecastMeshBuilder::addWater(const osg::Vec2i& cellPosition, const Water& water)
@@ -233,13 +276,18 @@ namespace DetourNavigator
         const auto intersection = getIntersection(mBounds, maxCellTileBounds(cellPosition, cellSize));
         if (!intersection.has_value())
             return;
-        const osg::Vec3f shift = Misc::Convert::toOsg(
-            BulletHelpers::getHeightfieldShift(cellPosition.x(), cellPosition.y(), cellSize, minHeight, maxHeight));
+
+        const osg::Vec3f shift = PhysicsSystemHelpers::getHeightfieldShift(
+            cellPosition.x(), cellPosition.y(), cellSize, minHeight, maxHeight);
         const float stepSize = getHeightfieldScale(cellSize, size);
-        const int halfCellSize = cellSize / 2;
-        const auto local = [&](float v, float offset) { return (v - offset + halfCellSize) / stepSize; };
-        const auto index
-            = [&](float v, int add) { return std::clamp<int>(static_cast<int>(v) + add, 0, static_cast<int>(size)); };
+        const float halfCellSize = static_cast<float>(cellSize) * 0.5f;
+        const auto local = [&](float v, float axisShift) { return (v - axisShift + halfCellSize) / stepSize; };
+        const auto index = [&](float v, int add) -> std::size_t {
+            const int value = static_cast<int>(v) + add;
+            if (value <= 0)
+                return 0;
+            return std::min(static_cast<std::size_t>(value), size);
+        };
         const std::size_t minX = index(std::round(local(intersection->mMin.x(), shift.x())), -1);
         const std::size_t minY = index(std::round(local(intersection->mMin.y(), shift.y())), -1);
         const std::size_t maxX = index(std::round(local(intersection->mMax.x(), shift.x())), 1);
@@ -280,60 +328,76 @@ namespace DetourNavigator
     }
 
     void RecastMeshBuilder::addObject(
-        const btConcaveShape& shape, const btTransform& transform, btTriangleCallback&& callback)
+        const JPH::Shape& shape, const osg::Matrixd& transform, TriangleProcessFunc& processTriangle)
     {
-        btVector3 aabbMin;
-        btVector3 aabbMax;
+        const JPH::AABox bounds = shape.GetLocalBounds();
+        const JPH::Vec3 boundsMin(mBounds.mMin.x(), mBounds.mMin.y(),
+            -std::numeric_limits<float>::max() * std::numeric_limits<float>::epsilon());
+        const JPH::Vec3 boundsMax(mBounds.mMax.x(), mBounds.mMax.y(),
+            std::numeric_limits<float>::max() * std::numeric_limits<float>::epsilon());
 
-        shape.getAabb(btTransform::getIdentity(), aabbMin, aabbMax);
+        // Convert to a world space triangle set
+        auto walkerFunc = [&](JPH::Float3* batchVertices, int triangleCount, int firstTriangleIndex) {
+            for (int i = 0; i < triangleCount; ++i)
+            {
+                const int triangleIndex = firstTriangleIndex + i;
+                const JPH::Float3* vertices = batchVertices + i * 3;
+                std::array<JPH::Float3, 3> transformed;
+                transformed[0] = joltTransformMult(vertices[0], transform);
+                transformed[1] = joltTransformMult(vertices[1], transform);
+                transformed[2] = joltTransformMult(vertices[2], transform);
+                // transformed[0] = vertices[0];
+                // transformed[1] = vertices[1];
+                // transformed[2] = vertices[2];
 
-        const btVector3 boundsMin(mBounds.mMin.x(), mBounds.mMin.y(),
-            -std::numeric_limits<btScalar>::max() * std::numeric_limits<btScalar>::epsilon());
-        const btVector3 boundsMax(mBounds.mMax.x(), mBounds.mMax.y(),
-            std::numeric_limits<btScalar>::max() * std::numeric_limits<btScalar>::epsilon());
-
-        auto wrapper = makeProcessTriangleCallback([&](btVector3* triangle, int partId, int triangleIndex) {
-            std::array<btVector3, 3> transformed;
-            for (std::size_t i = 0; i < 3; ++i)
-                transformed[i] = transform(triangle[i]);
-            if (TestTriangleAgainstAabb2(transformed.data(), boundsMin, boundsMax))
-                callback.processTriangle(transformed.data(), partId, triangleIndex);
-        });
-
-        shape.processAllTriangles(&wrapper, aabbMin, aabbMax);
+                // Keep world-space tile culling here: Jolt triangle walking uses shape-local query bounds.
+                if (TestTriangleAgainstAabb2(transformed.data(), boundsMin, boundsMax))
+                    processTriangle(transformed.data(), 0, triangleIndex);
+            }
+        };
+        walkShapeTriangles(shape, bounds, walkerFunc);
+        // walkShapeTriangles(shape, bounds, walkerFunc, Misc::Convert::toJolt<JPH::Vec3>(transform.getTrans()),
+        //   Misc::Convert::toJolt(transform.getRotate()), Misc::Convert::toJolt<JPH::Vec3>(transform.getScale()));
     }
 
     void RecastMeshBuilder::addObject(
-        const btHeightfieldTerrainShape& shape, const btTransform& transform, btTriangleCallback&& callback)
+        const JPH::HeightFieldShape& shape, const osg::Matrixd& transform, TriangleProcessFunc& processTriangle)
     {
-        using BulletHelpers::transformBoundingBox;
+        using PhysicsSystemHelpers::transformBoundingBox;
 
-        btVector3 aabbMin;
-        btVector3 aabbMax;
+        JPH::AABox bounds = shape.GetLocalBounds();
 
-        shape.getAabb(btTransform::getIdentity(), aabbMin, aabbMax);
+        auto joltTransform = Misc::Convert::toJoltNoScale(transform);
 
-        transformBoundingBox(transform, aabbMin, aabbMax);
+        transformBoundingBox(joltTransform, bounds.mMin, bounds.mMax);
 
-        aabbMin.setX(std::max(static_cast<btScalar>(mBounds.mMin.x()), aabbMin.x()));
-        aabbMin.setX(std::min(static_cast<btScalar>(mBounds.mMax.x()), aabbMin.x()));
-        aabbMin.setY(std::max(static_cast<btScalar>(mBounds.mMin.y()), aabbMin.y()));
-        aabbMin.setY(std::min(static_cast<btScalar>(mBounds.mMax.y()), aabbMin.y()));
+        bounds.mMin.SetX(std::max(static_cast<float>(mBounds.mMin.x()), bounds.mMin.GetX()));
+        bounds.mMin.SetX(std::min(static_cast<float>(mBounds.mMax.x()), bounds.mMin.GetX()));
+        bounds.mMin.SetY(std::max(static_cast<float>(mBounds.mMin.y()), bounds.mMin.GetY()));
+        bounds.mMin.SetY(std::min(static_cast<float>(mBounds.mMax.y()), bounds.mMin.GetY()));
 
-        aabbMax.setX(std::max(static_cast<btScalar>(mBounds.mMin.x()), aabbMax.x()));
-        aabbMax.setX(std::min(static_cast<btScalar>(mBounds.mMax.x()), aabbMax.x()));
-        aabbMax.setY(std::max(static_cast<btScalar>(mBounds.mMin.y()), aabbMax.y()));
-        aabbMax.setY(std::min(static_cast<btScalar>(mBounds.mMax.y()), aabbMax.y()));
+        bounds.mMax.SetX(std::max(static_cast<float>(mBounds.mMin.x()), bounds.mMax.GetX()));
+        bounds.mMax.SetX(std::min(static_cast<float>(mBounds.mMax.x()), bounds.mMax.GetX()));
+        bounds.mMax.SetY(std::max(static_cast<float>(mBounds.mMin.y()), bounds.mMax.GetY()));
+        bounds.mMax.SetY(std::min(static_cast<float>(mBounds.mMax.y()), bounds.mMax.GetY()));
 
-        transformBoundingBox(transform.inverse(), aabbMin, aabbMax);
+        JPH::RMat44 inverseMatrix = joltTransform.Inversed();
+        transformBoundingBox(inverseMatrix, bounds.mMin, bounds.mMax);
 
-        auto wrapper = makeProcessTriangleCallback([&](btVector3* triangle, int partId, int triangleIndex) {
-            std::array<btVector3, 3> transformed;
-            for (std::size_t i = 0; i < 3; ++i)
-                transformed[i] = transform(triangle[i]);
-            callback.processTriangle(transformed.data(), partId, triangleIndex);
-        });
-
-        shape.processAllTriangles(&wrapper, aabbMin, aabbMax);
+        auto walkerFunc = [&](JPH::Float3* batchVertices, int triangleCount, int firstTriangleIndex) {
+            for (int i = 0; i < triangleCount; ++i)
+            {
+                const JPH::Float3* vertices = batchVertices + i * 3;
+                const int partId = 0;
+                const int triangleIndex = firstTriangleIndex + i;
+                // Convert to a world space triangle set
+                std::array<JPH::Float3, 3> transformed;
+                transformed[0] = joltTransformMult(vertices[0], transform);
+                transformed[1] = joltTransformMult(vertices[1], transform);
+                transformed[2] = joltTransformMult(vertices[2], transform);
+                processTriangle(transformed.data(), partId, triangleIndex);
+            }
+        };
+        walkShapeTriangles(shape, bounds, walkerFunc);
     }
 }

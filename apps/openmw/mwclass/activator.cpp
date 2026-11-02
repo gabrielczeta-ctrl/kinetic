@@ -9,6 +9,7 @@
 #include <components/esm3/loadsoun.hpp>
 #include <components/misc/rng.hpp>
 #include <components/sceneutil/positionattitudetransform.hpp>
+#include <components/vfs/pathutil.hpp>
 
 #include "../mwbase/environment.hpp"
 #include "../mwbase/windowmanager.hpp"
@@ -59,7 +60,7 @@ namespace MWClass
     void Activator::insertObjectPhysics(const MWWorld::Ptr& ptr, const std::string& model, const osg::Quat& rotation,
         MWPhysics::PhysicsSystem& physics) const
     {
-        physics.addObject(ptr, VFS::Path::toNormalized(model), rotation, MWPhysics::CollisionType_World);
+        physics.addObject(ptr, VFS::Path::toNormalized(model), rotation, MWPhysics::Layers::WORLD);
     }
 
     VFS::Path::NormalizedView Activator::getModel(const MWWorld::ConstPtr& ptr) const

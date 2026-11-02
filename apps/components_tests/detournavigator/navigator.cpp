@@ -1,21 +1,25 @@
 #include "operators.hpp"
 #include "settings.hpp"
 
-#include <components/bullethelpers/heightfield.hpp>
 #include <components/detournavigator/navigatorimpl.hpp>
 #include <components/detournavigator/navigatorutils.hpp>
 #include <components/detournavigator/navmeshdb.hpp>
 #include <components/esm3/loadland.hpp>
 #include <components/loadinglistener/loadinglistener.hpp>
 #include <components/misc/rng.hpp>
-#include <components/resource/bulletshape.hpp>
+#include <components/physicshelpers/heightfield.hpp>
+#include <components/resource/physicsshape.hpp>
+
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/MutableCompoundShape.h>
+#include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
+#include <Jolt/Physics/Collision/Shape/ScaledShape.h>
+#include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 
 #include <osg/io_utils>
 #include <osg/ref_ptr>
-
-#include <BulletCollision/CollisionShapes/btBoxShape.h>
-#include <BulletCollision/CollisionShapes/btCompoundShape.h>
-#include <BulletCollision/CollisionShapes/btHeightfieldTerrainShape.h>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -30,7 +34,10 @@
 
 MATCHER_P3(Vec3fEq, x, y, z, "")
 {
-    return std::abs(arg.x() - x) < 1e-3 && std::abs(arg.y() - y) < 1e-3 && std::abs(arg.z() - z) < 1e-3;
+    const float xf = static_cast<float>(x);
+    const float yf = static_cast<float>(y);
+    const float zf = static_cast<float>(z);
+    return std::abs(arg.x() - xf) < 1e-3f && std::abs(arg.y() - yf) < 1e-3f && std::abs(arg.z() - zf) < 1e-3f;
 }
 
 MATCHER_P4(Vec3fEq, x, y, z, precision, "")
@@ -62,19 +69,11 @@ namespace
         Loading::Listener mListener;
         const osg::Vec2i mCellPosition{ 0, 0 };
         const float mEndTolerance = 0;
-        const btTransform mTransform{ btMatrix3x3::getIdentity(), btVector3(256, 256, 0) };
+        const osg::Matrixd mTransform = osg::Matrixd::translate(osg::Vec3f(256, 256, 0));
         const ObjectTransform mObjectTransform{ ESM::Position{ { 256, 256, 0 }, { 0, 0, 0 } }, 0.0f };
     };
 
     constexpr std::array<float, 5 * 5> defaultHeightfieldData{ {
-        0, 0, 0, 0, 0, // row 0
-        0, -25, -25, -25, -25, // row 1
-        0, -25, -100, -100, -100, // row 2
-        0, -25, -100, -100, -100, // row 3
-        0, -25, -100, -100, -100, // row 4
-    } };
-
-    constexpr std::array<btScalar, 5 * 5> defaultHeightfieldDataScalar{ {
         0, 0, 0, 0, 0, // row 0
         0, -25, -25, -25, -25, // row 1
         0, -25, -100, -100, -100, // row 2
@@ -92,14 +91,30 @@ namespace
     }
 
     template <std::size_t size>
-    std::unique_ptr<btHeightfieldTerrainShape> makeSquareHeightfieldTerrainShape(
-        const std::array<btScalar, size>& values, btScalar heightScale = 1, int upAxis = 2,
-        PHY_ScalarType heightDataType = PHY_FLOAT, bool flipQuadEdges = false)
+    std::unique_ptr<JPH::RotatedTranslatedShape> makeSquareHeightfieldTerrainShape(
+        const std::array<float, size>& values)
     {
         const int width = static_cast<int>(std::sqrt(size));
-        const auto [minHeight, maxHeight] = getMinMaxHeight(values);
-        return std::make_unique<btHeightfieldTerrainShape>(
-            width, width, values.data(), heightScale, minHeight, maxHeight, upAxis, heightDataType, flipQuadEdges);
+        const float min = *std::min_element(values.begin(), values.end());
+        const float max = *std::max_element(values.begin(), values.end());
+        const float greater = std::max(std::abs(min), std::abs(max));
+
+        JPH::Vec3 terrainOffset(0.0f, 0, 0.0f);
+        JPH::Vec3 terrainScale(128.0f, 1.0f, -128.0f); // NOTE: jolt heightfield is Y up, its rotated below
+
+        JPH::HeightFieldShapeSettings settings(
+            values.data(), terrainOffset, terrainScale, static_cast<JPH::uint32>(width));
+        settings.mMinHeightValue = -greater;
+        settings.mMaxHeightValue = greater;
+        settings.mBlockSize = 2;
+
+        // Create a quaternion representing a rotation of 90 degrees around the X-axis
+        JPH::Quat rotation = JPH::Quat::sRotation(JPH::Vec3::sAxisX(), JPH::DegreesToRadians(90.0f));
+
+        // Must flip on Z axis (scale) then rotate
+        JPH::Ref<JPH::Shape> createdRes = settings.Create().Get();
+        createdRes->SetEmbedded();
+        return std::make_unique<JPH::RotatedTranslatedShape>(JPH::Vec3(-256.0f, -256.0f, 0.0f), rotation, createdRes);
     }
 
     template <std::size_t size>
@@ -115,11 +130,11 @@ namespace
     }
 
     template <class T>
-    osg::ref_ptr<const Resource::BulletShapeInstance> makeBulletShapeInstance(std::unique_ptr<T>&& shape)
+    osg::ref_ptr<const Resource::PhysicsShapeInstance> makePhysicsShapeInstance(std::unique_ptr<T>&& shape)
     {
-        osg::ref_ptr<Resource::BulletShape> bulletShape(new Resource::BulletShape);
-        bulletShape->mCollisionShape.reset(std::move(shape).release());
-        return new Resource::BulletShapeInstance(bulletShape);
+        osg::ref_ptr<Resource::PhysicsShape> physicsShape(new Resource::PhysicsShape);
+        physicsShape->mCollisionShape = std::move(shape).release();
+        return new Resource::PhysicsShapeInstance(physicsShape);
     }
 
     template <class T>
@@ -127,20 +142,22 @@ namespace
     {
     public:
         CollisionShapeInstance(std::unique_ptr<T>&& shape)
-            : mInstance(makeBulletShapeInstance(std::move(shape)))
+            : mInstance(makePhysicsShapeInstance(std::move(shape)))
         {
         }
 
         T& shape() const { return static_cast<T&>(*mInstance->mCollisionShape); }
-        const osg::ref_ptr<const Resource::BulletShapeInstance>& instance() const { return mInstance; }
+        const osg::ref_ptr<const Resource::PhysicsShapeInstance>& instance() const { return mInstance; }
 
     private:
-        osg::ref_ptr<const Resource::BulletShapeInstance> mInstance;
+        osg::ref_ptr<const Resource::PhysicsShapeInstance> mInstance;
     };
 
-    btVector3 getHeightfieldShift(const osg::Vec2i& cellPosition, int cellSize, float minHeight, float maxHeight)
+    inline osg::Vec3f getHeightfieldShift(
+        const osg::Vec2i& cellPosition, int cellSize, float minHeight, float maxHeight)
     {
-        return BulletHelpers::getHeightfieldShift(cellPosition.x(), cellPosition.x(), cellSize, minHeight, maxHeight);
+        return PhysicsSystemHelpers::getHeightfieldShift(
+            cellPosition.x(), cellPosition.x(), cellSize, minHeight, maxHeight);
     }
 
     TEST_F(DetourNavigatorNavigatorTest, find_path_for_empty_should_return_empty)
@@ -215,9 +232,12 @@ namespace
         const HeightfieldSurface surface = makeSquareHeightfieldSurface(defaultHeightfieldData);
         const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
 
-        CollisionShapeInstance compound(std::make_unique<btCompoundShape>());
-        compound.shape().addChildShape(
-            btTransform(btMatrix3x3::getIdentity(), btVector3(0, 0, 0)), new btBoxShape(btVector3(20, 20, 100)));
+        std::unique_ptr<JPH::Shape> ptr;
+        JPH::StaticCompoundShapeSettings settings;
+        settings.AddShape(JPH::Vec3(0, 0, 0), JPH::Quat::sIdentity(), new JPH::BoxShape(JPH::Vec3(20, 20, 100)));
+        ptr.reset(settings.Create().Get().GetPtr());
+
+        CollisionShapeInstance compound(std::move(ptr));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addHeightfield(mCellPosition, cellSize, surface, nullptr);
@@ -260,9 +280,13 @@ namespace
         const HeightfieldSurface surface = makeSquareHeightfieldSurface(defaultHeightfieldData);
         const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
 
-        CollisionShapeInstance compound(std::make_unique<btCompoundShape>());
-        compound.shape().addChildShape(
-            btTransform(btMatrix3x3::getIdentity(), btVector3(0, 0, 0)), new btBoxShape(btVector3(20, 20, 100)));
+        std::unique_ptr<JPH::Shape> ptr;
+        JPH::MutableCompoundShapeSettings settings;
+        settings.AddShape(JPH::Vec3(0, 0, 0), JPH::Quat::sIdentity(), new JPH::BoxShape(JPH::Vec3(20, 20, 100)));
+        auto shapeRef = settings.Create().Get();
+        ptr.reset(shapeRef.GetPtr());
+
+        CollisionShapeInstance compound(std::move(ptr));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addHeightfield(mCellPosition, cellSize, surface, nullptr);
@@ -282,7 +306,8 @@ namespace
                 Vec3fEq(460, 56.66664886474609375, 1.99999392032623291015625)))
             << mPath;
 
-        compound.shape().updateChildTransform(0, btTransform(btMatrix3x3::getIdentity(), btVector3(1000, 0, 0)));
+        static_cast<JPH::MutableCompoundShape*>(shapeRef.GetPtr())
+            ->ModifyShape(0, JPH::Vec3(1000, 0, 0), JPH::Quat::sIdentity());
 
         mNavigator->updateObject(
             ObjectId(&compound.shape()), ObjectShapes(compound.instance(), mObjectTransform), mTransform, nullptr);
@@ -303,10 +328,10 @@ namespace
 
     TEST_F(DetourNavigatorNavigatorTest, for_overlapping_heightfields_objects_should_use_higher)
     {
-        CollisionShapeInstance heightfield1(makeSquareHeightfieldTerrainShape(defaultHeightfieldDataScalar));
-        heightfield1.shape().setLocalScaling(btVector3(128, 128, 1));
+        CollisionShapeInstance heightfield1(makeSquareHeightfieldTerrainShape(defaultHeightfieldData));
+        heightfield1.shape().SetEmbedded();
 
-        const std::array<btScalar, 5 * 5> heightfieldData2{ {
+        const std::array<float, 5 * 5> heightfieldData2{ {
             -25, -25, -25, -25, -25, // row 0
             -25, -25, -25, -25, -25, // row 1
             -25, -25, -25, -25, -25, // row 2
@@ -314,10 +339,10 @@ namespace
             -25, -25, -25, -25, -25, // row 4
         } };
         CollisionShapeInstance heightfield2(makeSquareHeightfieldTerrainShape(heightfieldData2));
-        heightfield2.shape().setLocalScaling(btVector3(128, 128, 1));
+        heightfield2.shape().SetEmbedded();
 
         const ObjectTransform objectTransform{ ESM::Position{ { 256, 256, -50 }, { 0, 0, 0 } }, 0.0f };
-        const btTransform transform{ btMatrix3x3::getIdentity(), btVector3(256, 256, -50) };
+        const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(256, 256, -50));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addObject(ObjectId(&heightfield1.shape()), ObjectShapes(heightfield1.instance(), objectTransform),
@@ -332,8 +357,8 @@ namespace
 
         EXPECT_THAT(mPath,
             ElementsAre( //
-                Vec3fEq(56.66664886474609375, 460, 1.99999392032623291015625),
-                Vec3fEq(460, 56.66664886474609375, 1.99999392032623291015625)))
+                Vec3fEq(56.66664886474609375, 460, -47.999988555908203125),
+                Vec3fEq(460, 56.66664886474609375, -47.999988555908203125)))
             << mPath;
     }
 
@@ -368,30 +393,28 @@ namespace
 
     TEST_F(DetourNavigatorNavigatorTest, path_should_be_around_avoid_shape)
     {
-        osg::ref_ptr<Resource::BulletShape> bulletShape(new Resource::BulletShape);
+        osg::ref_ptr<Resource::PhysicsShape> physicsShape(new Resource::PhysicsShape);
 
-        std::unique_ptr<btHeightfieldTerrainShape> shapePtr
-            = makeSquareHeightfieldTerrainShape(defaultHeightfieldDataScalar);
-        shapePtr->setLocalScaling(btVector3(128, 128, 1));
-        bulletShape->mCollisionShape.reset(shapePtr.release());
+        std::unique_ptr<JPH::RotatedTranslatedShape> shapePtr
+            = makeSquareHeightfieldTerrainShape(defaultHeightfieldData);
+        physicsShape->mCollisionShape = shapePtr.release();
 
-        std::array<btScalar, 5 * 5> heightfieldDataAvoid{ {
+        std::array<float, 5 * 5> heightfieldDataAvoid{ {
             -25, -25, -25, -25, -25, // row 0
             -25, -25, -25, -25, -25, // row 1
             -25, -25, -25, -25, -25, // row 2
             -25, -25, -25, -25, -25, // row 3
             -25, -25, -25, -25, -25, // row 4
         } };
-        std::unique_ptr<btHeightfieldTerrainShape> shapeAvoidPtr
+        std::unique_ptr<JPH::RotatedTranslatedShape> shapeAvoidPtr
             = makeSquareHeightfieldTerrainShape(heightfieldDataAvoid);
-        shapeAvoidPtr->setLocalScaling(btVector3(128, 128, 1));
-        bulletShape->mAvoidCollisionShape.reset(shapeAvoidPtr.release());
+        physicsShape->mAvoidCollisionShape = shapeAvoidPtr.release();
 
-        osg::ref_ptr<const Resource::BulletShapeInstance> instance(new Resource::BulletShapeInstance(bulletShape));
+        osg::ref_ptr<const Resource::PhysicsShapeInstance> instance(new Resource::PhysicsShapeInstance(physicsShape));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
-        mNavigator->addObject(
-            ObjectId(instance->mCollisionShape.get()), ObjectShapes(instance, mObjectTransform), mTransform, nullptr);
+        mNavigator->addObject(ObjectId(instance->mCollisionShape.GetPtr()), ObjectShapes(instance, mObjectTransform),
+            mTransform, nullptr);
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
@@ -400,10 +423,10 @@ namespace
 
         EXPECT_THAT(mPath,
             ElementsAre( //
-                Vec3fEq(56.66664886474609375, 460, 51.999996185302734375),
-                Vec3fEq(192.666656494140625, 249.3332977294921875, 6.666663646697998046875),
-                Vec3fEq(249.3332977294921875, 192.666656494140625, 6.666663646697998046875),
-                Vec3fEq(460, 56.66664886474609375, 51.999996185302734375)))
+                Vec3fEq(56.66664886474609375, 460, 1.99999392032623291015625),
+                Vec3fEq(158.6666412353515625, 192.666656494140625, -20.6666717529296875),
+                Vec3fEq(192.666656494140625, 158.6666412353515625, -20.6666717529296875),
+                Vec3fEq(460, 56.66664886474609375, 1.99999392032623291015625)))
             << mPath;
     }
 
@@ -540,11 +563,10 @@ namespace
 
     TEST_F(DetourNavigatorNavigatorTest, update_object_remove_and_update_then_find_path_should_return_path)
     {
-        CollisionShapeInstance heightfield(makeSquareHeightfieldTerrainShape(defaultHeightfieldDataScalar));
-        heightfield.shape().setLocalScaling(btVector3(128, 128, 1));
+        CollisionShapeInstance heightfield(makeSquareHeightfieldTerrainShape(defaultHeightfieldData));
 
         const ObjectTransform objectTransform{ ESM::Position{ { 256, 256, -50 }, { 0, 0, 0 } }, 0.0f };
-        const btTransform transform{ btMatrix3x3::getIdentity(), btVector3(256, 256, -50) };
+        const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(256, 256, -50));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addObject(
@@ -566,8 +588,8 @@ namespace
 
         EXPECT_THAT(mPath,
             ElementsAre( //
-                Vec3fEq(56.66664886474609375, 460, 1.99999392032623291015625),
-                Vec3fEq(460, 56.66664886474609375, 1.99999392032623291015625)))
+                Vec3fEq(56.66664886474609375, 460, -47.999988555908203125),
+                Vec3fEq(460, 56.66664886474609375, -47.999988555908203125)))
             << mPath;
     }
 
@@ -639,11 +661,11 @@ namespace
 
         const HeightfieldSurface surface = makeSquareHeightfieldSurface(defaultHeightfieldData);
         const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
-        const btVector3 shift = getHeightfieldShift(mCellPosition, cellSize, surface.mMinHeight, surface.mMaxHeight);
+        const osg::Vec3f shift = getHeightfieldShift(mCellPosition, cellSize, surface.mMinHeight, surface.mMaxHeight);
 
-        std::vector<CollisionShapeInstance<btBoxShape>> boxes;
+        std::vector<CollisionShapeInstance<JPH::BoxShape>> boxes;
         std::generate_n(
-            std::back_inserter(boxes), 100, [] { return std::make_unique<btBoxShape>(btVector3(20, 20, 100)); });
+            std::back_inserter(boxes), 100, [] { return std::make_unique<JPH::BoxShape>(JPH::Vec3(20, 20, 100)); });
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
 
@@ -651,9 +673,10 @@ namespace
 
         for (std::size_t i = 0; i < boxes.size(); ++i)
         {
-            const btScalar diameter = static_cast<btScalar>(i) * 10;
-            const btTransform transform(
-                btMatrix3x3::getIdentity(), btVector3(shift.x() + diameter, shift.y() + diameter, diameter));
+            boxes[i].shape().SetEmbedded();
+            const double offset = static_cast<double>(i) * 10.0;
+            const osg::Matrixd transform
+                = osg::Matrixd::translate(osg::Vec3d(shift.x() + offset, shift.y() + offset, offset));
             mNavigator->addObject(
                 ObjectId(&boxes[i].shape()), ObjectShapes(boxes[i].instance(), mObjectTransform), transform, nullptr);
         }
@@ -662,9 +685,9 @@ namespace
 
         for (std::size_t i = 0; i < boxes.size(); ++i)
         {
-            const btScalar diameter = static_cast<btScalar>(i) * 10 + 1;
-            const btTransform transform(
-                btMatrix3x3::getIdentity(), btVector3(shift.x() + diameter, shift.y() + diameter, diameter));
+            const double offset = static_cast<double>(i) * 10.0 + 1.0;
+            const osg::Matrixd transform
+                = osg::Matrixd::translate(osg::Vec3d(shift.x() + offset, shift.y() + offset, offset));
             mNavigator->updateObject(
                 ObjectId(&boxes[i].shape()), ObjectShapes(boxes[i].instance(), mObjectTransform), transform, nullptr);
         }
@@ -686,16 +709,17 @@ namespace
 
     TEST_F(DetourNavigatorNavigatorTest, update_changed_multiple_times_object_should_delay_navmesh_change)
     {
-        std::vector<CollisionShapeInstance<btBoxShape>> shapes;
+        std::vector<CollisionShapeInstance<JPH::BoxShape>> shapes;
         std::generate_n(
-            std::back_inserter(shapes), 100, [] { return std::make_unique<btBoxShape>(btVector3(64, 64, 64)); });
+            std::back_inserter(shapes), 100, [] { return std::make_unique<JPH::BoxShape>(JPH::Vec3(64, 64, 64)); });
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
 
         for (std::size_t i = 0; i < shapes.size(); ++i)
         {
-            const btScalar diameter = static_cast<btScalar>(i) * 32;
-            const btTransform transform(btMatrix3x3::getIdentity(), btVector3(diameter, diameter, diameter));
+            shapes[i].shape().SetEmbedded();
+            const float offset = static_cast<float>(i) * 32.0f;
+            const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(offset, offset, offset));
             mNavigator->addObject(
                 ObjectId(&shapes[i].shape()), ObjectShapes(shapes[i].instance(), mObjectTransform), transform, nullptr);
         }
@@ -705,8 +729,8 @@ namespace
         const auto start = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < shapes.size(); ++i)
         {
-            const btScalar diameter = static_cast<btScalar>(i) * 32 + 1;
-            const btTransform transform(btMatrix3x3::getIdentity(), btVector3(diameter, diameter, diameter));
+            const float offset = static_cast<float>(i) * 32.0f + 1.0f;
+            const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(offset, offset, offset));
             mNavigator->updateObject(
                 ObjectId(&shapes[i].shape()), ObjectShapes(shapes[i].instance(), mObjectTransform), transform, nullptr);
         }
@@ -715,8 +739,8 @@ namespace
 
         for (std::size_t i = 0; i < shapes.size(); ++i)
         {
-            const btScalar diameter = static_cast<btScalar>(i) * 32 + 2;
-            const btTransform transform(btMatrix3x3::getIdentity(), btVector3(diameter, diameter, diameter));
+            const float offset = static_cast<float>(i) * 32.0f + 2.0f;
+            const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(offset, offset, offset));
             mNavigator->updateObject(
                 ObjectId(&shapes[i].shape()), ObjectShapes(shapes[i].instance(), mObjectTransform), transform, nullptr);
         }
@@ -753,18 +777,18 @@ namespace
         const HeightfieldSurface surface = makeSquareHeightfieldSurface(defaultHeightfieldData);
         const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
 
-        CollisionShapeInstance oscillatingBox(std::make_unique<btBoxShape>(btVector3(20, 20, 20)));
-        const btVector3 oscillatingBoxShapePosition(288, 288, 400);
-        CollisionShapeInstance borderBox(std::make_unique<btBoxShape>(btVector3(50, 50, 50)));
+        CollisionShapeInstance oscillatingBox(std::make_unique<JPH::BoxShape>(JPH::Vec3(20, 20, 20)));
+        const osg::Vec3f oscillatingBoxShapePosition(288, 288, 400);
+        CollisionShapeInstance borderBox(std::make_unique<JPH::BoxShape>(JPH::Vec3(50, 50, 50)));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addHeightfield(mCellPosition, cellSize, surface, nullptr);
         mNavigator->addObject(ObjectId(&oscillatingBox.shape()),
             ObjectShapes(oscillatingBox.instance(), mObjectTransform),
-            btTransform(btMatrix3x3::getIdentity(), oscillatingBoxShapePosition), nullptr);
+            osg::Matrixd::translate(oscillatingBoxShapePosition), nullptr);
         // add this box to make navmesh bound box independent from oscillatingBoxShape rotations
         mNavigator->addObject(ObjectId(&borderBox.shape()), ObjectShapes(borderBox.instance(), mObjectTransform),
-            btTransform(btMatrix3x3::getIdentity(), oscillatingBoxShapePosition + btVector3(0, 0, 200)), nullptr);
+            osg::Matrixd::translate(oscillatingBoxShapePosition + osg::Vec3f(0, 0, 200)), nullptr);
         mNavigator->update(mPlayerPosition, nullptr);
         mNavigator->wait(WaitConditionType::allJobsDone, &mListener);
 
@@ -776,8 +800,9 @@ namespace
 
         for (int n = 0; n < 10; ++n)
         {
-            const btTransform transform(
-                btQuaternion(btVector3(0, 0, 1), n * 2 * osg::PI / 10), oscillatingBoxShapePosition);
+            osg::Matrixd transform = osg::Matrixd::rotate(osg::Quat(n * 2 * osg::PI / 10, osg::Vec3f(0, 0, 1)));
+            transform.setTrans(oscillatingBoxShapePosition);
+
             mNavigator->updateObject(ObjectId(&oscillatingBox.shape()),
                 ObjectShapes(oscillatingBox.instance(), mObjectTransform), transform, nullptr);
             mNavigator->update(mPlayerPosition, nullptr);
@@ -812,9 +837,13 @@ namespace
         const HeightfieldSurface surface = makeSquareHeightfieldSurface(defaultHeightfieldData);
         const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
 
-        CollisionShapeInstance compound(std::make_unique<btCompoundShape>());
-        compound.shape().addChildShape(btTransform(btMatrix3x3::getIdentity(), btVector3(204, -204, 0)),
-            new btBoxShape(btVector3(200, 200, 1000)));
+        std::unique_ptr<JPH::Shape> ptr;
+        JPH::StaticCompoundShapeSettings settings;
+        settings.AddShape(
+            JPH::Vec3(204, -204, 0), JPH::Quat::sIdentity(), new JPH::BoxShape(JPH::Vec3(200, 200, 1000)));
+        ptr.reset(settings.Create().Get().GetPtr());
+
+        CollisionShapeInstance compound(std::move(ptr));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addHeightfield(mCellPosition, cellSize, surface, nullptr);
@@ -838,9 +867,13 @@ namespace
         const HeightfieldSurface surface = makeSquareHeightfieldSurface(defaultHeightfieldData);
         const int cellSize = heightfieldTileSize * static_cast<int>(surface.mSize - 1);
 
-        CollisionShapeInstance compound(std::make_unique<btCompoundShape>());
-        compound.shape().addChildShape(btTransform(btMatrix3x3::getIdentity(), btVector3(204, -204, 0)),
-            new btBoxShape(btVector3(100, 100, 1000)));
+        std::unique_ptr<JPH::Shape> ptr;
+        JPH::StaticCompoundShapeSettings settings;
+        settings.AddShape(
+            JPH::Vec3(204, -204, 0), JPH::Quat::sIdentity(), new JPH::BoxShape(JPH::Vec3(100, 100, 1000)));
+        ptr.reset(settings.Create().Get().GetPtr());
+
+        CollisionShapeInstance compound(std::move(ptr));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addHeightfield(mCellPosition, cellSize, surface, nullptr);
@@ -896,7 +929,8 @@ namespace
     TEST_F(DetourNavigatorNavigatorTest, update_for_very_big_object_should_be_limited)
     {
         const float size = static_cast<float>((1 << 22) - 1);
-        CollisionShapeInstance bigBox(std::make_unique<btBoxShape>(btVector3(size, size, 1)));
+        CollisionShapeInstance bigBox(std::make_unique<JPH::BoxShape>(JPH::Vec3(size, size, 1)));
+        bigBox.shape().SetEmbedded();
         const ObjectTransform objectTransform{
             .mPosition = ESM::Position{ .pos = { 0, 0, 0 }, .rot{ 0, 0, 0 } },
             .mScale = 1.0f,
@@ -907,7 +941,7 @@ namespace
         mNavigator->updateBounds(mWorldspace, cellGridBounds, playerPosition, nullptr);
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addObject(ObjectId(&bigBox.shape()), ObjectShapes(bigBox.instance(), objectTransform),
-            btTransform::getIdentity(), nullptr);
+            osg::Matrixd::identity(), nullptr);
 
         bool updated = false;
         std::condition_variable updateFinished;
@@ -946,7 +980,7 @@ namespace
     TEST_F(DetourNavigatorNavigatorTest, update_should_be_limited_by_cell_grid_bounds)
     {
         const float size = static_cast<float>((1 << 22) - 1);
-        CollisionShapeInstance bigBox(std::make_unique<btBoxShape>(btVector3(size, size, 1)));
+        CollisionShapeInstance bigBox(std::make_unique<JPH::BoxShape>(JPH::Vec3(size, size, 1)));
         const ObjectTransform objectTransform{
             .mPosition = ESM::Position{ .pos = { 0, 0, 0 }, .rot{ 0, 0, 0 } },
             .mScale = 1.0f,
@@ -960,7 +994,7 @@ namespace
         mNavigator->updateBounds(mWorldspace, cellGridBounds, playerPosition, nullptr);
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addObject(ObjectId(&bigBox.shape()), ObjectShapes(bigBox.instance(), objectTransform),
-            btTransform::getIdentity(), nullptr);
+            osg::Matrixd::identity(), nullptr);
 
         bool updated = false;
         std::condition_variable updateFinished;
@@ -1224,11 +1258,11 @@ namespace
 
     TEST_F(DetourNavigatorNavigatorTest, should_not_post_jobs_for_tiles_outside_processing_range)
     {
-        CollisionShapeInstance compound(std::make_unique<btCompoundShape>());
-        compound.shape().addChildShape(
-            btTransform(btMatrix3x3::getIdentity(), btVector3(0, 0, 0)), new btBoxShape(btVector3(20, 20, 100)));
+        JPH::StaticCompoundShapeSettings settings;
+        settings.AddShape(JPH::Vec3::sZero(), JPH::Quat::sIdentity(), new JPH::BoxShape(JPH::Vec3(20, 20, 100)));
+        CollisionShapeInstance compound(std::unique_ptr<JPH::Shape>(settings.Create().Get().GetPtr()));
 
-        const btTransform transform{ btMatrix3x3::getIdentity(), btVector3(100512, 256, 0) };
+        const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(100512, 256, 0));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addObject(
@@ -1241,11 +1275,11 @@ namespace
 
     TEST_F(DetourNavigatorNavigatorTest, should_add_jobs_for_tiles_when_they_get_in_range)
     {
-        CollisionShapeInstance compound(std::make_unique<btCompoundShape>());
-        compound.shape().addChildShape(
-            btTransform(btMatrix3x3::getIdentity(), btVector3(0, 0, 0)), new btBoxShape(btVector3(20, 20, 100)));
+        JPH::StaticCompoundShapeSettings settings;
+        settings.AddShape(JPH::Vec3::sZero(), JPH::Quat::sIdentity(), new JPH::BoxShape(JPH::Vec3(20, 20, 100)));
+        CollisionShapeInstance compound(std::unique_ptr<JPH::Shape>(settings.Create().Get().GetPtr()));
 
-        const btTransform transform{ btMatrix3x3::getIdentity(), btVector3(100512, 256, 0) };
+        const osg::Matrixd transform = osg::Matrixd::translate(osg::Vec3f(100512, 256, 0));
 
         ASSERT_TRUE(mNavigator->addAgent(mAgentBounds));
         mNavigator->addObject(
@@ -1483,7 +1517,6 @@ namespace
     struct AddObject
     {
         const float mSize = 8192;
-        CollisionShapeInstance<btBoxShape> mBox{ std::make_unique<btBoxShape>(btVector3(mSize, mSize, 1)) };
         const ObjectTransform mTransform{
             .mPosition = ESM::Position{ .pos = { 0, 0, 0 }, .rot{ 0, 0, 0 } },
             .mScale = 1.0f,
@@ -1491,8 +1524,10 @@ namespace
 
         void operator()(Navigator& navigator) const
         {
-            navigator.addObject(ObjectId(&mBox.shape()), ObjectShapes(mBox.instance(), mTransform),
-                btTransform::getIdentity(), nullptr);
+            CollisionShapeInstance<JPH::BoxShape> mBox{ std::make_unique<JPH::BoxShape>(JPH::Vec3(mSize, mSize, 1)) };
+            mBox.shape().SetEmbedded();
+            navigator.addObject(
+                ObjectId(&mBox.shape()), ObjectShapes(mBox.instance(), mTransform), osg::Matrixd::identity(), nullptr);
         }
     };
 

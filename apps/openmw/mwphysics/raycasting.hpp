@@ -5,7 +5,7 @@
 
 #include "../mwworld/ptr.hpp"
 
-#include "collisiontype.hpp"
+#include "joltlayers.hpp"
 
 namespace MWPhysics
 {
@@ -27,7 +27,7 @@ namespace MWPhysics
         /// ignoring all other actors.
         virtual RayCastingResult castRay(const osg::Vec3f& from, const osg::Vec3f& to,
             const std::vector<MWWorld::ConstPtr>& ignore = {}, const std::vector<MWWorld::Ptr>& targets = {},
-            int mask = CollisionType_Default, int group = 0xff) const = 0;
+            int mask = CollisionMask_Default, int group = 0xff) const = 0;
 
         RayCastingResult castRay(const osg::Vec3f& from, const osg::Vec3f& to, int mask) const
         {
@@ -35,7 +35,7 @@ namespace MWPhysics
         }
 
         virtual RayCastingResult castSphere(const osg::Vec3f& from, const osg::Vec3f& to, float radius,
-            int mask = CollisionType_Default, int group = 0xff) const = 0;
+            int mask = CollisionMask_Default, int group = 0xff) const = 0;
 
         /// Return true if actor1 can see actor2.
         virtual bool getLineOfSight(const MWWorld::ConstPtr& actor1, const MWWorld::ConstPtr& actor2) const = 0;

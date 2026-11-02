@@ -115,7 +115,7 @@ add_component_dir (bsa
     bsafile compressedbsafile ba2gnrlfile ba2dx10file ba2file memorystream
     )
 
-add_component_dir (bullethelpers
+add_component_dir (physicshelpers
     collisionobject
     heightfield
     operators
@@ -128,8 +128,8 @@ add_component_dir (vfs
     )
 
 add_component_dir (resource
-    scenemanager keyframemanager imagemanager animblendrulesmanager bulletshapemanager bulletshape niffilemanager objectcache multiobjectcache resourcesystem
-    resourcemanager stats animation foreachbulletobject errormarker selectionmarker cachestats bgsmfilemanager
+    scenemanager keyframemanager imagemanager animblendrulesmanager physicsshapemanager physicsshape niffilemanager objectcache multiobjectcache resourcesystem
+    resourcemanager stats animation foreachphysicsobject errormarker cachestats bgsmfilemanager
     )
 
 add_component_dir (shader
@@ -152,8 +152,8 @@ add_component_dir (nifosg
     autotransform nifloader controller particle matrixtransform
     )
 
-add_component_dir (nifbullet
-    bulletnifloader
+add_component_dir (nifjolt
+    joltnifloader
     )
 
 add_component_dir (toutf8
@@ -423,6 +423,7 @@ add_component_dir(detournavigator
     generatenavmeshtile
     gettilespositions
     guardednavmeshcacheitem
+    heightfieldmeshbuilder
     heightfieldshape
     makenavmesh
     navigator
@@ -575,7 +576,7 @@ if (MSVC)
     )
 endif()
 
-include_directories(${BULLET_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 if (OPENMW_USE_SYSTEM_SQLITE3)
     find_package(SQLite3 REQUIRED)
@@ -585,6 +586,9 @@ if (OPENMW_USE_SYSTEM_SQLITE3)
 endif()
 
 add_library(components STATIC ${COMPONENT_FILES})
+
+target_include_directories(components PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(components SYSTEM BEFORE PUBLIC ${JOLT_INCLUDE_DIRS})
 
 if (ANDROID)
     set_property(TARGET components PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -628,6 +632,8 @@ target_link_libraries(components
     smhasher
     ${ICU_LIBRARIES}
     ZLIB::ZLIB
+
+    ${JOLT_LIBRARIES}
     )
 
 if(yaml-cpp_VERSION VERSION_GREATER_EQUAL 0.8.0)
@@ -636,7 +642,11 @@ else()
     target_link_libraries(components yaml-cpp)
 endif()
 
-target_link_libraries(components ${BULLET_LIBRARIES})
+if (WIN32)
+    target_link_libraries(components
+    ${Boost_LOCALE_LIBRARY}
+    ${Boost_ZLIB_LIBRARY})
+endif()
 
 if (USE_QT)
     add_library(components_qt STATIC ${COMPONENT_QT_FILES})
@@ -680,7 +690,7 @@ endif()
 set(COMPONENT_FILES ${COMPONENT_FILES} PARENT_SCOPE)
 
 target_compile_definitions(components PUBLIC
-    BT_USE_DOUBLE_PRECISION
+    DOUBLE_PRECISION
     MYGUI_DONT_USE_OBSOLETE=ON
 )
 

@@ -7,8 +7,9 @@
 #include "stats.hpp"
 #include "updateguard.hpp"
 
-#include <components/bullethelpers/aabb.hpp>
+#include <components/debug/debuglog.hpp>
 #include <components/misc/convert.hpp>
+#include <components/physicshelpers/aabb.hpp>
 
 #include <boost/geometry/geometry.hpp>
 
@@ -156,7 +157,7 @@ namespace DetourNavigator
         mCache.clear();
     }
 
-    bool TileCachedRecastMeshManager::addObject(ObjectId id, const CollisionShape& shape, const btTransform& transform,
+    bool TileCachedRecastMeshManager::addObject(ObjectId id, const CollisionShape& shape, const osg::Matrixd& transform,
         const AreaType areaType, const UpdateGuard* guard)
     {
         const TilesPositionsRange range = makeTilesPositionsRange(shape.getShape(), transform, mSettings);
@@ -166,19 +167,19 @@ namespace DetourNavigator
             if (it != mObjects.end())
                 return false;
             const std::size_t revision = mRevision + 1;
-            ObjectData* const dataPtr
-                = mObjects
-                      .emplace_hint(it, id,
-                          std::unique_ptr<ObjectData>(new ObjectData{
-                              .mObject = RecastMeshObject(shape, transform, areaType),
-                              .mRange = range,
-                              .mAabb = CommulativeAabb(revision, BulletHelpers::getAabb(shape.getShape(), transform)),
-                              .mGeneration = mGeneration,
-                              .mRevision = revision,
-                              .mLastNavMeshReportedChange = {},
-                              .mLastNavMeshReport = {},
-                          }))
-                      ->second.get();
+            ObjectData* const dataPtr = mObjects
+                                            .emplace_hint(it, id,
+                                                std::unique_ptr<ObjectData>(new ObjectData{
+                                                    .mObject = RecastMeshObject(shape, transform, areaType),
+                                                    .mRange = range,
+                                                    .mAabb = CommulativeAabb(revision,
+                                                        PhysicsSystemHelpers::getAabb(shape.getShape(), transform)),
+                                                    .mGeneration = mGeneration,
+                                                    .mRevision = revision,
+                                                    .mLastNavMeshReportedChange = {},
+                                                    .mLastNavMeshReport = {},
+                                                }))
+                                            ->second.get();
             assert(range.mBegin != range.mEnd);
             mObjectIndex.insert(makeObjectIndexValue(range, dataPtr));
             mRevision = revision;
@@ -189,7 +190,7 @@ namespace DetourNavigator
     }
 
     bool TileCachedRecastMeshManager::updateObject(
-        ObjectId id, const btTransform& transform, const AreaType areaType, const UpdateGuard* guard)
+        ObjectId id, const osg::Matrixd& transform, const AreaType areaType, const UpdateGuard* guard)
     {
         TilesPositionsRange newRange;
         TilesPositionsRange oldRange;
@@ -198,14 +199,17 @@ namespace DetourNavigator
             const auto it = mObjects.find(id);
             if (it == mObjects.end())
                 return false;
+
             if (!it->second->mObject.update(transform, areaType))
                 return false;
+
             const std::size_t lastChangeRevision = it->second->mLastNavMeshReportedChange.has_value()
                 ? it->second->mLastNavMeshReportedChange->mRevision
                 : mRevision;
-            const btCollisionShape& shape = it->second->mObject.getShape();
-            if (!it->second->mAabb.update(lastChangeRevision, BulletHelpers::getAabb(shape, transform)))
+            const JPH::Shape& shape = it->second->mObject.getShape();
+            if (!it->second->mAabb.update(lastChangeRevision, PhysicsSystemHelpers::getAabb(&shape, transform)))
                 return false;
+
             newRange = makeTilesPositionsRange(shape, transform, mSettings);
             oldRange = it->second->mRange;
             if (newRange != oldRange)
@@ -217,6 +221,7 @@ namespace DetourNavigator
             ++mRevision;
             it->second->mRevision = mRevision;
         }
+
         if (newRange == oldRange)
         {
             getTilesPositions(getIntersection(newRange, mRange),
@@ -257,7 +262,7 @@ namespace DetourNavigator
     void TileCachedRecastMeshManager::addWater(
         const osg::Vec2i& cellPosition, const int cellSize, const float level, const UpdateGuard* guard)
     {
-        const btVector3 shift = Misc::Convert::toBullet(getWaterShift3d(cellPosition, cellSize, level));
+        const osg::Vec3f shift = getWaterShift3d(cellPosition, cellSize, level);
         const std::optional<TilesPositionsRange> range = cellSize == std::numeric_limits<int>::max()
             ? std::optional<TilesPositionsRange>()
             : makeTilesPositionsRange(cellSize, shift, mSettings);
@@ -304,7 +309,7 @@ namespace DetourNavigator
     void TileCachedRecastMeshManager::addHeightfield(
         const osg::Vec2i& cellPosition, const int cellSize, const HeightfieldShape& shape, const UpdateGuard* guard)
     {
-        const btVector3 shift = getHeightfieldShift(shape, cellPosition, cellSize);
+        const osg::Vec3f shift = getHeightfieldShift(shape, cellPosition, cellSize);
         const std::optional<TilesPositionsRange> range = cellSize == std::numeric_limits<int>::max()
             ? std::optional<TilesPositionsRange>()
             : makeTilesPositionsRange(cellSize, shift, mSettings);
@@ -489,8 +494,8 @@ namespace DetourNavigator
     std::shared_ptr<RecastMesh> TileCachedRecastMeshManager::makeMesh(const TilePosition& tilePosition) const
     {
         RecastMeshBuilder builder(makeRealTileBoundsWithBorder(mSettings, tilePosition));
-        using Object = std::tuple<osg::ref_ptr<const Resource::BulletShapeInstance>, ObjectTransform,
-            std::reference_wrapper<const btCollisionShape>, btTransform, AreaType>;
+        using Object = std::tuple<osg::ref_ptr<const Resource::PhysicsShapeInstance>, ObjectTransform,
+            std::reference_wrapper<const JPH::Shape>, osg::Matrixd, AreaType>;
         std::vector<Object> objects;
         Version version;
         bool hasInput = false;

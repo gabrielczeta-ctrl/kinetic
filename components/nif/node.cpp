@@ -1,12 +1,14 @@
 #include "node.hpp"
 
+#include <algorithm>
 #include <cstdint>
 
-#include <BulletCollision/CollisionShapes/btTriangleMesh.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Collision/Shape/MeshShape.h>
 
 #include <components/misc/convert.hpp>
 #include <components/misc/strings/algorithm.hpp>
-#include <components/resource/bulletshape.hpp>
+#include <components/resource/physicsshape.hpp>
 
 #include "data.hpp"
 #include "exception.hpp"
@@ -16,24 +18,26 @@
 namespace
 {
 
-    void triBasedGeomToBtTriangleMesh(btTriangleMesh& mesh, const Nif::NiTriBasedGeomData& data)
+    void triBasedGeomToJPHMeshShape(JPH::MeshShapeSettings& mesh, const Nif::NiTriBasedGeomData& data)
     {
         // FIXME: copying vertices/indices individually is unreasonable
         const std::vector<osg::Vec3f>& vertices = data.mVertices;
-        mesh.preallocateVertices(static_cast<int>(vertices.size()));
+        mesh.mTriangleVertices.reserve(vertices.size());
         for (const osg::Vec3f& vertex : vertices)
-            mesh.findOrAddVertex(Misc::Convert::toBullet(vertex), false);
+            mesh.mTriangleVertices.push_back(Misc::Convert::toJolt<JPH::Float3>(vertex));
 
-        mesh.preallocateIndices(static_cast<int>(data.mNumTriangles) * 3);
+        mesh.mIndexedTriangles.reserve(
+            data.mNumTriangles > 0 ? static_cast<std::size_t>(data.mNumTriangles) : std::size_t{ 0 });
     }
 
-    void trianglesToBtTriangleMesh(btTriangleMesh& mesh, const std::vector<unsigned short>& triangles)
+    void trianglesToJPHMeshShape(JPH::MeshShapeSettings& mesh, const std::vector<unsigned short>& triangles)
     {
         for (std::size_t i = 0; i < triangles.size(); i += 3)
-            mesh.addTriangleIndices(triangles[i + 0], triangles[i + 1], triangles[i + 2]);
+            mesh.mIndexedTriangles.push_back(JPH::IndexedTriangle(
+                uint32_t(triangles[i + 0]), uint32_t(triangles[i + 1]), uint32_t(triangles[i + 2])));
     }
 
-    void stripsToBtTriangleMesh(btTriangleMesh& mesh, const std::vector<std::vector<unsigned short>>& strips)
+    void stripsToJPHMeshShape(JPH::MeshShapeSettings& mesh, const std::vector<std::vector<unsigned short>>& strips)
     {
         for (const auto& strip : strips)
         {
@@ -51,9 +55,9 @@ namespace
                 if (a == b || b == c || a == c)
                     continue;
                 if (i % 2 == 0)
-                    mesh.addTriangleIndices(a, b, c);
+                    mesh.mIndexedTriangles.push_back(JPH::IndexedTriangle(a, b, c));
                 else
-                    mesh.addTriangleIndices(a, c, b);
+                    mesh.mIndexedTriangles.push_back(JPH::IndexedTriangle(a, c, b));
             }
         }
     }
@@ -303,7 +307,7 @@ namespace Nif
         }
     }
 
-    std::unique_ptr<btCollisionShape> NiTriShape::getCollisionShape() const
+    std::unique_ptr<JPH::MeshShapeSettings> NiTriShape::getCollisionShape() const
     {
         if (mData.empty() || mData->mVertices.empty())
             return nullptr;
@@ -329,23 +333,19 @@ namespace Nif
             triangleLists.push_back(&data->mTriangles);
 
         // This makes a perhaps dangerous assumption that NiSkinPartition will never have more than 65536 triangles.
-        auto mesh = std::make_unique<btTriangleMesh>();
-        triBasedGeomToBtTriangleMesh(*mesh, *data);
+        JPH::MeshShapeSettings* mesh = new JPH::MeshShapeSettings;
+        mesh->mBuildQuality = JPH::MeshShapeSettings::EBuildQuality::FavorRuntimePerformance;
+        triBasedGeomToJPHMeshShape(*mesh, *data);
         for (const auto triangles : triangleLists)
-            trianglesToBtTriangleMesh(*mesh, *triangles);
+            trianglesToJPHMeshShape(*mesh, *triangles);
         for (const auto strips : stripsLists)
-            stripsToBtTriangleMesh(*mesh, *strips);
+            stripsToJPHMeshShape(*mesh, *strips);
 
-        if (mesh->getNumTriangles() == 0)
-            return nullptr;
-
-        auto shape = std::make_unique<Resource::TriangleMeshShape>(mesh.get(), true);
-        std::ignore = mesh.release();
-
-        return shape;
+        std::unique_ptr<JPH::MeshShapeSettings> ptr(mesh);
+        return ptr;
     }
 
-    std::unique_ptr<btCollisionShape> NiTriStrips::getCollisionShape() const
+    std::unique_ptr<JPH::MeshShapeSettings> NiTriStrips::getCollisionShape() const
     {
         if (mData.empty() || mData->mVertices.empty())
             return nullptr;
@@ -370,28 +370,25 @@ namespace Nif
         else if (data->mNumTriangles != 0)
             stripsLists.push_back(&data->mStrips);
 
-        auto mesh = std::make_unique<btTriangleMesh>();
-        triBasedGeomToBtTriangleMesh(*mesh, *data);
+        JPH::MeshShapeSettings* mesh = new JPH::MeshShapeSettings;
+        mesh->mBuildQuality = JPH::MeshShapeSettings::EBuildQuality::FavorRuntimePerformance;
+        triBasedGeomToJPHMeshShape(*mesh, *data);
         for (const auto triangles : triangleLists)
-            trianglesToBtTriangleMesh(*mesh, *triangles);
+            trianglesToJPHMeshShape(*mesh, *triangles);
         for (const auto strips : stripsLists)
-            stripsToBtTriangleMesh(*mesh, *strips);
+            stripsToJPHMeshShape(*mesh, *strips);
 
-        if (mesh->getNumTriangles() == 0)
-            return nullptr;
-
-        auto shape = std::make_unique<Resource::TriangleMeshShape>(mesh.get(), true);
-        std::ignore = mesh.release();
-
-        return shape;
+        // JPH::MeshShape* meshShape = static_cast<JPH::MeshShape*>(createdRef.Get().GetPtr());
+        std::unique_ptr<JPH::MeshShapeSettings> ptr(mesh);
+        return ptr;
     }
 
-    std::unique_ptr<btCollisionShape> NiLines::getCollisionShape() const
+    std::unique_ptr<JPH::MeshShapeSettings> NiLines::getCollisionShape() const
     {
         return nullptr;
     }
 
-    std::unique_ptr<btCollisionShape> NiParticles::getCollisionShape() const
+    std::unique_ptr<JPH::MeshShapeSettings> NiParticles::getCollisionShape() const
     {
         return nullptr;
     }

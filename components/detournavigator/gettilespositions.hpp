@@ -5,13 +5,15 @@
 #include "tileposition.hpp"
 #include "tilespositionsrange.hpp"
 
-class btVector3;
-class btTransform;
-class btCollisionShape;
+namespace JPH
+{
+    class Shape;
+}
 
 namespace osg
 {
     class Vec2f;
+    class Matrixd;
 }
 
 namespace DetourNavigator
@@ -22,13 +24,13 @@ namespace DetourNavigator
         const osg::Vec2f& aabbMin, const osg::Vec2f& aabbMax, const RecastSettings& settings);
 
     TilesPositionsRange makeTilesPositionsRange(
-        const btCollisionShape& shape, const btTransform& transform, const RecastSettings& settings);
+        const JPH::Shape& shape, const osg::Matrixd& transform, const RecastSettings& settings);
 
-    TilesPositionsRange makeTilesPositionsRange(const btCollisionShape& shape, const btTransform& transform,
+    TilesPositionsRange makeTilesPositionsRange(const JPH::Shape& shape, const osg::Matrixd& transform,
         const TileBounds& bounds, const RecastSettings& settings);
 
     TilesPositionsRange makeTilesPositionsRange(
-        const int cellSize, const btVector3& shift, const RecastSettings& settings);
+        const int cellSize, const osg::Vec3f& shift, const RecastSettings& settings);
 
     template <class Callback>
     inline void getTilesPositions(const TilesPositionsRange& range, Callback&& callback)

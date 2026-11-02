@@ -6,7 +6,10 @@
 
 #include <components/misc/convert.hpp>
 
-#include <BulletCollision/CollisionShapes/btCollisionShape.h>
+#include <osg/Matrixd>
+
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Collision/Shape/Shape.h>
 
 namespace DetourNavigator
 {
@@ -33,13 +36,13 @@ namespace DetourNavigator
     }
 
     TilesPositionsRange makeTilesPositionsRange(
-        const btCollisionShape& shape, const btTransform& transform, const RecastSettings& settings)
+        const JPH::Shape& shape, const osg::Matrixd& transform, const RecastSettings& settings)
     {
         const TileBounds bounds = makeObjectTileBounds(shape, transform);
         return makeTilesPositionsRange(bounds.mMin, bounds.mMax, settings);
     }
 
-    TilesPositionsRange makeTilesPositionsRange(const btCollisionShape& shape, const btTransform& transform,
+    TilesPositionsRange makeTilesPositionsRange(const JPH::Shape& shape, const osg::Matrixd& transform,
         const TileBounds& bounds, const RecastSettings& settings)
     {
         if (const auto intersection = getIntersection(bounds, makeObjectTileBounds(shape, transform)))
@@ -48,18 +51,16 @@ namespace DetourNavigator
     }
 
     TilesPositionsRange makeTilesPositionsRange(
-        const int cellSize, const btVector3& shift, const RecastSettings& settings)
+        const int cellSize, const osg::Vec3f& shift, const RecastSettings& settings)
     {
         const int halfCellSize = cellSize / 2;
-        const btTransform transform(btMatrix3x3::getIdentity(), shift);
-        btVector3 aabbMin = transform(btVector3(-halfCellSize, -halfCellSize, 0));
-        btVector3 aabbMax = transform(btVector3(halfCellSize, halfCellSize, 0));
+        const auto halfCellSizeF = static_cast<osg::Vec3f::value_type>(halfCellSize);
 
-        aabbMin.setX(std::min(aabbMin.x(), aabbMax.x()));
-        aabbMin.setY(std::min(aabbMin.y(), aabbMax.y()));
+        osg::Vec3f aabbMin = shift + osg::Vec3f(-halfCellSizeF, -halfCellSizeF, 0.0f);
+        osg::Vec3f aabbMax = shift + osg::Vec3f(halfCellSizeF, halfCellSizeF, 0.0f);
 
-        aabbMax.setX(std::max(aabbMin.x(), aabbMax.x()));
-        aabbMax.setY(std::max(aabbMin.y(), aabbMax.y()));
+        aabbMin.set(std::min(aabbMin.x(), aabbMax.x()), std::min(aabbMin.y(), aabbMax.y()), aabbMin.z());
+        aabbMax.set(std::max(aabbMin.x(), aabbMax.x()), std::max(aabbMin.y(), aabbMax.y()), aabbMax.z());
 
         return makeTilesPositionsRange(Misc::Convert::toOsgXY(aabbMin), Misc::Convert::toOsgXY(aabbMax), settings);
     }

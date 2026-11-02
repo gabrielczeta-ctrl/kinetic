@@ -974,7 +974,9 @@ namespace Nif
     void bhkPoseArray::BoneTransform::read(NIFStream* nif)
     {
         nif->read(mTranslation);
-        nif->read(mRotation);
+        std::array<float, 4> rotation;
+        nif->readArray(rotation);
+        mRotation.set(rotation[0], rotation[1], rotation[2], rotation[3]);
         nif->read(mScale);
     }
 

@@ -42,7 +42,7 @@ option(BUILD_WITH_CODE_COVERAGE "Enable code coverage with gconv" OFF)
 option(BUILD_COMPONENTS_TESTS   "Build components library tests" OFF)
 option(BUILD_BENCHMARKS         "Build benchmarks with Google Benchmark" OFF)
 option(BUILD_NAVMESHTOOL        "Build navmesh tool" ON)
-option(BUILD_BULLETOBJECTTOOL   "Build Bullet object tool" ON)
+option(BUILD_PHYSICSOBJECTTOOL   "Build Physics object tool" ON)
 option(BUILD_OPENCS_TESTS       "Build OpenMW Construction Set tests" OFF)
 option(BUILD_OPENMW_TESTS       "Build OpenMW tests" OFF)
 option(PRECOMPILE_HEADERS_WITH_MSVC "Precompile most common used headers with MSVC (alternative to ccache)" ON)
@@ -126,13 +126,9 @@ configure_file ("${OpenMW_SOURCE_DIR}/docs/mainpage.hpp.cmake" "${OpenMW_BINARY_
 
 option(QT_STATIC "Link static build of Qt into the binaries" FALSE)
 
-option(OPENMW_USE_SYSTEM_BULLET "Use system provided bullet physics library" ON)
-if(OPENMW_USE_SYSTEM_BULLET)
-    set(_bullet_static_default OFF)
-else()
-    set(_bullet_static_default ON)
-endif()
-option(BULLET_STATIC "Link static build of Bullet into the binaries" ${_bullet_static_default})
+set(_jolt_static_default ON)
+option(JOLT_STATIC "Build Jolt Physics static libraries" ${_jolt_static_default})
+add_definitions(-DJPH_DEBUG_RENDERER=1)
 
 option(OPENMW_USE_SYSTEM_OSG "Use system provided OpenSceneGraph libraries" ON)
 if(OPENMW_USE_SYSTEM_OSG)
@@ -397,39 +393,6 @@ if (WIN32)
     )
 endif()
 
-if(OPENMW_USE_SYSTEM_BULLET)
-    set(REQUIRED_BULLET_VERSION 286) # Bullet 286 required due to runtime bugfixes for btCapsuleShape
-    if (DEFINED ENV{TRAVIS_BRANCH} OR DEFINED ENV{APPVEYOR})
-        set(REQUIRED_BULLET_VERSION 283) # but for build testing, 283 is fine
-    endif()
-
-    # First, try BulletConfig-float64.cmake which comes with Debian derivatives.
-    # This file does not define the Bullet version in a CMake-friendly way.
-    find_package(Bullet CONFIGS BulletConfig-float64.cmake QUIET COMPONENTS BulletCollision LinearMath)
-    if (BULLET_FOUND)
-        string(REPLACE "." "" _bullet_version_num ${BULLET_VERSION_STRING})
-        if (_bullet_version_num VERSION_LESS REQUIRED_BULLET_VERSION)
-            message(FATAL_ERROR "System bullet version too old, OpenMW requires at least ${REQUIRED_BULLET_VERSION}, got ${_bullet_version_num}")
-        endif()
-        # Fix the relative include:
-        set(BULLET_INCLUDE_DIRS "${BULLET_ROOT_DIR}/${BULLET_INCLUDE_DIRS}")
-        include(FindPackageMessage)
-        find_package_message(Bullet "Found Bullet: ${BULLET_LIBRARIES} ${BULLET_VERSION_STRING}" "${BULLET_VERSION_STRING}-float64")
-    else()
-        find_package(Bullet ${REQUIRED_BULLET_VERSION} REQUIRED COMPONENTS BulletCollision LinearMath)
-    endif()
-
-    # Only link the Bullet libraries that we need:
-    string(REGEX MATCHALL "((optimized|debug);)?[^;]*(BulletCollision|LinearMath)[^;]*" BULLET_LIBRARIES "${BULLET_LIBRARIES}")
-
-    include(cmake/CheckBulletPrecision.cmake)
-    if (HAS_DOUBLE_PRECISION_BULLET)
-        message(STATUS "Bullet uses double precision")
-    else()
-        message(FATAL_ERROR "Bullet does not uses double precision")
-    endif()
-endif()
-
 if (NOT WIN32 AND BUILD_WIZARD) # windows users can just run the morrowind installer
     find_package(LIBUNSHIELD REQUIRED) # required only for non win32 when building openmw-wizard
     set(OPENMW_USE_UNSHIELD TRUE)
@@ -512,7 +475,6 @@ include_directories(
     ${MyGUI_INCLUDE_DIRS}
     ${OPENAL_INCLUDE_DIR}
     ${OPENGL_INCLUDE_DIR}
-    ${BULLET_INCLUDE_DIRS}
     ${LUA_INCLUDE_DIR}
     ${SOL_INCLUDE_DIR}
     ${SOL_CONFIG_DIR}
@@ -718,8 +680,8 @@ if (BUILD_NAVMESHTOOL)
     add_subdirectory(apps/navmeshtool)
 endif()
 
-if (BUILD_BULLETOBJECTTOOL)
-    add_subdirectory(apps/bulletobjecttool)
+if (BUILD_PHYSICSOBJECTTOOL)
+    add_subdirectory( apps/physicsobjecttool )
 endif()
 
 if (BUILD_OPENCS_TESTS)
@@ -1058,9 +1020,9 @@ elseif(NOT APPLE)
         if(BUILD_NAVMESHTOOL)
             install(PROGRAMS "${INSTALL_SOURCE}/openmw-navmeshtool" DESTINATION "${BINDIR}" )
         endif()
-        IF(BUILD_BULLETOBJECTTOOL)
-            INSTALL(PROGRAMS "${INSTALL_SOURCE}/openmw-bulletobjecttool" DESTINATION "${BINDIR}" )
-        ENDIF(BUILD_BULLETOBJECTTOOL)
+        IF(BUILD_PHYSICSOBJECTTOOL)
+            INSTALL(PROGRAMS "${INSTALL_SOURCE}/openmw-physicsobjecttool" DESTINATION "${BINDIR}" )
+        ENDIF(BUILD_PHYSICSOBJECTTOOL)
 
         # Install icon and desktop file
         INSTALL(FILES "${OpenMW_BINARY_DIR}/org.openmw.launcher.desktop" DESTINATION "${DATAROOTDIR}/applications" COMPONENT "openmw")

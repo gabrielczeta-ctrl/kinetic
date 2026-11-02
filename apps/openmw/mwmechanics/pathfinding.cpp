@@ -245,7 +245,7 @@ namespace MWMechanics
                     converter.toWorld(temp);
                     // Add Z offset since path node can overlap with other objects.
                     // Also ignore doors in raytesting.
-                    const int mask = MWPhysics::CollisionType_World;
+                    const int mask = MWPhysics::Layers::WORLD;
                     const osg::Vec3f zOffset(0.f, 0.f, 16.f);
                     const osg::Vec3f from = startPoint + zOffset;
                     const osg::Vec3f to = Misc::Convert::makeOsgVec3f(temp) + zOffset;

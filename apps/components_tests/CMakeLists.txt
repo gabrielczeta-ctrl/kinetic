@@ -27,7 +27,7 @@ file(GLOB UNITTEST_SRC_FILES
     misc/testresourcehelpers.cpp
     misc/teststringops.cpp
 
-    nifloader/testbulletnifloader.cpp
+    nifloader/testjoltnifloader.cpp
 
     detournavigator/navigator.cpp
     detournavigator/settingsutils.cpp

@@ -554,7 +554,7 @@ namespace MWMechanics
         bool targetUsesRanged = false;
         float rangeAttackOfTarget = ActionWeapon(targetWeapon).getCombatRange(targetUsesRanged);
 
-        if (mMovement.mPosition[0])
+        if (mMovement.mPosition[0] != 0.0f)
         {
             mTimerCombatMove = 0.1f + 0.1f * Misc::Rng::rollClosedProbability(prng);
             mCombatMove = true;
@@ -597,8 +597,7 @@ namespace MWMechanics
             if (MWBase::Environment::get().getWorld()->isUnderwater(MWWorld::ConstPtr(actor), 0.5f))
                 return;
 
-            int mask
-                = MWPhysics::CollisionType_World | MWPhysics::CollisionType_HeightMap | MWPhysics::CollisionType_Door;
+            int mask = MWPhysics::Layers::WORLD | MWPhysics::Layers::HEIGHTMAP | MWPhysics::Layers::DOOR;
 
             // Actor can not back up if there is no free space behind
             // Currently we take the 35% of actor's height from the ground as vector height.
@@ -691,7 +690,6 @@ namespace MWMechanics
                         MWBase::Environment::get().getDialogueManager()->say(actor, ESM::RefId::stringRefId("attack"));
                     }
                 }
-
                 if (mCurrentAction->getActionCooldown() > 0.f)
                 {
                     mAttackCooldown = mCurrentAction->getActionCooldown();
@@ -753,10 +751,10 @@ namespace
             int thrust = (weapon->mData.mThrust[0] + weapon->mData.mThrust[1]) / 2;
 
             auto& prng = MWBase::Environment::get().getWorld()->getPrng();
-            float roll = Misc::Rng::rollClosedProbability(prng) * (slash + chop + thrust);
-            if (roll <= slash)
+            const float roll = Misc::Rng::rollClosedProbability(prng) * static_cast<float>(slash + chop + thrust);
+            if (roll <= static_cast<float>(slash))
                 return "slash";
-            else if (roll <= (slash + thrust))
+            else if (roll <= static_cast<float>(slash + thrust))
                 return "thrust";
             else
                 return "chop";

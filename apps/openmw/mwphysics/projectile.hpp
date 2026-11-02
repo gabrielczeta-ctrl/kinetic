@@ -5,17 +5,16 @@
 #include <memory>
 #include <mutex>
 
-#include <LinearMath/btVector3.h>
-
 #include "ptrholder.hpp"
-
-class btCollisionObject;
-class btCollisionShape;
-class btConvexShape;
 
 namespace osg
 {
     class Vec3f;
+}
+
+namespace JPH
+{
+    class Body;
 }
 
 namespace MWPhysics
@@ -30,43 +29,43 @@ namespace MWPhysics
             PhysicsTaskScheduler* scheduler, PhysicsSystem* physicssystem);
         ~Projectile() override;
 
-        btConvexShape* getConvexShape() const { return mConvexShape; }
-
-        void updateCollisionObjectPosition();
-
         bool isActive() const { return mActive.load(std::memory_order_acquire); }
 
         MWWorld::Ptr getTarget() const;
 
         MWWorld::Ptr getCaster() const;
         void setCaster(const MWWorld::Ptr& caster);
-        const btCollisionObject* getCasterCollisionObject() const { return mCasterColObj; }
+        const JPH::BodyID getCasterCollisionObject() const { return mCasterColObj; }
 
         void setHitWater() { mHitWater = true; }
 
-        bool getHitWater() const { return mHitWater; }
+        bool getHitWater() const { return mHitWater.load(std::memory_order_acquire); }
 
-        void hit(const btCollisionObject* target, btVector3 pos, btVector3 normal);
+        void hit(const JPH::BodyID target, osg::Vec3f pos, osg::Vec3f normal);
 
         void setValidTargets(const std::vector<MWWorld::Ptr>& targets);
-        bool isValidTarget(const btCollisionObject* target) const;
+        bool isValidTarget(const JPH::BodyID target) const;
 
-        btVector3 getHitPosition() const { return mHitPosition; }
-        btVector3 getHitNormal() const { return mHitNormal; }
+        osg::Vec3f getHitPosition() const { return mHitPosition; }
+        osg::Vec3f getHitNormal() const { return mHitNormal; }
+
+        void onContactAdded(const JPH::Body& withBody, const JPH::ContactManifold& inManifold,
+            JPH::ContactSettings& ioSettings) override;
+        bool onContactValidate(const JPH::Body& withBody) override;
+        void setVelocity(osg::Vec3f velocity) override;
+
+        osg::Vec3f getSimulationPosition() const override;
 
     private:
-        std::unique_ptr<btCollisionShape> mShape;
-        btConvexShape* mConvexShape;
-
-        bool mHitWater;
+        std::atomic<bool> mHitWater;
         std::atomic<bool> mActive;
         MWWorld::Ptr mCaster;
-        const btCollisionObject* mCasterColObj;
-        const btCollisionObject* mHitTarget;
-        btVector3 mHitPosition;
-        btVector3 mHitNormal;
+        JPH::BodyID mCasterColObj;
+        JPH::BodyID mHitTarget;
+        osg::Vec3f mHitPosition;
+        osg::Vec3f mHitNormal;
 
-        std::vector<const btCollisionObject*> mValidTargets;
+        std::vector<JPH::BodyID> mValidTargets;
 
         mutable std::mutex mMutex;
 

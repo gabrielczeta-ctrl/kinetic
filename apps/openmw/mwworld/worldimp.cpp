@@ -1,5 +1,6 @@
 #include "worldimp.hpp"
 
+#include <array>
 #include <charconv>
 #include <vector>
 
@@ -9,7 +10,10 @@
 
 #include <MyGUI_TextIterator.h>
 
-#include <LinearMath/btAabbUtil2.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
 
 #include <components/debug/debuglog.hpp>
 
@@ -38,7 +42,7 @@
 
 #include <components/files/collections.hpp>
 
-#include <components/resource/bulletshape.hpp>
+#include <components/resource/physicsshape.hpp>
 #include <components/resource/resourcesystem.hpp>
 
 #include <components/sceneutil/lightmanager.hpp>
@@ -87,7 +91,7 @@
 #include "../mwclass/door.hpp"
 
 #include "../mwphysics/actor.hpp"
-#include "../mwphysics/collisiontype.hpp"
+#include "../mwphysics/joltlayers.hpp"
 #include "../mwphysics/object.hpp"
 #include "../mwphysics/physicssystem.hpp"
 
@@ -1271,7 +1275,7 @@ namespace MWWorld
                 targetPos = pos + (orientation * osg::Vec3f(1, 0, 0)) * distance;
 
             // destination is free
-            if (!mPhysics->castRay(pos, targetPos, MWPhysics::CollisionType_World | MWPhysics::CollisionType_Door).mHit)
+            if (!mPhysics->castRay(pos, targetPos, MWPhysics::Layers::WORLD | MWPhysics::Layers::DOOR).mHit)
                 break;
         }
         targetPos.z() += distance / 2.f; // move up a bit to get out from geometry, will snap down later
@@ -1338,7 +1342,7 @@ namespace MWWorld
 
             if (!mPhysics
                      ->castRay(spawnPoint, osg::Vec3f(pos.x(), pos.y(), pos.z() + 20),
-                         MWPhysics::CollisionType_World | MWPhysics::CollisionType_Door)
+                         MWPhysics::Layers::WORLD | MWPhysics::Layers::DOOR)
                      .mHit)
             {
                 // safe
@@ -1435,7 +1439,7 @@ namespace MWWorld
         /// \todo should use convexSweepTest here
         bool collisionWithActor = false;
         for (auto& [ptr, point, normal] :
-            mPhysics->getCollisionsPoints(door, MWPhysics::CollisionType_Door, MWPhysics::CollisionType_Actor))
+            mPhysics->getCollisionsPoints(door, MWPhysics::Layers::DOOR, MWPhysics::Layers::ACTOR))
         {
 
             if (ptr.getClass().isActor())
@@ -1443,7 +1447,7 @@ namespace MWWorld
                 auto localPoint = objPos.asVec3() - point;
                 osg::Vec3f direction = osg::Quat(diff, osg::Vec3f(0, 0, 1)) * localPoint - localPoint;
                 direction.normalize();
-                mPhysics->reportCollision(Misc::Convert::toBullet(point), Misc::Convert::toBullet(normal));
+                mPhysics->reportCollision(point, normal);
                 if (direction * normal < 0) // door is turning away from actor
                     continue;
 
@@ -2553,11 +2557,10 @@ namespace MWWorld
         to.normalize();
         to = from + (to * maxDist);
 
-        int collisionTypes
-            = MWPhysics::CollisionType_World | MWPhysics::CollisionType_HeightMap | MWPhysics::CollisionType_Door;
+        int collisionTypes = MWPhysics::Layers::WORLD | MWPhysics::Layers::HEIGHTMAP | MWPhysics::Layers::DOOR;
         if (includeWater)
         {
-            collisionTypes |= MWPhysics::CollisionType_Water;
+            collisionTypes |= MWPhysics::Layers::WATER;
         }
         MWPhysics::RayCastingResult result
             = mPhysics->castRay(from, to, { MWWorld::Ptr() }, std::vector<MWWorld::Ptr>(), collisionTypes);
@@ -2846,11 +2849,12 @@ namespace MWWorld
         {
             const ESM::Spell* spell = mStore.get<ESM::Spell>().find(selectedSpell);
             int spellCost = MWMechanics::calcSpellCost(*spell);
+            const float spellCostF = static_cast<float>(spellCost);
 
             // Check mana
             bool godmode = (isPlayer && mGodMode);
             MWMechanics::DynamicStat<float> magicka = stats.getMagicka();
-            if (spellCost > 0 && magicka.getCurrent() < spellCost && !godmode)
+            if (spellCost > 0 && magicka.getCurrent() < spellCostF && !godmode)
             {
                 message = "#{sMagicInsufficientSP}";
                 result = MWWorld::SpellCastState::InsufficientMagicka;
@@ -2867,7 +2871,7 @@ namespace MWWorld
             if (result == MWWorld::SpellCastState::Success && !godmode)
             {
                 // Reduce mana
-                magicka.setCurrent(magicka.getCurrent() - spellCost);
+                magicka.setCurrent(magicka.getCurrent() - spellCostF);
                 stats.setMagicka(magicka);
 
                 // Reduce fatigue (note that in the vanilla game, both GMSTs are 0, and there's no fatigue loss)
@@ -2878,7 +2882,7 @@ namespace MWWorld
                 MWMechanics::DynamicStat<float> fatigue = stats.getFatigue();
                 const float normalizedEncumbrance = actor.getClass().getNormalizedEncumbrance(actor);
 
-                float fatigueLoss = spellCost * (fFatigueSpellBase + normalizedEncumbrance * fFatigueSpellMult);
+                float fatigueLoss = spellCostF * (fFatigueSpellBase + normalizedEncumbrance * fFatigueSpellMult);
                 fatigue.setCurrent(fatigue.getCurrent() - fatigueLoss);
                 stats.setFatigue(fatigue);
             }
@@ -3002,8 +3006,8 @@ namespace MWWorld
             actor.getClass().getCreatureStats(actor).getAiSequence().getCombatTargets(targetActors);
 
         // Check for impact, if yes, handle hit
-        MWPhysics::RayCastingResult result = mPhysics->castRay(
-            sourcePos, worldPos, { actor }, targetActors, 0xff, MWPhysics::CollisionType_Projectile);
+        MWPhysics::RayCastingResult result
+            = mPhysics->castRay(sourcePos, worldPos, { actor }, targetActors, 0xff, MWPhysics::Layers::PROJECTILE);
 
         if (result.mHit)
         {
@@ -3106,7 +3110,7 @@ namespace MWWorld
 
     float World::getPhysicsFrameRateDt() const
     {
-        return mPhysics->mPhysicsDt;
+        return mPhysics->getPhysicsDt();
     }
 
     bool World::findInteriorPositionInWorldSpace(const MWWorld::CellStore* cell, osg::Vec3f& result)
@@ -3435,7 +3439,7 @@ namespace MWWorld
         else if (type == World::Detect_Enchantment)
             dist = effects.getOrDefault(ESM::MagicEffect::DetectEnchantment).getMagnitude();
 
-        if (!dist)
+        if (dist <= 0.0f)
             return;
 
         dist = feetToGameUnits(dist);
@@ -3476,8 +3480,9 @@ namespace MWWorld
         static float fCrimeGoldTurnInMult
             = mStore.get<ESM::GameSetting>().find("fCrimeGoldTurnInMult")->mValue.getFloat();
 
-        int discount = static_cast<int>(bounty * fCrimeGoldDiscountMult);
-        int turnIn = static_cast<int>(bounty * fCrimeGoldTurnInMult);
+        const float bountyF = static_cast<float>(bounty);
+        int discount = static_cast<int>(bountyF * fCrimeGoldDiscountMult);
+        int turnIn = static_cast<int>(bountyF * fCrimeGoldTurnInMult);
 
         if (bounty > 0)
         {
@@ -3758,24 +3763,33 @@ namespace MWWorld
         if (!object)
             return false;
 
-        btVector3 aabbMin;
-        btVector3 aabbMax;
-        object->getShapeInstance()->mCollisionShape->getAabb(btTransform::getIdentity(), aabbMin, aabbMax);
+        JPH::AABox aabbBounds = object->getShapeInstance()->mCollisionShape->GetLocalBounds();
+        JPH::Vec3 halfExtents = (aabbBounds.mMax - aabbBounds.mMin) / 2.0f;
 
-        const auto toLocal = object->getTransform().inverse();
-        const auto localFrom = toLocal(Misc::Convert::toBullet(position));
-        const auto localTo = toLocal(Misc::Convert::toBullet(destination));
+        osg::Matrixd toLocal = osg::Matrixd::inverse(object->getTransform());
+        const JPH::Vec3 localFrom = Misc::Convert::toJolt<JPH::Vec3>(position * toLocal);
+        const JPH::Vec3 localTo = Misc::Convert::toJolt<JPH::Vec3>(destination * toLocal);
+        const JPH::Vec3 diff = localTo - localFrom;
 
-        btScalar hitDistance = 1;
-        btVector3 hitNormal;
-        return btRayAabb(localFrom, localTo, aabbMin, aabbMax, hitDistance, hitNormal);
+        JPH::BoxShape boundsShape(halfExtents);
+        boundsShape.SetEmbedded();
+        JPH::RayCast ray(localFrom, diff);
+        JPH::RayCastResult ioHit;
+        return boundsShape.CastRay(ray, {}, ioHit);
+    }
+
+    bool World::isAreaOccupiedByOtherActor(const osg::Vec3f& position, const float radius,
+        std::span<const MWWorld::ConstPtr> ignore, std::vector<MWWorld::Ptr>* occupyingActors) const
+    {
+        return mPhysics->isAreaOccupiedByOtherActor(position, radius, ignore, occupyingActors);
     }
 
     bool World::isAreaOccupiedByOtherActor(const MWWorld::ConstPtr& actor, const osg::Vec3f& position) const
     {
-        const osg::Vec3f halfExtents = getPathfindingAgentBounds(actor).mHalfExtents;
-        const float maxHalfExtent = std::max(halfExtents.x(), std::max(halfExtents.y(), halfExtents.z()));
-        return mPhysics->isAreaOccupiedByOtherActor(actor.mRef, position, 2 * maxHalfExtent);
+        const osg::Vec3f halfExtents = getHalfExtents(actor);
+        const float radius = std::max(20.f, std::max(halfExtents.x(), halfExtents.y()));
+        const std::array<MWWorld::ConstPtr, 1> ignore{ actor };
+        return isAreaOccupiedByOtherActor(position, radius, ignore, nullptr);
     }
 
     void World::reportStats(unsigned int frameNumber, osg::Stats& stats) const

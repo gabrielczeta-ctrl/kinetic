@@ -7,7 +7,8 @@
 
 #include <osg/Vec3d>
 
-#include <BulletCollision/CollisionDispatch/btCollisionObject.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/PhysicsSystem.h>
 
 #include "../mwworld/ptr.hpp"
 
@@ -18,7 +19,6 @@ namespace MWPhysics
     public:
         explicit PtrHolder(const MWWorld::Ptr& ptr, const osg::Vec3f& position)
             : mPtr(ptr)
-            , mSimulationPosition(position)
             , mPosition(position)
             , mPreviousPosition(position)
         {
@@ -30,15 +30,22 @@ namespace MWPhysics
 
         MWWorld::Ptr getPtr() const { return mPtr; }
 
-        btCollisionObject* getCollisionObject() const { return mCollisionObject.get(); }
+        const JPH::BodyID getPhysicsBody() const
+        {
+            assert(mPhysicsBody != nullptr);
+            if (mPhysicsBody == nullptr)
+            {
+                return JPH::BodyID();
+            }
+            return mPhysicsBody->GetID();
+        }
 
-        void setVelocity(osg::Vec3f velocity) { mVelocity = velocity; }
+        virtual void setVelocity(osg::Vec3f velocity) { mVelocity = velocity; }
 
         osg::Vec3f velocity() { return std::exchange(mVelocity, osg::Vec3f()); }
 
-        void setSimulationPosition(const osg::Vec3f& position) { mSimulationPosition = position; }
-
-        osg::Vec3f getSimulationPosition() const { return mSimulationPosition; }
+        // Assumed static by default, override if not
+        virtual osg::Vec3f getSimulationPosition() const { return mPosition; }
 
         void setPosition(const osg::Vec3f& position)
         {
@@ -50,11 +57,17 @@ namespace MWPhysics
 
         osg::Vec3d getPreviousPosition() const { return mPreviousPosition; }
 
+        virtual void onContactAdded(
+            const JPH::Body& withBody, const JPH::ContactManifold& inManifold, JPH::ContactSettings& ioSettings)
+        {
+        }
+
+        virtual bool onContactValidate(const JPH::Body& withBody) { return true; }
+
     protected:
         MWWorld::Ptr mPtr;
-        std::unique_ptr<btCollisionObject> mCollisionObject;
+        JPH::Body* mPhysicsBody; // NOTE: memory is managed by Jolt!
         osg::Vec3f mVelocity;
-        osg::Vec3f mSimulationPosition;
         osg::Vec3d mPosition;
         osg::Vec3d mPreviousPosition;
     };

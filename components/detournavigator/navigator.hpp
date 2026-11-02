@@ -14,8 +14,7 @@
 #include "updateguard.hpp"
 #include "waitconditiontype.hpp"
 
-#include <components/esm/refid.hpp>
-#include <components/resource/bulletshape.hpp>
+#include <components/resource/physicsshape.hpp>
 
 namespace ESM
 {
@@ -37,11 +36,11 @@ namespace DetourNavigator
 
     struct ObjectShapes
     {
-        osg::ref_ptr<const Resource::BulletShapeInstance> mShapeInstance;
+        osg::ref_ptr<const Resource::PhysicsShapeInstance> mShapeInstance;
         ObjectTransform mTransform;
 
         ObjectShapes(
-            const osg::ref_ptr<const Resource::BulletShapeInstance>& shapeInstance, const ObjectTransform& transform)
+            const osg::ref_ptr<const Resource::PhysicsShapeInstance>& shapeInstance, const ObjectTransform& transform)
             : mShapeInstance(shapeInstance)
             , mTransform(transform)
         {
@@ -54,7 +53,7 @@ namespace DetourNavigator
         osg::Vec3f mConnectionStart;
         osg::Vec3f mConnectionEnd;
 
-        DoorShapes(const osg::ref_ptr<const Resource::BulletShapeInstance>& shapeInstance,
+        DoorShapes(const osg::ref_ptr<const Resource::PhysicsShapeInstance>& shapeInstance,
             const ObjectTransform& transform, const osg::Vec3f& connectionStart, const osg::Vec3f& connectionEnd)
             : ObjectShapes(shapeInstance, transform)
             , mConnectionStart(connectionStart)
@@ -90,7 +89,12 @@ namespace DetourNavigator
          */
         virtual void removeAgent(const AgentBounds& agentBounds) = 0;
 
-        // Updates bounds for recast mesh and navmesh tiles, removes tiles outside the range.
+        /**
+         * @brief updateBounds should be called before adding object from loading cell
+         * @param worldspace worldspace of loading cell
+         * @param cellGridBounds bounds of loaded exterior cells around the player
+         * @param playerPosition corresponds to the bounds center
+         */
         virtual void updateBounds(ESM::RefId worldspace, const std::optional<CellGridBounds>& cellGridBounds,
             const osg::Vec3f& playerPosition, const UpdateGuard* guard)
             = 0;
@@ -102,7 +106,7 @@ namespace DetourNavigator
          * @param transform allows to setup objects geometry according to its world state
          */
         virtual void addObject(
-            const ObjectId id, const ObjectShapes& shapes, const btTransform& transform, const UpdateGuard* guard)
+            const ObjectId id, const ObjectShapes& shapes, const osg::Matrixd& transform, const UpdateGuard* guard)
             = 0;
 
         /**
@@ -112,7 +116,7 @@ namespace DetourNavigator
          * @param transform allows to setup objects geometry according to its world state.
          */
         virtual void addObject(
-            const ObjectId id, const DoorShapes& shapes, const btTransform& transform, const UpdateGuard* guard)
+            const ObjectId id, const DoorShapes& shapes, const osg::Matrixd& transform, const UpdateGuard* guard)
             = 0;
 
         /**
@@ -122,7 +126,7 @@ namespace DetourNavigator
          * @param transform allows to setup objects geometry according to its world state.
          */
         virtual void updateObject(
-            const ObjectId id, const ObjectShapes& shapes, const btTransform& transform, const UpdateGuard* guard)
+            const ObjectId id, const ObjectShapes& shapes, const osg::Matrixd& transform, const UpdateGuard* guard)
             = 0;
 
         /**
@@ -132,7 +136,7 @@ namespace DetourNavigator
          * @param transform allows to setup objects geometry according to its world state.
          */
         virtual void updateObject(
-            const ObjectId id, const DoorShapes& shapes, const btTransform& transform, const UpdateGuard* guard)
+            const ObjectId id, const DoorShapes& shapes, const osg::Matrixd& transform, const UpdateGuard* guard)
             = 0;
 
         /**

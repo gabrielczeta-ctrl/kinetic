@@ -305,7 +305,7 @@ namespace NavMeshTool
             = std::make_shared<NavMeshTileConsumer>(db, options);
 
         const TilesPositionsRange range = DetourNavigator::makeTilesPositionsRange(
-            Misc::Convert::toOsgXY(data.mAabb.m_min), Misc::Convert::toOsgXY(data.mAabb.m_max), settings.mRecast);
+            Misc::Convert::toOsgXY(data.mAabb.mMin), Misc::Convert::toOsgXY(data.mAabb.mMax), settings.mRecast);
 
         if (options.mRemoveUnusedTiles)
             navMeshTileConsumer->removeTilesOutsideRange(data.mWorldspace, range);

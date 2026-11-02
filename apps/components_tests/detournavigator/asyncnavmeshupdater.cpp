@@ -9,7 +9,11 @@
 #include <components/loadinglistener/loadinglistener.hpp>
 #include <components/testing/util.hpp>
 
-#include <BulletCollision/CollisionShapes/btBoxShape.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Body/Body.h>
+#include <Jolt/Physics/Body/BodyInterface.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/MutableCompoundShape.h>
 
 #include <DetourNavMesh.h>
 
@@ -31,21 +35,21 @@ namespace
         recastMeshManager.addHeightfield(cellPosition, cellSize, HeightfieldPlane{ 0 }, nullptr);
     }
 
-    void addObject(const btBoxShape& shape, TileCachedRecastMeshManager& recastMeshManager)
+    void addObject(const JPH::BoxShape& shape, TileCachedRecastMeshManager& recastMeshManager)
     {
         const ObjectId id(&shape);
-        osg::ref_ptr<Resource::BulletShape> bulletShape(new Resource::BulletShape);
+        osg::ref_ptr<Resource::PhysicsShape> physicsShape(new Resource::PhysicsShape);
         constexpr VFS::Path::NormalizedView test("test.nif");
-        bulletShape->mFileName = test;
-        bulletShape->mFileHash = "test_hash";
+        physicsShape->mFileName = test;
+        physicsShape->mFileHash = "test_hash";
         ObjectTransform objectTransform;
         std::fill(std::begin(objectTransform.mPosition.pos), std::end(objectTransform.mPosition.pos), 0.1f);
         std::fill(std::begin(objectTransform.mPosition.rot), std::end(objectTransform.mPosition.rot), 0.2f);
         objectTransform.mScale = 3.14f;
         const CollisionShape collisionShape(
-            osg::ref_ptr<Resource::BulletShapeInstance>(new Resource::BulletShapeInstance(bulletShape)), shape,
+            osg::ref_ptr<Resource::PhysicsShapeInstance>(new Resource::PhysicsShapeInstance(physicsShape)), shape,
             objectTransform);
-        recastMeshManager.addObject(id, collisionShape, btTransform::getIdentity(), AreaType_ground, nullptr);
+        recastMeshManager.addObject(id, collisionShape, osg::Matrixd::identity(), AreaType_ground, nullptr);
     }
 
     struct DetourNavigatorAsyncNavMeshUpdaterTest : Test
@@ -56,7 +60,7 @@ namespace
         const AgentBounds mAgentBounds{ CollisionShapeType::Aabb, { 29, 29, 66 } };
         const TilePosition mPlayerTile{ 0, 0 };
         const ESM::RefId mWorldspace = ESM::RefId::stringRefId("sys::default");
-        const btBoxShape mBox{ btVector3(100, 100, 20) };
+        const JPH::BoxShape mBox{ JPH::Vec3(100, 100, 20) };
         Loading::Listener mListener;
     };
 

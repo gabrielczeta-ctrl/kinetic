@@ -1,4 +1,4 @@
-#include "foreachbulletobject.hpp"
+#include "foreachphysicsobject.hpp"
 
 #include <components/debug/debuglog.hpp>
 #include <components/esm3/cellref.hpp>
@@ -10,12 +10,16 @@
 #include <components/esmloader/record.hpp>
 #include <components/misc/resourcehelpers.hpp>
 #include <components/misc/strings/lower.hpp>
-#include <components/resource/bulletshapemanager.hpp>
+#include <components/resource/physicsshapemanager.hpp>
 #include <components/vfs/manager.hpp>
 
 #include <osg/ref_ptr>
 
 #include <algorithm>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -60,7 +64,7 @@ namespace Resource
             {
                 const ESM::ReadersCache::BusyItem reader
                     = readers.get(static_cast<std::size_t>(cell.mContextList[i].index));
-                cell.restore(*reader, static_cast<int>(i));
+                cell.restore(*reader, i);
                 ESM::CellRef cellRef;
                 bool deleted = false;
                 while (ESM::Cell::getNextRef(*reader, cellRef, deleted))
@@ -85,7 +89,7 @@ namespace Resource
 
         template <class F>
         void forEachObject(const ESM::Cell& cell, const EsmLoader::EsmData& esmData, const VFS::Manager& vfs,
-            Resource::BulletShapeManager& bulletShapeManager, ESM::ReadersCache& readers, F&& f)
+            Resource::PhysicsShapeManager& physicsShapeManager, ESM::ReadersCache& readers, F&& f)
         {
             std::vector<CellRef> cellRefs = loadCellRefs(cell, esmData, readers);
 
@@ -100,17 +104,16 @@ namespace Resource
                 if (cellRef.mType != ESM::REC_STAT)
                     model = Misc::ResourceHelpers::correctActorModelPath(model, &vfs);
 
-                osg::ref_ptr<const Resource::BulletShape> shape = [&] {
+                osg::ref_ptr<const Resource::PhysicsShape> shape = [&] {
                     try
                     {
-                        constexpr VFS::Path::NormalizedView prefix("meshes");
-                        return bulletShapeManager.getShape(prefix / model);
+                        return physicsShapeManager.getShape(Misc::ResourceHelpers::correctMeshPath(model));
                     }
                     catch (const std::exception& e)
                     {
                         Log(Debug::Warning) << "Failed to load cell ref \"" << cellRef.mRefId << "\" model \"" << model
                                             << "\": " << e.what();
-                        return osg::ref_ptr<const Resource::BulletShape>();
+                        return osg::ref_ptr<const Resource::PhysicsShape>();
                     }
                 }();
 
@@ -123,7 +126,7 @@ namespace Resource
                     case ESM::REC_CONT:
                     case ESM::REC_DOOR:
                     case ESM::REC_STAT:
-                        f(BulletObject{ std::move(shape), cellRef.mPos, cellRef.mScale });
+                        f(PhysicsObject{ std::move(shape), cellRef.mPos, cellRef.mScale });
                         break;
                     default:
                         break;
@@ -132,9 +135,9 @@ namespace Resource
         }
     }
 
-    void forEachBulletObject(ESM::ReadersCache& readers, const VFS::Manager& vfs,
-        Resource::BulletShapeManager& bulletShapeManager, const EsmLoader::EsmData& esmData,
-        std::function<void(const ESM::Cell& cell, const BulletObject& object)> callback)
+    void forEachPhysicsObject(ESM::ReadersCache& readers, const VFS::Manager& vfs,
+        Resource::PhysicsShapeManager& physicsShapeManager, const EsmLoader::EsmData& esmData,
+        std::function<void(const ESM::Cell& cell, const PhysicsObject& object)> callback)
     {
         Log(Debug::Info) << "Processing " << esmData.mCells.size() << " cells...";
 
@@ -148,7 +151,7 @@ namespace Resource
 
             std::size_t objects = 0;
 
-            forEachObject(cell, esmData, vfs, bulletShapeManager, readers, [&](const BulletObject& object) {
+            forEachObject(cell, esmData, vfs, physicsShapeManager, readers, [&](const PhysicsObject& object) {
                 callback(cell, object);
                 ++objects;
             });

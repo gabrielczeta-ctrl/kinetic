@@ -76,7 +76,7 @@ namespace Resource
              ++it)
             (*it)->setExpiryDelay(expiryDelay);
 
-        // NIF files aren't needed any more once the converted objects are cached in SceneManager / BulletShapeManager,
+        // NIF files aren't needed any more once the converted objects are cached in SceneManager / PhysicsShapeManager,
         // so no point in using an expiry delay
         mNifFileManager->setExpiryDelay(0.0);
     }

@@ -11,13 +11,14 @@
 #include <osg/Quat>
 #include <osg/Vec3f>
 
-class btCollisionShape;
-class btCollisionWorld;
-class btConvexShape;
-
 namespace Resource
 {
-    struct BulletShape;
+    struct PhysicsShape;
+}
+
+namespace JPH
+{
+    class Body;
 }
 
 namespace MWPhysics
@@ -27,7 +28,7 @@ namespace MWPhysics
     class Actor final : public PtrHolder
     {
     public:
-        Actor(const MWWorld::Ptr& ptr, const Resource::BulletShape* shape, PhysicsTaskScheduler* scheduler,
+        Actor(const MWWorld::Ptr& ptr, const Resource::PhysicsShape* shape, PhysicsTaskScheduler* scheduler,
             bool canWaterWalk, DetourNavigator::CollisionShapeType collisionShapeType);
         ~Actor() override;
 
@@ -41,8 +42,6 @@ namespace MWPhysics
         void enableCollisionMode(bool collision);
 
         bool getCollisionMode() const { return mInternalCollisionMode; }
-
-        btConvexShape* getConvexShape() const { return mConvexShape; }
 
         /**
          * Enables or disables the *external* collision body. If disabled, other actors will not collide with this
@@ -140,22 +139,21 @@ namespace MWPhysics
         const osg::Vec3f& getLastStuckPosition() const { return mLastStuckPosition; }
         void setLastStuckPosition(osg::Vec3f position) { mLastStuckPosition = position; }
 
-        bool canMoveToWaterSurface(float waterlevel, const btCollisionWorld* world) const;
+        bool canMoveToWaterSurface(float waterlevel, const JPH::PhysicsSystem* physicsSystem) const;
+
+        bool isScaleIdentity() const { return mScale == osg::Vec3f(1.0f, 1.0f, 1.0f); }
 
         bool isActive() const { return mActive; }
 
         void setActive(bool value) { mActive = value; }
 
+        JPH::ObjectLayer getCollisionMask() const;
+
         DetourNavigator::CollisionShapeType getCollisionShapeType() const { return mCollisionShapeType; }
 
     private:
         MWWorld::Ptr mStandingOnPtr;
-        /// Removes then re-adds the collision object to the dynamics world
-        void updateCollisionMask();
-        void addCollisionMask(int collisionMask);
-        int getCollisionMask() const;
 
-        /// Returns the mesh translation, scaled and rotated as necessary
         osg::Vec3f getScaledMeshTranslation() const;
 
         bool mCanWaterWalk;
@@ -165,9 +163,10 @@ namespace MWPhysics
 
         DetourNavigator::CollisionShapeType mCollisionShapeType;
 
-        std::unique_ptr<btCollisionShape> mShape;
-        btConvexShape* mConvexShape;
+        JPH::Shape* mPhysicsShape;
+        JPH::Shape* mBasePhysicsShape;
 
+        osg::Vec3f mSimulationPosition;
         osg::Vec3f mMeshTranslation;
         osg::Vec3f mOriginalHalfExtents;
         osg::Vec3f mHalfExtents;
@@ -177,7 +176,8 @@ namespace MWPhysics
         osg::Vec3f mScale;
         osg::Vec3f mPositionOffset;
         bool mSkipSimulation = true;
-        mutable std::mutex mPositionMutex;
+        bool mScaleUpdated = false;
+        mutable std::mutex mMutex;
 
         unsigned int mStuckFrames;
         osg::Vec3f mLastStuckPosition;

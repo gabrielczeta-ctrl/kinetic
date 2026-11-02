@@ -3,12 +3,14 @@
 #include <components/detournavigator/recastmesh.hpp>
 #include <components/detournavigator/recastmeshbuilder.hpp>
 
-#include <BulletCollision/CollisionDispatch/btCollisionObject.h>
-#include <BulletCollision/CollisionShapes/btBoxShape.h>
-#include <BulletCollision/CollisionShapes/btBvhTriangleMeshShape.h>
-#include <BulletCollision/CollisionShapes/btCompoundShape.h>
-#include <BulletCollision/CollisionShapes/btHeightfieldTerrainShape.h>
-#include <BulletCollision/CollisionShapes/btTriangleMesh.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Body/Body.h>
+#include <Jolt/Physics/Body/BodyInterface.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
+#include <Jolt/Physics/Collision/Shape/MutableCompoundShape.h>
+#include <Jolt/Physics/Collision/Shape/ScaledShape.h>
+#include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 
 #include <DetourCommon.h>
 
@@ -52,7 +54,7 @@ namespace
     {
         TileBounds mBounds;
         const Version mVersion{ 0, 0 };
-        const osg::ref_ptr<const Resource::BulletShape> mSource{ nullptr };
+        const osg::ref_ptr<const Resource::PhysicsShape> mSource{ nullptr };
         const ObjectTransform mObjectTransform{ ESM::Position{ { 0, 0, 0 }, { 0, 0, 0 } }, 0.0f };
 
         DetourNavigatorRecastMeshBuilderTest()
@@ -75,13 +77,18 @@ namespace
 
     TEST_F(DetourNavigatorRecastMeshBuilderTest, add_bhv_triangle_mesh_shape)
     {
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        btBvhTriangleMeshShape shape(&mesh, true);
+        JPH::MeshShapeSettings settings;
+        settings.SetEmbedded();
+        settings.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settings.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settings.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settings.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        const auto shape = settings.Create().Get();
 
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape), btTransform::getIdentity(), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(static_cast<const JPH::Shape&>(*shape), osg::Matrixd::identity(), AreaType_ground, mSource,
+            mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
@@ -96,13 +103,21 @@ namespace
 
     TEST_F(DetourNavigatorRecastMeshBuilderTest, add_transformed_bhv_triangle_mesh_shape)
     {
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        btBvhTriangleMeshShape shape(&mesh, true);
+        JPH::MeshShapeSettings settings;
+        settings.SetEmbedded();
+        settings.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settings.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settings.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settings.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        const auto shape = settings.Create().Get();
+
+        osg::Matrixd transform
+            = osg::Matrixd::scale(osg::Vec3f(1, 2, 3)) * osg::Matrixd::translate(osg::Vec3f(1, 2, 3));
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape),
-            btTransform(btMatrix3x3::getIdentity().scaled(btVector3(1, 2, 3)), btVector3(1, 2, 3)), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(
+            static_cast<const JPH::Shape&>(*shape), transform, AreaType_ground, mSource, mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
@@ -115,33 +130,61 @@ namespace
         EXPECT_EQ(recastMesh->getMesh().getAreaTypes(), std::vector<AreaType>({ AreaType_ground }));
     }
 
-    TEST_F(DetourNavigatorRecastMeshBuilderTest, add_heightfield_terrian_shape)
+    TEST_F(DetourNavigatorRecastMeshBuilderTest, add_heightfield_terrain_shape)
     {
-        const std::array<btScalar, 4> heightfieldData{ { 0, 0, 0, 0 } };
-        btHeightfieldTerrainShape shape(2, 2, heightfieldData.data(), 1, 0, 0, 2, PHY_FLOAT, false);
+        // NOTE: this is the smallest Jolt heightfield we can create
+        const std::array<float, 16> heightfieldData{ { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+
+        JPH::Vec3 terrainOffset(-1.5f, 0.0f, -1.5f);
+        JPH::Vec3 terrainScale = JPH::Vec3::sReplicate(1.0f);
+        JPH::HeightFieldShapeSettings shapeSettings(heightfieldData.data(), terrainOffset, terrainScale, 4);
+        shapeSettings.mBlockSize = 2;
+
+        auto createdRes = shapeSettings.Create();
+        EXPECT_FALSE(createdRes.HasError());
+        JPH::ShapeRefC shape = createdRes.Get();
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape), btTransform::getIdentity(), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(static_cast<const JPH::Shape&>(*shape), osg::Matrixd::identity(), AreaType_ground, mSource,
+            mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
-        EXPECT_EQ(recastMesh->getMesh().getVertices(),
-            std::vector<float>({
-                -0.5, -0.5, 0, // vertex 0
-                -0.5, 0.5, 0, // vertex 1
-                0.5, -0.5, 0, // vertex 2
-                0.5, 0.5, 0, // vertex 3
-            }))
+
+        EXPECT_THAT(recastMesh->getMesh().getVertices(),
+            Pointwise(FloatNear(1e-5f), std::vector<float>({
+                -1.5, 0.0, -1.5, // vertex 0
+                -1.5, 0.0, -0.5, // vertex 1
+                -1.5, 0.0, 0.5, // vertex 2
+                -1.5, 0.0, 1.5, // vertex 3
+                -0.5, 0.0, -1.5, // vertex 4
+                -0.5, 0.0, -0.5, // vertex 5
+                -0.5, 0.0, 0.5, // vertex 6
+                -0.5, 0.0, 1.5, // vertex 7
+                0.5, 0.0, -1.5, // vertex 8
+                0.5, 0.0, -0.5, // vertex 9
+                0.5, 0.0, 0.5, // vertex 10
+                0.5, 0.0, 1.5, // vertex 11
+                1.5, 0.0, -1.5, // vertex 12
+                1.5, 0.0, -0.5, // vertex 13
+                1.5, 0.0, 0.5, // vertex 14
+                1.5, 0.0, 1.5, // vertex 15
+            })))
             << recastMesh->getMesh().getVertices();
-        EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 0, 1, 2, 2, 1, 3 }));
-        EXPECT_EQ(recastMesh->getMesh().getAreaTypes(), std::vector<AreaType>({ AreaType_ground, AreaType_ground }));
+        EXPECT_EQ(recastMesh->getMesh().getIndices(),
+            std::vector<int>({ 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7, 6, 4, 5, 9, 4, 9, 8, 5, 6, 10, 5, 10,
+                9, 6, 7, 11, 6, 11, 10, 8, 9, 13, 8, 13, 12, 9, 10, 14, 9, 14, 13, 10, 11, 15, 10, 15, 14 }));
+        EXPECT_EQ(recastMesh->getMesh().getAreaTypes(), std::vector<AreaType>(18, AreaType_ground));
     }
 
     TEST_F(DetourNavigatorRecastMeshBuilderTest, add_box_shape_should_produce_12_triangles)
     {
-        btBoxShape shape(btVector3(1, 1, 2));
+        JPH::BoxShape shape(JPH::Vec3(1, 1, 2));
+        shape.SetEmbedded();
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape), btTransform::getIdentity(), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(static_cast<const JPH::Shape&>(shape), osg::Matrixd::identity(), AreaType_ground, mSource,
+            mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
+
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
                 -1, -1, -2, // vertex 0
@@ -156,18 +199,18 @@ namespace
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(),
             std::vector<int>({
-                0, 1, 5, // triangle 0
-                0, 2, 3, // triangle 1
-                0, 4, 6, // triangle 2
-                1, 3, 7, // triangle 3
-                2, 6, 7, // triangle 4
-                3, 1, 0, // triangle 5
-                4, 5, 7, // triangle 6
+                0, 4, 2, // triangle 0
+                1, 0, 2, // triangle 1
+                1, 5, 0, // triangle 2
+                3, 1, 2, // triangle 3
+                4, 5, 7, // triangle 4
+                4, 6, 2, // triangle 5
+                5, 1, 3, // triangle 6
                 5, 4, 0, // triangle 7
-                6, 2, 0, // triangle 8
-                7, 3, 2, // triangle 9
-                7, 5, 1, // triangle 10
-                7, 6, 4, // triangle 11
+                6, 4, 7, // triangle 8
+                6, 7, 2, // triangle 9
+                7, 3, 2, // triangle 10
+                7, 5, 3, // triangle 11
             }))
             << recastMesh->getMesh().getIndices();
         EXPECT_EQ(recastMesh->getMesh().getAreaTypes(), std::vector<AreaType>(12, AreaType_ground));
@@ -175,21 +218,38 @@ namespace
 
     TEST_F(DetourNavigatorRecastMeshBuilderTest, add_compound_shape)
     {
-        btTriangleMesh mesh1;
-        mesh1.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        btBvhTriangleMeshShape triangle1(&mesh1, true);
-        btBoxShape box(btVector3(1, 1, 2));
-        btTriangleMesh mesh2;
-        mesh2.addTriangle(btVector3(1, 1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        btBvhTriangleMeshShape triangle2(&mesh2, true);
-        btCompoundShape shape;
-        shape.addChildShape(btTransform::getIdentity(), &triangle1);
-        shape.addChildShape(btTransform::getIdentity(), &box);
-        shape.addChildShape(btTransform::getIdentity(), &triangle2);
+        JPH::BoxShape box(JPH::Vec3(1, 1, 2));
+        box.SetEmbedded();
+
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        JPH::MeshShapeSettings settingsTri2;
+        settingsTri2.SetEmbedded();
+        settingsTri2.mTriangleVertices.push_back(JPH::Float3(1, 1, 0));
+        settingsTri2.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri2.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri2.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        const auto triangle1 = settingsTri1.Create().Get();
+        const auto triangle2 = settingsTri2.Create().Get();
+
+        JPH::StaticCompoundShapeSettings compoundSettings;
+        compoundSettings.SetEmbedded();
+        compoundSettings.AddShape(JPH::Vec3(0, 0, 0), JPH::Quat::sIdentity(), triangle1);
+        compoundSettings.AddShape(JPH::Vec3(0, 0, 0), JPH::Quat::sIdentity(), &box);
+        compoundSettings.AddShape(JPH::Vec3(0, 0, 0), JPH::Quat::sIdentity(), triangle2);
+        const auto shape = compoundSettings.Create().Get();
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape), btTransform::getIdentity(), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(static_cast<const JPH::Shape&>(*shape), osg::Matrixd::identity(), AreaType_ground, mSource,
+            mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
+
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
                 -1, -1, -2, // vertex 0
@@ -208,20 +268,20 @@ namespace
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(),
             std::vector<int>({
-                0, 2, 8, // triangle 0
-                0, 3, 5, // triangle 1
-                0, 6, 9, // triangle 2
-                2, 5, 11, // triangle 3
-                3, 9, 11, // triangle 4
-                5, 2, 0, // triangle 5
-                6, 8, 11, // triangle 6
-                7, 4, 1, // triangle 7
-                7, 4, 10, // triangle 8
+                0, 6, 3, // triangle 0
+                2, 0, 3, // triangle 1
+                2, 8, 0, // triangle 2
+                5, 2, 3, // triangle 3
+                6, 8, 11, // triangle 4
+                6, 9, 3, // triangle 5
+                7, 4, 1, // triangle 6
+                7, 4, 10, // triangle 7
+                8, 2, 5, // triangle 8
                 8, 6, 0, // triangle 9
-                9, 3, 0, // triangle 10
-                11, 5, 3, // triangle 11
-                11, 8, 2, // triangle 12
-                11, 9, 6, // triangle 13
+                9, 6, 11, // triangle 10
+                9, 11, 3, // triangle 11
+                11, 5, 3, // triangle 12
+                11, 8, 5, // triangle 13
             }))
             << recastMesh->getMesh().getIndices();
         EXPECT_EQ(recastMesh->getMesh().getAreaTypes(), std::vector<AreaType>(14, AreaType_ground));
@@ -229,15 +289,25 @@ namespace
 
     TEST_F(DetourNavigatorRecastMeshBuilderTest, add_transformed_compound_shape)
     {
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        btBvhTriangleMeshShape triangle(&mesh, true);
-        btCompoundShape shape;
-        shape.addChildShape(btTransform::getIdentity(), &triangle);
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        const auto triangle1 = settingsTri1.Create().Get();
+
+        JPH::StaticCompoundShapeSettings compoundSettings;
+        compoundSettings.SetEmbedded();
+        compoundSettings.AddShape(JPH::Vec3(0, 0, 0), JPH::Quat::sIdentity(), triangle1);
+        const auto shape = compoundSettings.Create().Get();
+
+        osg::Matrixd transform
+            = osg::Matrixd::scale(osg::Vec3f(1, 2, 3)) * osg::Matrixd::translate(osg::Vec3f(1, 2, 3));
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape),
-            btTransform(btMatrix3x3::getIdentity().scaled(btVector3(1, 2, 3)), btVector3(1, 2, 3)), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(
+            static_cast<const JPH::Shape&>(*shape), transform, AreaType_ground, mSource, mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
@@ -252,16 +322,27 @@ namespace
 
     TEST_F(DetourNavigatorRecastMeshBuilderTest, add_transformed_compound_shape_with_transformed_bhv_triangle_shape)
     {
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        btBvhTriangleMeshShape triangle(&mesh, true);
-        btCompoundShape shape;
-        shape.addChildShape(
-            btTransform(btMatrix3x3::getIdentity().scaled(btVector3(1, 2, 3)), btVector3(1, 2, 3)), &triangle);
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        const auto triangle1 = settingsTri1.Create().Get();
+
+        JPH::StaticCompoundShapeSettings compoundSettings;
+        compoundSettings.SetEmbedded();
+        compoundSettings.AddShape(
+            JPH::Vec3(1, 2, 3), JPH::Quat::sIdentity(), new JPH::ScaledShape(triangle1, JPH::Vec3(1, 2, 3)));
+        const auto shape = compoundSettings.Create().Get();
+
+        osg::Matrixd transform
+            = osg::Matrixd::scale(osg::Vec3f(1, 2, 3)) * osg::Matrixd::translate(osg::Vec3f(1, 2, 3));
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape),
-            btTransform(btMatrix3x3::getIdentity().scaled(btVector3(1, 2, 3)), btVector3(1, 2, 3)), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(
+            static_cast<const JPH::Shape&>(*shape), transform, AreaType_ground, mSource, mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
@@ -276,22 +357,34 @@ namespace
 
     TEST_F(DetourNavigatorRecastMeshBuilderTest, without_bounds_add_bhv_triangle_shape_should_not_filter_by_bounds)
     {
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        mesh.addTriangle(btVector3(-3, -3, 0), btVector3(-3, -2, 0), btVector3(-2, -3, 0));
-        btBvhTriangleMeshShape shape(&mesh, true);
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-3, -3, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-3, -2, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-2, -3, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(3, 4, 5));
+
+        const auto shape = settingsTri1.Create().Get();
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape), btTransform::getIdentity(), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(static_cast<const JPH::Shape&>(*shape), osg::Matrixd::identity(), AreaType_ground, mSource,
+            mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
+
+        // NOTE: jolt mesh shape triangle walk causes this inprecision
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
                 -3, -3, 0, // vertex 0
-                -3, -2, 0, // vertex 1
-                -2, -3, 0, // vertex 2
-                -1, -1, 0, // vertex 3
-                -1, 1, 0, // vertex 4
-                1, -1, 0, // vertex 5
+                -3, -1.999999523162841796875, 0, // vertex 1
+                -1.999999523162841796875, -3, 0, // vertex 2
+                -0.99999904632568359375, -0.99999904632568359375, 0, // vertex 3
+                -0.99999904632568359375, 1, 0, // vertex 4
+                1, -0.99999904632568359375, 0, // vertex 5
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0, 5, 4, 3 }));
@@ -302,19 +395,32 @@ namespace
     {
         mBounds.mMin = osg::Vec2f(-3, -3);
         mBounds.mMax = osg::Vec2f(-2, -2);
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        mesh.addTriangle(btVector3(-3, -3, 0), btVector3(-3, -2, 0), btVector3(-2, -3, 0));
-        btBvhTriangleMeshShape shape(&mesh, true);
+
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-3, -3, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-3, -2, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-2, -3, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(3, 4, 5));
+
+        const auto shape = settingsTri1.Create().Get();
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape), btTransform::getIdentity(), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(static_cast<const JPH::Shape&>(*shape), osg::Matrixd::identity(), AreaType_ground, mSource,
+            mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
+
+        // NOTE: jolt mesh shape triangle walk causes this inprecision
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
                 -3, -3, 0, // vertex 0
-                -3, -2, 0, // vertex 1
-                -2, -3, 0, // vertex 2
+                -3, -1.999999523162841796875, 0, // vertex 1
+                -1.999999523162841796875, -3, 0, // vertex 2
             }))
             << recastMesh->getMesh().getVertices();
         EXPECT_EQ(recastMesh->getMesh().getIndices(), std::vector<int>({ 2, 1, 0 }));
@@ -326,14 +432,25 @@ namespace
     {
         mBounds.mMin = osg::Vec2f(-5, -5);
         mBounds.mMax = osg::Vec2f(5, -2);
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(0, -1, -1), btVector3(0, -1, -1), btVector3(0, 1, -1));
-        mesh.addTriangle(btVector3(0, -3, -3), btVector3(0, -3, -2), btVector3(0, -2, -3));
-        btBvhTriangleMeshShape shape(&mesh, true);
+
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(0, -1, -1));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(0, -1, 1));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(0, 1, -1));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(0, -3, -3));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(0, -3, -2));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(0, -2, -3));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(3, 4, 5));
+
+        const auto shape = settingsTri1.Create().Get();
+        osg::Matrixd transform = osg::Matrixd::rotate(osg::Quat(static_cast<float>(-osg::PI_4), osg::Vec3f(1, 0, 0)));
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape),
-            btTransform(btQuaternion(btVector3(1, 0, 0), static_cast<btScalar>(-osg::PI_4))), AreaType_ground, mSource,
-            mObjectTransform);
+        builder.addObject(
+            static_cast<const JPH::Shape&>(*shape), transform, AreaType_ground, mSource, mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_THAT(recastMesh->getMesh().getVertices(),
             Pointwise(FloatNear(1e-5f),
@@ -352,14 +469,25 @@ namespace
     {
         mBounds.mMin = osg::Vec2f(-5, -5);
         mBounds.mMax = osg::Vec2f(-3, 5);
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(-1, 0, -1), btVector3(-1, 0, 1), btVector3(1, 0, -1));
-        mesh.addTriangle(btVector3(-3, 0, -3), btVector3(-3, 0, -2), btVector3(-2, 0, -3));
-        btBvhTriangleMeshShape shape(&mesh, true);
+
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 0, -1));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 0, 1));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, 0, -1));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-3, 0, -3));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-3, 0, -2));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-2, 0, -3));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(3, 4, 5));
+
+        const auto shape = settingsTri1.Create().Get();
+        osg::Matrixd transform = osg::Matrixd::rotate(osg::Quat(static_cast<float>(osg::PI_4), osg::Vec3f(0, 1, 0)));
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape),
-            btTransform(btQuaternion(btVector3(0, 1, 0), static_cast<btScalar>(osg::PI_4))), AreaType_ground, mSource,
-            mObjectTransform);
+        builder.addObject(
+            static_cast<const JPH::Shape&>(*shape), transform, AreaType_ground, mSource, mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_THAT(recastMesh->getMesh().getVertices(),
             Pointwise(FloatNear(1e-5f),
@@ -378,14 +506,25 @@ namespace
     {
         mBounds.mMin = osg::Vec2f(-5, -5);
         mBounds.mMax = osg::Vec2f(-1, -1);
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        mesh.addTriangle(btVector3(-3, -3, 0), btVector3(-3, -2, 0), btVector3(-2, -3, 0));
-        btBvhTriangleMeshShape shape(&mesh, true);
+
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-3, -3, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-3, -2, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-2, -3, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(3, 4, 5));
+
+        const auto shape = settingsTri1.Create().Get();
+        osg::Matrixd transform = osg::Matrixd::rotate(osg::Quat(static_cast<float>(osg::PI_4), osg::Vec3f(0, 0, 1)));
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape),
-            btTransform(btQuaternion(btVector3(0, 0, 1), static_cast<btScalar>(osg::PI_4))), AreaType_ground, mSource,
-            mObjectTransform);
+        builder.addObject(
+            static_cast<const JPH::Shape&>(*shape), transform, AreaType_ground, mSource, mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_THAT(recastMesh->getMesh().getVertices(),
             Pointwise(FloatNear(1e-5f),
@@ -401,17 +540,27 @@ namespace
 
     TEST_F(DetourNavigatorRecastMeshBuilderTest, flags_values_should_be_corresponding_to_added_objects)
     {
-        btTriangleMesh mesh1;
-        mesh1.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        btBvhTriangleMeshShape shape1(&mesh1, true);
-        btTriangleMesh mesh2;
-        mesh2.addTriangle(btVector3(-3, -3, 0), btVector3(-3, -2, 0), btVector3(-2, -3, 0));
-        btBvhTriangleMeshShape shape2(&mesh2, true);
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        JPH::MeshShapeSettings settingsTri2;
+        settingsTri2.mTriangleVertices.push_back(JPH::Float3(-3, -3, 0));
+        settingsTri2.mTriangleVertices.push_back(JPH::Float3(-3, -2, 0));
+        settingsTri2.mTriangleVertices.push_back(JPH::Float3(-2, -3, 0));
+        settingsTri2.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        const auto shape1 = settingsTri1.Create().Get();
+        const auto shape2 = settingsTri2.Create().Get();
+
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape1), btTransform::getIdentity(), AreaType_ground,
-            mSource, mObjectTransform);
-        builder.addObject(static_cast<const btCollisionShape&>(shape2), btTransform::getIdentity(), AreaType_null,
-            mSource, mObjectTransform);
+        builder.addObject(static_cast<const JPH::Shape&>(*shape1), osg::Matrixd::identity(), AreaType_ground, mSource,
+            mObjectTransform);
+        builder.addObject(static_cast<const JPH::Shape&>(*shape2), osg::Matrixd::identity(), AreaType_null, mSource,
+            mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({
@@ -438,14 +587,23 @@ namespace
 
     TEST_F(DetourNavigatorRecastMeshBuilderTest, add_bhv_triangle_mesh_shape_with_duplicated_vertices)
     {
-        btTriangleMesh mesh;
-        mesh.addTriangle(btVector3(-1, -1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        mesh.addTriangle(btVector3(1, 1, 0), btVector3(-1, 1, 0), btVector3(1, -1, 0));
-        btBvhTriangleMeshShape shape(&mesh, true);
+        JPH::MeshShapeSettings settingsTri1;
+        settingsTri1.SetEmbedded();
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, -1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(0, 1, 2));
+
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(-1, 1, 0));
+        settingsTri1.mTriangleVertices.push_back(JPH::Float3(1, -1, 0));
+        settingsTri1.mIndexedTriangles.push_back(JPH::IndexedTriangle(3, 4, 5));
+
+        const auto shape = settingsTri1.Create().Get();
 
         RecastMeshBuilder builder(mBounds);
-        builder.addObject(static_cast<const btCollisionShape&>(shape), btTransform::getIdentity(), AreaType_ground,
-            mSource, mObjectTransform);
+        builder.addObject(static_cast<const JPH::Shape&>(*shape), osg::Matrixd::identity(), AreaType_ground, mSource,
+            mObjectTransform);
         const auto recastMesh = std::move(builder).create(mVersion);
         EXPECT_EQ(recastMesh->getMesh().getVertices(),
             std::vector<float>({

@@ -1,12 +1,12 @@
 #include "stepper.hpp"
 
-#include <BulletCollision/CollisionDispatch/btCollisionObject.h>
-#include <BulletCollision/CollisionDispatch/btCollisionWorld.h>
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/PhysicsSystem.h>
 
 #include <components/misc/constants.hpp>
 
-#include "collisiontype.hpp"
 #include "constants.hpp"
+#include "joltlayers.hpp"
 #include "movementsolver.hpp"
 
 namespace MWPhysics
@@ -19,17 +19,17 @@ namespace MWPhysics
         if (stepper.mPlaneNormal.z() <= sMaxSlopeCos)
             return false;
 
-        return stepper.mHitObject->getBroadphaseHandle()->m_collisionFilterGroup != CollisionType_Actor;
+        return stepper.mHitObjectLayer != Layers::ACTOR;
     }
 
-    Stepper::Stepper(const btCollisionWorld* colWorld, const btCollisionObject* colObj)
+    Stepper::Stepper(const JPH::PhysicsSystem* colWorld, JPH::BodyID colObj)
         : mColWorld(colWorld)
         , mColObj(colObj)
     {
     }
 
-    bool Stepper::step(
-        osg::Vec3f& position, osg::Vec3f& velocity, float& remainingTime, const bool& onGround, bool firstIteration)
+    bool Stepper::step(osg::Vec3f& position, osg::Vec3f& velocity, float& remainingTime, const bool& onGround,
+        bool firstIteration, const int collisionMask)
     {
         if (velocity.x() == 0.0 && velocity.y() == 0.0)
             return false;
@@ -37,9 +37,8 @@ namespace MWPhysics
         // Stairstepping algorithms work by moving up to avoid the step, moving forwards, then moving back down onto the
         // ground. This algorithm has a couple of minor problems, but they don't cause problems for sane geometry, and
         // just prevent stepping on insane geometry.
-
-        mUpStepper.doTrace(
-            mColObj, position, position + osg::Vec3f(0.0f, 0.0f, Constants::sStepSizeUp), mColWorld, onGround);
+        mUpStepper.doTrace(mColObj, position, position + osg::Vec3f(0.0f, 0.0f, Constants::sStepSizeUp), mColWorld,
+            collisionMask, onGround);
 
         float upDistance = 0;
         if (!mUpStepper.mHitObject)
@@ -91,7 +90,7 @@ namespace MWPhysics
                 tracerDest = tracerPos + normalMove * sMinStep2;
             }
 
-            mTracer.doTrace(mColObj, tracerPos, tracerDest, mColWorld);
+            mTracer.doTrace(mColObj, tracerPos, tracerDest, mColWorld, collisionMask);
             if (mTracer.mHitObject)
             {
                 // map against what we hit, minus the safety margin
@@ -108,7 +107,7 @@ namespace MWPhysics
                 auto tempDest = tracerDest + mTracer.mPlaneNormal * sCollisionMargin * 2;
 
                 ActorTracer tempTracer;
-                tempTracer.doTrace(mColObj, tracerDest, tempDest, mColWorld);
+                tempTracer.doTrace(mColObj, tracerDest, tempDest, mColWorld, collisionMask);
 
                 if (tempTracer.mFraction > 0.5f) // distance to any object is greater than sCollisionMargin (we checked
                                                  // sCollisionMargin*2 distance)
@@ -122,8 +121,8 @@ namespace MWPhysics
                 downStepSize = upDistance;
             else
                 downStepSize = moveDistance + upDistance + sStepSizeDown;
-            mDownStepper.doTrace(
-                mColObj, tracerDest, tracerDest + osg::Vec3f(0.0f, 0.0f, -downStepSize), mColWorld, onGround);
+            mDownStepper.doTrace(mColObj, tracerDest, tracerDest + osg::Vec3f(0.0f, 0.0f, -downStepSize), mColWorld,
+                collisionMask, onGround);
 
             // can't step down onto air, non-walkable-slopes, or actors
             // NOTE: using a capsule causes isWalkableSlope (used in canStepDown) to fail on certain geometry that were

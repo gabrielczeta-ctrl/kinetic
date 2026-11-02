@@ -3,48 +3,47 @@
 set_directory_properties(PROPERTIES EXCLUDE_FROM_ALL on)
 set(CMAKE_CXX_CLANG_TIDY "")
 
-if(NOT OPENMW_USE_SYSTEM_BULLET)
-
-    set(BUILD_BULLET3 OFF CACHE BOOL "")
-    set(BUILD_EXTRAS OFF CACHE BOOL "")
-    set(BUILD_OPENGL3_DEMOS OFF CACHE BOOL "")
-    set(BUILD_UNIT_TESTS OFF CACHE BOOL "")
-    set(BUILD_BULLET2_DEMOS OFF CACHE BOOL "")
-    set(BUILD_CLSOCKET OFF CACHE BOOL "")
-    set(BUILD_ENET OFF CACHE BOOL "")
-    set(BUILD_CPU_DEMOS OFF CACHE BOOL "")
-    set(BUILD_EGL OFF CACHE BOOL "")
-
-    set(USE_DOUBLE_PRECISION ON CACHE BOOL "")
-    set(BULLET2_MULTITHREADING ON CACHE BOOL "")
-
-    if(BULLET_STATIC)
-        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    else()
-        set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
-    endif()
-
+if(NOT OPENMW_USE_SYSTEM_JOLT)
     if(MSVC)
-        # this setting is badly named - having it off forces the static runtime library,
-        # but having it on does nothing, letting the defaults get used.
-        # OpenMW uses the defaults, and you can't mix and match.
-        set(USE_MSVC_RUNTIME_LIBRARY_DLL ON CACHE BOOL "" FORCE)
+        # Keep Jolt runtime selection aligned with OpenMW (/MD on CI/MSVC).
+        # Jolt defaults this to ON, which causes /MT vs /MD linker mismatches.
+        set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
     endif()
 
-    # May 7, 2021
+    set(JPH_DEBUG_RENDERER ON CACHE BOOL "")
+    set(JPH_PROFILE_ENABLED OFF CACHE BOOL "")
+    add_definitions(-DJPH_DEBUG_RENDERER=1)
+
+    # Turn RTTI on for Jolt
+    set(CPP_RTTI_ENABLED ON)
+
+    # When turning this option on, the library will be compiled using doubles for positions. This allows for much bigger worlds.
+    set(DOUBLE_PRECISION ON)
+
+    # When turning this option on, the library will be compiled in such a way to attempt to keep the simulation deterministic across platforms
+    set(CROSS_PLATFORM_DETERMINISTIC OFF)
+
+    # When turning this option on, the library will be compiled with interprocedural optimizations enabled, also known as link-time optimizations or link-time code generation.
+    # Note that if you turn this on you need to use SET_INTERPROCEDURAL_OPTIMIZATION() or set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON) to enable LTO specificly for your own project as well.
+    # If you don't do this you may get an error: /usr/bin/ld: libJolt.a: error adding symbols: file format not recognized
+    set(INTERPROCEDURAL_OPTIMIZATION OFF)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+
+    # When turning this on, in Debug and Release mode, the library will emit extra code to ensure that the 4th component of a 3-vector is kept the same as the 3rd component
+    # and will enable floating point exceptions during simulation to detect divisions by zero.
+    set(FLOATING_POINT_EXCEPTIONS_ENABLED OFF)
+
     include(FetchContent)
-    FetchContent_Declare(bullet
-        URL https://github.com/bulletphysics/bullet3/archive/refs/tags/3.17.tar.gz
-        URL_HASH SHA512=a5105bf5f1dd365a64a350755c7d2c97942f74897a18dcdb3651e6732fd55cc1030a096f5808cf50575281f05e3ac09aa50a48d271a47b94cd61f5167a72b7cc
-        SOURCE_DIR fetched/bullet
+    FetchContent_Declare(joltphysics
+        URL https://github.com/jrouwe/JoltPhysics/archive/refs/tags/v5.5.0.zip
+        URL_HASH SHA512=52d6013a9bd38f31e73a308b8a5355df8a59d53d28a7823699d090f8e632ac0af58f1f7ecce342927cbe269b0aeae0656ea57f876a8e8f489024211bb52196a4
+        SOURCE_DIR fetched/joltphysics
+        SOURCE_SUBDIR Build
     )
-    FetchContent_MakeAvailable(bullet)
+    FetchContent_MakeAvailable(joltphysics)
 
-    set(BULLET_INCLUDE_DIRS ${bullet_SOURCE_DIR}/src PARENT_SCOPE)
-
-    # The order here is important to work around a bug in Bullet:
-    # https://github.com/bulletphysics/bullet3/issues/3233
-    set(BULLET_LIBRARIES BulletCollision LinearMath PARENT_SCOPE)
+    set(JOLT_INCLUDE_DIRS ${joltphysics_SOURCE_DIR} PARENT_SCOPE)
+    set(JOLT_LIBRARIES Jolt PARENT_SCOPE)
 endif()
 
 if(NOT OPENMW_USE_SYSTEM_MYGUI)
