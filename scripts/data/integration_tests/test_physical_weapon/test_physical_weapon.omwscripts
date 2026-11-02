@@ -1,0 +1,4 @@
+MENU: menu.lua
+GLOBAL: global.lua
+PLAYER: player.lua
+NPC,CREATURE,PLAYER: scripts/omw/combat/local.lua

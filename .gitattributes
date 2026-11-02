@@ -1,0 +1,22 @@
+# Tracker artifacts are byte-hashed. Keep their checkout representation stable
+# across Windows worktrees so a clean checkout cannot invalidate evidence.
+docs/ragdoll/evidence/*.json text eol=lf
+docs/ragdoll/evidence/raw/*.json text eol=lf
+# These inventories bind original producer bytes, including Windows line endings.
+# Do not normalize their nested raw logs, manifests or result files in Git.
+docs/ragdoll/evidence/raw/PLAY-04-guided-20260922-final-pose/** -text
+docs/ragdoll/evidence/raw/PLAY-04-guided-20260922-morning/** -text
+docs/ragdoll/evidence/raw/PLAY-04-manual-observation-20260922/** -text
+docs/ragdoll/updates/**/*.json text eol=lf
+docs/ragdoll/research/*.yaml text eol=lf
+docs/ragdoll/tracker.generated.json text eol=lf
+docs/ragdoll/tracker.yaml text eol=lf
+docs/ragdoll/TRACKER.md text eol=lf
+docs/ragdoll/tracker.html text eol=lf
+files/data/ragdoll/calibration/* text eol=lf
+
+docs/ragdoll/evidence/raw/PLAY-04-bookmark-notes-20260922/** -text
+
+docs/ragdoll/evidence/raw/PLAY-04-user-bookmarks-20260922/** -text
+# Shell scripts run under Git bash: LF only.
+tools/**/*.sh text eol=lf

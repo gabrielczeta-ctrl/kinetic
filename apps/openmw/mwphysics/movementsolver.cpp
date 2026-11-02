@@ -32,10 +32,9 @@
 
 namespace MWPhysics
 {
-    static bool isActor(const JPH::Body* obj)
+    static bool isActor(JPH::ObjectLayer layer)
     {
-        assert(obj);
-        return obj->GetObjectLayer() == Layers::ACTOR;
+        return layer == Layers::ACTOR;
     }
 
     namespace
@@ -265,7 +264,7 @@ namespace MWPhysics
             osg::Vec3f oldPosition = newPosition;
             bool usedStepLogic = false;
 
-            if (!isActor(tracer.mHitObject))
+            if (!isActor(tracer.mHitObjectLayer))
             {
                 if (hitHeight < Constants::sStepSizeUp)
                 {
@@ -275,9 +274,10 @@ namespace MWPhysics
                         newPosition, velocity, remainingTime, seenGround, iterations == 0, collisionMask);
                 }
 
-                if (tracer.mHitObject->GetObjectLayer() != Layers::WATER)
+                if (tracer.mHitObjectLayer != Layers::WATER)
                 {
-                    Object* hitObject = Misc::Convert::toPointerFromUserData<Object>(tracer.mHitObject->GetUserData());
+                    Object* hitObject
+                        = Misc::Convert::toPointerFromUserData<Object>(tracer.mHitObjectUserData);
                     if (hitObject != nullptr)
                     {
                         hitObject->addCollision(
@@ -410,13 +410,13 @@ namespace MWPhysics
             tracer.doTrace(actor.mPhysicsBody, newPosition, to, physicsSystem, collisionMask, actor.mIsOnGround);
             if (tracer.mFraction < 1.0f)
             {
-                if (!isActor(tracer.mHitObject))
+                if (!isActor(tracer.mHitObjectLayer))
                 {
                     isOnGround = true;
                     isOnSlope = !isWalkableSlope(tracer.mPlaneNormal);
-                    actor.mStandingOn = tracer.mHitObject->GetID();
+                    actor.mStandingOn = tracer.mHitObject;
 
-                    if (tracer.mHitObject->GetObjectLayer() == Layers::WATER)
+                    if (tracer.mHitObjectLayer == Layers::WATER)
                         actor.mWalkingOnWater = true;
                     if (!actor.mFlying && !isOnSlope)
                     {

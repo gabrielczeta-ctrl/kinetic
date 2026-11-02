@@ -11,6 +11,21 @@ namespace
     using namespace testing;
     using namespace Shader;
 
+    TEST(ShaderDefaultDefinesTest, supportsDebugShadersBeforeLightManagerInitialization)
+    {
+        ShaderManager manager;
+        const ShaderManager::DefineMap defines = manager.getGlobalDefines();
+        const auto maxLights = defines.find("maxLights");
+        const auto lightingMethod = defines.find("lightingMethodClustered");
+        const auto simpleLighting = defines.find("simpleLighting");
+        ASSERT_NE(maxLights, defines.end());
+        ASSERT_NE(lightingMethod, defines.end());
+        ASSERT_NE(simpleLighting, defines.end());
+        EXPECT_EQ(maxLights->second, "8");
+        EXPECT_EQ(lightingMethod->second, "0");
+        EXPECT_EQ(simpleLighting->second, "0");
+    }
+
     struct ShaderManagerTest : Test
     {
         ShaderManager mManager;

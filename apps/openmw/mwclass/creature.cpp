@@ -325,7 +325,13 @@ namespace MWClass
                 attack = weapon.get<ESM::Weapon>()->mBase->mData.mThrust.data();
             if (attack)
             {
-                damage = attack[0] + ((attack[1] - attack[0]) * attackStrength);
+                // Damage follows the momentum actually delivered rather than
+                // attack strength alone, so the weapon's maximum damage
+                // corresponds to its maximum possible momentum. A slow swing
+                // still carries the weapon's mass, so it lands above the
+                // minimum rather than at it.
+                damage = attack[0]
+                    + ((attack[1] - attack[0]) * MWMechanics::meleeImpactMomentumFraction(weapon, attackStrength));
                 MWMechanics::adjustWeaponDamage(damage, weapon, ptr);
                 MWMechanics::reduceWeaponCondition(damage, true, weapon, ptr);
                 MWMechanics::resistNormalWeapon(victim, ptr, weapon, damage);
@@ -341,13 +347,18 @@ namespace MWClass
 
         MWMechanics::applyElementalShields(ptr, victim);
 
-        if (MWMechanics::blockMeleeAttack(ptr, victim, weapon, damage, attackStrength))
+        const bool blocked = MWMechanics::blockMeleeAttack(ptr, victim, weapon, damage, attackStrength);
+        if (blocked)
             damage = 0;
 
         MWMechanics::diseaseContact(victim, ptr);
 
         MWBase::Environment::get().getLuaManager()->onHit(ptr, victim, weapon, MWWorld::Ptr(), type, attackStrength,
             attackWindUp, damage, healthdmg, hitPosition, true, MWMechanics::DamageSourceType::Melee);
+
+        // Creature attacks push a ragdolled victim at the hit point, natural
+        // or armed; the weapon's mass scales it.
+        MWMechanics::applyMeleeRagdollImpulse(ptr, victim, weapon, hitPosition, attackStrength, blocked);
     }
 
     void Creature::onHit(const MWWorld::Ptr& ptr, const std::map<std::string, float>& damages, ESM::RefId object,

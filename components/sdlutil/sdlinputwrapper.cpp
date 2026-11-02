@@ -4,6 +4,7 @@
 #include <components/settings/values.hpp>
 
 #include <osgViewer/Viewer>
+#include <cstdlib>
 
 namespace SDLUtil
 {
@@ -372,6 +373,9 @@ namespace SDLUtil
         // now remove all mouse events using the old setting from the queue
         SDL_PumpEvents();
         SDL_FlushEvent(SDL_MOUSEMOTION);
+        // A queued warp event was discarded too. Its coordinate marker must
+        // not consume a later real stroke in the new mouse mode.
+        mWarpCompensate = false;
     }
 
     /// \brief Internal method for ignoring relative motions as a side effect
@@ -384,6 +388,9 @@ namespace SDLUtil
         // this was a warp event, signal the caller to eat it.
         if (evt.x == mWarpX && evt.y == mWarpY)
         {
+            static unsigned traceCount = 0;
+            if (std::getenv("OPENMW_MOUSE_INPUT_TRACE") && traceCount++ < 16)
+                Log(Debug::Info) << "MOUSE_INPUT warp_drop dx=" << evt.xrel << " dy=" << evt.yrel;
             mWarpCompensate = false;
             return true;
         }
@@ -430,13 +437,24 @@ namespace SDLUtil
             packEvt.xrel = evt.motion.xrel * mScaleX;
             packEvt.yrel = evt.motion.yrel * mScaleY;
             packEvt.type = SDL_MOUSEMOTION;
+            const bool first = mFirstMouseMove;
             if (mFirstMouseMove)
             {
-                // first event should be treated as non-relative, since there's no point of reference
-                // SDL then (incorrectly) uses (0,0) as point of reference, on Linux at least...
-                packEvt.xrel = packEvt.yrel = 0;
+                // Absolute-pointer startup may use (0,0) as its previous
+                // position (seen on Linux). Native relative mode supplies
+                // motion independently of that position; suppressing its
+                // first delta loses a legitimate initial aim/weapon stroke.
+                if (SDL_GetRelativeMouseMode() != SDL_TRUE)
+                    packEvt.xrel = packEvt.yrel = 0;
                 mFirstMouseMove = false;
             }
+            static unsigned traceCount = 0;
+            if (std::getenv("OPENMW_MOUSE_INPUT_TRACE") && traceCount++ < 32)
+                Log(Debug::Info) << "MOUSE_INPUT packaged first=" << first
+                    << " native_relative=" << (SDL_GetRelativeMouseMode() == SDL_TRUE)
+                    << " allow_grab=" << mAllowGrab << " mouse_in_window=" << mMouseInWindow
+                    << " focus=" << mWindowHasFocus << " raw=" << evt.motion.xrel << ',' << evt.motion.yrel
+                    << " delivered=" << packEvt.xrel << ',' << packEvt.yrel;
         }
         else if (evt.type == SDL_MOUSEWHEEL)
         {

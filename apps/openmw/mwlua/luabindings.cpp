@@ -14,12 +14,15 @@
 #include "corebindings.hpp"
 #include "debugbindings.hpp"
 #include "inputbindings.hpp"
+#include "kineticbindings.hpp"
+#include "kineticnetbindings.hpp"
 #include "localscripts.hpp"
 #include "markupbindings.hpp"
 #include "menuscripts.hpp"
 #include "nearbybindings.hpp"
 #include "objectbindings.hpp"
 #include "postprocessingbindings.hpp"
+#include "ragdolltestbindings.hpp"
 #include "soundbindings.hpp"
 #include "types/types.hpp"
 #include "uibindings.hpp"
@@ -46,11 +49,16 @@ namespace MWLua
     {
         initObjectBindingsForGlobalScripts(context);
         initCellBindingsForGlobalScripts(context);
-        return {
+        std::map<std::string, sol::object> packages = {
             { "openmw.core", initCorePackage(context) },
             { "openmw.types", initTypesPackage(context) },
             { "openmw.world", initWorldPackage(context) },
+            { "openmw.kineticnet", initKineticNetPackage(context, true) },
         };
+#ifdef OPENMW_RAGDOLL_TEST_LUA
+        packages.emplace("openmw.ragdolltest", initRagdollTestPackage(context));
+#endif
+        return packages;
     }
 
     std::map<std::string, sol::object> initLocalPackages(const Context& context)
@@ -63,19 +71,28 @@ namespace MWLua
             { "openmw.core", initCorePackage(context) },
             { "openmw.types", initTypesPackage(context) },
             { "openmw.nearby", initNearbyPackage(context) },
+            // Player scripts keep their own, fuller openmw.kinetic (a player
+            // package of the same name is not replaced by this one).
+            { "openmw.kinetic", initKineticLocalPackage(context) },
         };
     }
 
     std::map<std::string, sol::object> initPlayerPackages(const Context& context)
     {
-        return {
+        std::map<std::string, sol::object> packages = {
             { "openmw.ambient", initAmbientPackage(context) },
             { "openmw.camera", initCameraPackage(context.sol()) },
             { "openmw.debug", initDebugPackage(context) },
             { "openmw.input", initInputPackage(context) },
+            { "openmw.kinetic", initKineticPackage(context) },
+            { "openmw.kineticnet", initKineticNetPackage(context, false) },
             { "openmw.postprocessing", initPostprocessingPackage(context) },
             { "openmw.ui", initUserInterfacePackage(context) },
         };
+#ifdef OPENMW_RAGDOLL_TEST_LUA
+        packages.emplace("openmw.manualobservation", initManualObservationPackage(context));
+#endif
+        return packages;
     }
 
     std::map<std::string, sol::object> initMenuPackages(const Context& context)

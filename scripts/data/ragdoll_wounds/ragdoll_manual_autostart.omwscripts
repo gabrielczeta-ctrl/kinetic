@@ -1,0 +1,3 @@
+GLOBAL: wound_duel.lua
+PLAYER: wound_duel_player.lua
+CUSTOM: wound_duel_actor.lua

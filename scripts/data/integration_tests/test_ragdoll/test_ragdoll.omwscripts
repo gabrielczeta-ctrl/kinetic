@@ -1,0 +1,4 @@
+MENU: menu.lua
+GLOBAL: global.lua
+PLAYER: player.lua
+CUSTOM: gait_actor.lua

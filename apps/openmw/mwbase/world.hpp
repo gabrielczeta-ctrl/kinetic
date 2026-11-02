@@ -4,13 +4,17 @@
 #include "rotationflags.hpp"
 
 #include <deque>
+#include <optional>
 #include <set>
 #include <span>
 #include <string_view>
 #include <vector>
 
 #include <components/misc/rng.hpp>
+#include <osg/Vec2f>
 #include <components/vfs/pathutil.hpp>
+
+#include "../mwmechanics/ragdollattackstate.hpp"
 
 #include "../mwworld/doorstate.hpp"
 #include "../mwworld/globalvariablename.hpp"
@@ -373,6 +377,46 @@ namespace MWBase
         virtual bool isPreviewModeEnabled() const = 0;
         virtual bool toggleVanityMode(bool enable) = 0;
         virtual bool vanityRotateCamera(const float* rot) = 0;
+
+        // Physical attack (plan item 2.3d): while the attack is held
+        // and the player's body is a powered ragdoll, aim motion drives the
+        // point the weapon hand chases instead of turning the view. Returns
+        // true when the swing consumed the motion, in which case the camera
+        // must not also turn - a swing that moved the view as well would
+        // fight the arc the player is drawing.
+        virtual bool driveActorRagdollSwing(float aimRight, float aimUp, bool held, bool thrust = false) = 0;
+        // The player's physical guard (block/parry stance) while held.
+        virtual bool setActorRagdollGuard(bool held) = 0;
+        // SHOVE-01: the player shoves the body in front of it (a double
+        // right click); false when nobody is in reach.
+        virtual bool shoveActorRagdoll() { return false; }
+        // GRIP-05: the player's long blade to its next grip (normal,
+        // half-sword, murder-stroke); false when it has none to change.
+        virtual bool cycleActorRagdollGrip() { return false; }
+        // The player's dodge key (OPENMW_RAGDOLL_DODGE): a committed step
+        // along the movement keys (else back), a dodge roll when running.
+        virtual bool dodgeActorRagdoll() { return false; }
+        // The AI's dodge for `actor` along `direction` (horizontal, world).
+        virtual bool requestActorRagdollDodge(const MWWorld::ConstPtr& /*actor*/, const osg::Vec3f& /*direction*/)
+        {
+            return false;
+        }
+        // Right-click guard (RMB_GUARD): mouse motion while the guard is held
+        // picks its zone (look units, as driveActorRagdollSwing); reset = back
+        // to the middle.
+        virtual bool driveActorRagdollGuardZone(float aimRight, float aimUp, bool reset) = 0;
+        // Physical weapon input must claim Use before the animation-driven
+        // melee action sees it. False keeps ordinary input behavior.
+        virtual bool isPlayerRagdollWeaponAttached() const { return false; }
+        virtual bool hasActorRagdollWeaponAttached(const MWWorld::ConstPtr&) const { return false; }
+        virtual bool usesPlayerRagdollAttackAnimation() const { return false; }
+        virtual bool queuePlayerRagdollAttackInput(bool) { return false; }
+        virtual void cancelPlayerRagdollAttackInput() {}
+        virtual std::optional<MWMechanics::RagdollAttackInput> consumeActorRagdollAttackInput(const MWWorld::Ptr&)
+        {
+            return std::nullopt;
+        }
+        virtual void updateActorRagdollAttack(const MWWorld::Ptr&, const MWMechanics::RagdollAttackState&) {}
         virtual void applyDeferredPreviewRotationToPlayer(float dt) = 0;
         virtual void disableDeferredPreviewRotation() = 0;
 
@@ -420,6 +464,27 @@ namespace MWBase
             = 0;
 
         virtual void enableActorCollision(const MWWorld::Ptr& actor, bool enable) = 0;
+
+        // Records the finalized direct hit that killed an actor. Implementations
+        // may use it to initialize optional physical corpse behavior.
+        virtual void recordActorKillingBlow(const MWWorld::Ptr&, const osg::Vec3f&, const osg::Vec3f&, float) {}
+        virtual bool beginPhysicalHitReceipt(const MWWorld::Ptr&, std::uint64_t) { return false; }
+        virtual void finishPhysicalHitReceipt(const MWWorld::Ptr&, std::uint64_t, float, float) {}
+        // NET-01 duel: the actor that replays the remote player's body.
+        virtual bool isNetPuppet(const MWWorld::ConstPtr&) const { return false; }
+        virtual bool setNetPuppet(const MWWorld::Ptr&) { return false; }
+        virtual void clearNetPuppet() {}
+
+        /// Retain consecutive evaluated poses for passive-ragdoll launch motion.
+        virtual void sampleActorRagdollMotion(const MWWorld::Ptr&, float) {}
+        // Involuntary movement after a shove (actor-local side, forward in -1..1).
+        virtual osg::Vec2f getActorRagdollStumble(const MWWorld::Ptr&) { return osg::Vec2f(); }
+
+        /// Whether the living actor currently owns a powered physical body.
+        virtual bool isActorPoweredRagdoll(const MWWorld::ConstPtr&) const { return false; }
+
+        /// Return a simulated corpse focal point for third-person camera tracking.
+        virtual bool getActorRagdollCameraPosition(const MWWorld::ConstPtr&, osg::Vec3f&) const { return false; }
 
         enum RestFlags
         {
@@ -536,6 +601,10 @@ namespace MWBase
 
         virtual void removeEffect(std::string_view effectId) = 0;
 
+        /// Metal-on-metal sparks: a short burst of bright streaks thrown off
+        /// the struck surface (normal), sized by strength 0..1.
+        virtual void spawnSparks(const osg::Vec3f& worldPos, const osg::Vec3f& normal, float strength) = 0;
+
         /// @see MWWorld::WeatherManager::isInStorm
         virtual bool isInStorm() const = 0;
 
@@ -570,6 +639,10 @@ namespace MWBase
 
         /// Return physical or rendering half extents of the given actor.
         virtual osg::Vec3f getHalfExtents(const MWWorld::ConstPtr& actor, bool rendering = false) const = 0;
+
+        /// True when the actor's body is currently driven by a powered
+        /// ragdoll. Melee reach uses this to require physical contact.
+        virtual bool isPoweredRagdoll(const MWWorld::ConstPtr& actor) const = 0;
 
         /// Export scene graph to a file and return the filename.
         /// \param ptr object to export scene graph for (if empty, export entire scene graph)

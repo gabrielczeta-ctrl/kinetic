@@ -2,7 +2,10 @@
 #define OPENMW_MWRENDER_EFFECTMANAGER_H
 
 #include <memory>
+#include <map>
 #include <vector>
+
+#include <osg/Vec3f>
 
 #include <osg/ref_ptr>
 
@@ -13,6 +16,8 @@ namespace osg
     class Group;
     class Vec3f;
     class PositionAttitudeTransform;
+    class Geometry;
+    class Node;
 }
 
 namespace Resource
@@ -40,6 +45,22 @@ namespace MWRender
 
         void removeEffect(std::string_view effectId);
 
+        /// A burst of bright streaks (metal sparks): thrown off around normal,
+        /// falling under gravity, fading from white-yellow to orange.
+        void addSparks(const osg::Vec3f& worldPosition, const osg::Vec3f& normal, float strength);
+
+        /// TRAIL-01 (user 10-29: "a visible subtle whoosh at the tip of the
+        /// weapon so the player knows the range"): this frame's blades, the
+        /// last part of each held weapon (base) to its tip, world space. A
+        /// faint ribbon trails a blade while its tip moves fast; a blade not
+        /// given for a frame fades out.
+        struct WeaponBlade
+        {
+            const void* mKey = nullptr;
+            osg::Vec3f mBase, mTip;
+        };
+        void setWeaponBlades(const std::vector<WeaponBlade>& blades);
+
         void update(float dt);
 
         /// Remove all effects
@@ -56,6 +77,34 @@ namespace MWRender
         };
 
         std::vector<Effect> mEffects;
+
+        struct SparkBurst
+        {
+            osg::ref_ptr<osg::Node> mNode;
+            osg::ref_ptr<osg::Geometry> mGeometry;
+            std::vector<osg::Vec3f> mPositions, mVelocities;
+            std::vector<float> mLifetimes;
+            float mAge = 0.0f;
+        };
+        std::vector<SparkBurst> mSparks;
+        void updateSparks(float dt);
+
+        struct TrailSample
+        {
+            osg::Vec3f mBase, mTip;
+            float mAge = 0.0f;
+            float mStrength = 0.0f; // 0..1 by the tip's speed when it was taken
+        };
+        struct WeaponTrail
+        {
+            osg::ref_ptr<osg::Node> mNode;
+            osg::ref_ptr<osg::Geometry> mGeometry;
+            std::vector<TrailSample> mSamples; // newest first
+            bool mSeen = false;
+        };
+        std::map<const void*, WeaponTrail> mTrails;
+        std::vector<WeaponBlade> mPendingBlades;
+        void updateTrails(float dt);
 
         osg::ref_ptr<osg::Group> mParentNode;
         Resource::ResourceSystem* mResourceSystem;

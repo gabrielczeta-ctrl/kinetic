@@ -2,6 +2,7 @@
 #define OPENMW_COMPONENTS_MORPHGEOMETRY_H
 
 #include <osg/Geometry>
+#include <osg/observer_ptr>
 
 namespace SceneUtil
 {
@@ -66,6 +67,9 @@ namespace SceneUtil
         inline MorphTarget& getMorphTarget(unsigned int i) { return mMorphTargets[i]; }
 
         osg::ref_ptr<osg::Geometry> getSourceGeometry() const;
+        osg::ref_ptr<osg::Geometry> copyDeformedGeometry() const;
+        // Surface overlays follow the owning face's live expression weights.
+        void followMorphWeights(const MorphGeometry* source) { mMorphSource = source; }
 
         void accept(osg::NodeVisitor& nv) override;
         bool supports(const osg::PrimitiveFunctor&) const override { return true; }
@@ -77,6 +81,7 @@ namespace SceneUtil
         void cull(osg::NodeVisitor* nv);
 
         MorphTargetList mMorphTargets;
+        osg::observer_ptr<const MorphGeometry> mMorphSource;
 
         osg::ref_ptr<osg::Geometry> mSourceGeometry;
 

@@ -45,12 +45,21 @@ namespace MWPhysics
 
         /**
          * Enables or disables the *external* collision body. If disabled, other actors will not collide with this
-         * actor.
+         * actor. With collideWithActors false the capsule keeps its world
+         * collision but uses the POWERED_ACTOR layer, so other actor capsules
+         * do not block it: used by kinematic-root powered bodies whose physical
+         * limbs own body-to-body contact.
          */
-        void enableCollisionBody(bool collision);
+        void enableCollisionBody(bool collision, bool collideWithActors = true);
 
         void updateScale();
         void setRotation(osg::Quat quat);
+        osg::Quat getRotation() const;
+        osg::Vec3f getScale() const;
+        osg::Vec3f getQueuedVelocity() const;
+        // Movement is queued in actor-local space. This applies the same yaw
+        // transform used by MovementSolver for a grounded actor.
+        osg::Vec3f getQueuedWorldVelocity() const;
 
         /**
          * Return true if the collision shape looks the same no matter how its Z rotated.
@@ -62,6 +71,10 @@ namespace MWPhysics
          * to account for e.g. scripted movements
          */
         void setSimulationPosition(const osg::Vec3f& position);
+        // Between the last two physics steps at this frame (the Sync visitor's
+        // interpolateMovements). Not getSimulationPosition: moveActors writes
+        // that into the actor's gameplay position, which stays stepped.
+        osg::Vec3f getInterpolatedPosition() const { return mSimulationPosition; }
 
         void updateCollisionObjectPosition();
 
@@ -87,6 +100,15 @@ namespace MWPhysics
          * Returns true if the new position is different.
          */
         bool setPosition(const osg::Vec3f& position);
+
+        // A powered ragdoll owns the gameplay root while falling and
+        // recovering. Unlike the ordinary movement setter, this must not drop
+        // the update when a preceding teleport marked simulation to skip.
+        void setPoweredRagdollPosition(const osg::Vec3f& position);
+
+        // Returns the actor root owned by the physics system. Powered-ragdoll
+        // synchronization samples this immediately after assigning the root.
+        osg::Vec3f getPhysicsPosition() const;
 
         // force set actor position to be as in Ptr::RefData
         void updatePosition();
@@ -187,6 +209,7 @@ namespace MWPhysics
         bool mOnSlope;
         bool mInternalCollisionMode;
         bool mExternalCollisionMode;
+        bool mCollideWithActors;
         bool mActive;
 
         PhysicsTaskScheduler* mTaskScheduler;

@@ -43,13 +43,30 @@ namespace MWPhysics
 
         // Sensors only collide with DYNAMIC_WORLD objects
         static constexpr JPH::ObjectLayer SENSOR = 1 << 10;
+
+        // A POWERED ragdoll: a body under active control that is expected to
+        // hit things. Corpses stay on DEBRIS, which by design touches nothing
+        // but the ground - correct for a body flopping in a corner, and the
+        // reason a swung arm passed straight through its target. This layer
+        // exists so two fighters can reach each other without every corpse in
+        // the cell becoming a physics obstacle.
+        static constexpr JPH::ObjectLayer RAGDOLL = 1 << 11;
+
+        // The actor capsule of a POWERED kinematic-root body. It keeps the
+        // ordinary world collision (stairs, slopes, walls) but does not collide
+        // with other actor capsules, so powered bodies interact through their
+        // physical limbs and can stumble into each other. Unpowered actors keep
+        // the ordinary ACTOR capsule, and queries that look for actors include
+        // this layer where they mean "a body that is present".
+        static constexpr JPH::ObjectLayer POWERED_ACTOR = 1 << 12;
     }
 
     enum CollisionMask
     {
         CollisionMask_Default = Layers::WORLD | Layers::HEIGHTMAP | Layers::ACTOR | Layers::DOOR,
         CollisionMask_AnyPhysical
-        = Layers::WORLD | Layers::HEIGHTMAP | Layers::ACTOR | Layers::DOOR | Layers::PROJECTILE | Layers::WATER,
+        = Layers::WORLD | Layers::HEIGHTMAP | Layers::ACTOR | Layers::DOOR | Layers::PROJECTILE | Layers::WATER
+            | Layers::POWERED_ACTOR,
     };
 
     // Broadphase layers
@@ -81,6 +98,8 @@ namespace MWPhysics
                     return BroadPhaseLayers::DEBRIS;
                 case Layers::ACTOR:
                 case Layers::PROJECTILE:
+                case Layers::RAGDOLL:
+                case Layers::POWERED_ACTOR:
                     return BroadPhaseLayers::MOVING;
             }
             return BroadPhaseLayers::WORLD;
@@ -117,12 +136,15 @@ namespace MWPhysics
                     return broadPhaseLayer == BroadPhaseLayers::MOVING;
                 case Layers::ACTOR:
                 case Layers::PROJECTILE:
+                case Layers::POWERED_ACTOR:
                     return broadPhaseLayer == BroadPhaseLayers::WORLD || broadPhaseLayer == BroadPhaseLayers::MOVING
                         || broadPhaseLayer == BroadPhaseLayers::SENSOR;
                 case Layers::DOOR:
                     return broadPhaseLayer == BroadPhaseLayers::DEBRIS || broadPhaseLayer == BroadPhaseLayers::MOVING;
                 case Layers::DEBRIS:
                     return broadPhaseLayer == BroadPhaseLayers::WORLD;
+                case Layers::RAGDOLL:
+                    return broadPhaseLayer == BroadPhaseLayers::WORLD || broadPhaseLayer == BroadPhaseLayers::MOVING;
                 case Layers::SENSOR:
                     return broadPhaseLayer == BroadPhaseLayers::MOVING || broadPhaseLayer == BroadPhaseLayers::SENSOR;
                 default:
@@ -148,7 +170,8 @@ namespace MWPhysics
                 case Layers::WATER:
                 case Layers::HEIGHTMAP:
                     return inObject2 == Layers::DYNAMIC_WORLD || inObject2 == Layers::ACTOR
-                        || inObject2 == Layers::PROJECTILE || inObject2 == Layers::DEBRIS;
+                        || inObject2 == Layers::PROJECTILE || inObject2 == Layers::DEBRIS
+                        || inObject2 == Layers::RAGDOLL || inObject2 == Layers::POWERED_ACTOR;
 
                 // Any dynamic/moving layers should collide with all static geometry, sensors and other dynamics
                 case Layers::DYNAMIC_WORLD:
@@ -156,7 +179,18 @@ namespace MWPhysics
                 case Layers::ACTOR:
                     return inObject2 == Layers::WORLD || inObject2 == Layers::HEIGHTMAP || inObject2 == Layers::DOOR
                         || inObject2 == Layers::WATER || inObject2 == Layers::ACTOR || inObject2 == Layers::PROJECTILE
-                        || inObject2 == Layers::DYNAMIC_WORLD || inObject2 == Layers::SENSOR;
+                        || inObject2 == Layers::DYNAMIC_WORLD || inObject2 == Layers::SENSOR
+                        || inObject2 == Layers::POWERED_ACTOR;
+
+                // A powered actor's capsule: world collision and a mutual
+                // capsule so two powered bodies cannot interpenetrate (the
+                // limbs push through and the whole ragdoll spins when the
+                // stand-ins overlap). It still does not collide with ordinary
+                // actor capsules; projectiles hit it.
+                case Layers::POWERED_ACTOR:
+                    return inObject2 == Layers::WORLD || inObject2 == Layers::HEIGHTMAP
+                        || inObject2 == Layers::DOOR || inObject2 == Layers::PROJECTILE
+                        || inObject2 == Layers::POWERED_ACTOR;
 
                 // Sensors should collide with other sensors, actors and projectiles (not dynamic objects)
                 case Layers::SENSOR:
@@ -165,6 +199,17 @@ namespace MWPhysics
                 // Debris layer should only collide with static world for performance
                 case Layers::DEBRIS:
                     return inObject2 == Layers::WORLD || inObject2 == Layers::HEIGHTMAP;
+
+                // A powered ragdoll stands on the world and can reach other
+                // powered ragdolls. Deliberately NOT actor capsules: a capsule
+                // is a gameplay approximation of a body that already has a
+                // physical one here, so colliding with both would have a
+                // fighter shoved by its opponent's stand-in as well as by the
+                // opponent. Within one ragdoll the profile's self-collision
+                // groups still apply, so this only opens body-to-body.
+                case Layers::RAGDOLL:
+                    return inObject2 == Layers::WORLD || inObject2 == Layers::HEIGHTMAP
+                        || inObject2 == Layers::DOOR || inObject2 == Layers::RAGDOLL;
 
                 default:
                     return false;

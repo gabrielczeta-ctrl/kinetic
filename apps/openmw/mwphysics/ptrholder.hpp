@@ -19,6 +19,7 @@ namespace MWPhysics
     public:
         explicit PtrHolder(const MWWorld::Ptr& ptr, const osg::Vec3f& position)
             : mPtr(ptr)
+            , mPhysicsBody(nullptr)
             , mPosition(position)
             , mPreviousPosition(position)
         {
@@ -62,7 +63,37 @@ namespace MWPhysics
         {
         }
 
+        // Called for both new and persistent contacts. firstBody preserves the
+        // original manifold order for post-solve impulse observation. Callbacks
+        // may arrive concurrently from Jolt worker threads.
+        virtual void onContactObserved(const JPH::Body& selfBody, const JPH::Body& withBody,
+            const JPH::ContactManifold& manifold, bool firstBody, float friction)
+        {
+        }
+
+        // New and persisted contacts, before the solver: a holder may change
+        // this contact's settings (e.g. make it a sensor). Runs on Jolt worker
+        // threads.
+        virtual void onContactSettings(const JPH::Body& selfBody, const JPH::Body& withBody,
+            const JPH::ContactManifold& manifold, JPH::ContactSettings& ioSettings)
+        {
+        }
+
+        // The same, knowing whether selfBody is the contact's first body (for
+        // the per-side settings such as mInvMassScale1/2).
+        virtual void onContactSettingsSided(const JPH::Body& selfBody, const JPH::Body& withBody,
+            const JPH::ContactManifold& manifold, JPH::ContactSettings& ioSettings, bool /*selfIsFirst*/)
+        {
+            onContactSettings(selfBody, withBody, manifold, ioSettings);
+        }
+
         virtual bool onContactValidate(const JPH::Body& withBody) { return true; }
+        // Same, knowing which of this holder's bodies is involved (a ragdoll
+        // owns many bodies). Runs on Jolt worker threads.
+        virtual bool onContactValidatePair(const JPH::Body& selfBody, const JPH::Body& withBody)
+        {
+            return onContactValidate(withBody);
+        }
 
     protected:
         MWWorld::Ptr mPtr;

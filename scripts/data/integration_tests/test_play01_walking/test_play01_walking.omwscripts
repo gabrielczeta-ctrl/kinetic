@@ -1,0 +1,3 @@
+GLOBAL: global.lua
+PLAYER: player.lua
+MENU: menu.lua

@@ -1,4 +1,5 @@
 #include "projectilemanager.hpp"
+#include <ragdollcore/tuning.hpp>
 
 #include <iomanip>
 #include <memory>
@@ -559,6 +560,10 @@ namespace MWWorld
             }
 
             const auto hitPosition = projectile->getHitPosition();
+            if (RagdollCore::tuningText("OPENMW_RAGDOLL_PROJECTILE_TRACE"))
+                Log(Debug::Info) << "PROJECTILE_HIT target="
+                                 << (target.isEmpty() ? std::string("<none>") : target.getCellRef().getRefId().toDebugString())
+                                 << " pos=" << hitPosition.x() << "," << hitPosition.y() << "," << hitPosition.z();
 
             if (projectile->getHitWater())
                 mRendering->emitWaterRipple(hitPosition);
@@ -589,6 +594,10 @@ namespace MWWorld
 
             const Ptr target = !active ? projectile->getTarget() : Ptr();
             assert(target != caster);
+            if (RagdollCore::tuningText("OPENMW_RAGDOLL_PROJECTILE_TRACE"))
+                Log(Debug::Info) << "MAGIC_BOLT_HIT target="
+                                 << (target.isEmpty() ? std::string("<none>") : target.getCellRef().getRefId().toDebugString())
+                                 << " active=" << active;
 
             auto hitPos = !active ? projectile->getHitPosition() : pos;
             auto hitNormal = projectile->getHitNormal();

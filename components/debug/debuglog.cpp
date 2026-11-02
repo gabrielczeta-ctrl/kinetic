@@ -32,6 +32,11 @@ Log::~Log()
         return;
 
     std::cout << std::endl;
+    // A manipulator in one line (std::hex, std::fixed, setprecision) stayed on
+    // std::cout for every later line: counts and flags came out in hex.
+    static const std::ios_base::fmtflags defaultFlags = std::ios_base::dec | std::ios_base::skipws;
+    std::cout.flags(defaultFlags);
+    std::cout.precision(6);
     sLock.unlock();
 }
 

@@ -308,7 +308,9 @@ namespace MWPhysics
         , mHasPendingTimingStats(false)
         , mSimulationBarrier(nullptr)
     {
-        Log(Debug::Info) << "Using " << mNumThreads << " async physics threads";
+        // mNumThreads is also a nonzero batching divisor, not the worker count.
+        Log(Debug::Info) << "Jolt job system: max concurrency=" << jobSystem->GetMaxConcurrency()
+                         << " background workers=" << std::max(0, jobSystem->GetMaxConcurrency() - 1);
         if (jobSystem->GetMaxConcurrency() <= 1)
             mLOSCacheExpiry = 0;
     }

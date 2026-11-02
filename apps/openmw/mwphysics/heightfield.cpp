@@ -52,5 +52,6 @@ namespace MWPhysics
     HeightField::~HeightField()
     {
         mTaskScheduler->removeCollisionObject(mPhysicsBody);
+        mTaskScheduler->destroyCollisionObject(mPhysicsBody);
     }
 }

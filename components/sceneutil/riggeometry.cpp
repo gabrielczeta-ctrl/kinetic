@@ -97,6 +97,45 @@ namespace SceneUtil
         return mSourceGeometry;
     }
 
+    void RigGeometry::setSharedTexCoordArray(unsigned int unit, osg::ref_ptr<osg::Array> array)
+    {
+        if (!mSourceGeometry || !array || unit == 7)
+            return;
+        // A shallow copy of the source: the source is a template shared by
+        // every instance of the mesh, and must not change under them.
+        osg::ref_ptr<osg::Geometry> source = new osg::Geometry(*mSourceGeometry, osg::CopyOp::SHALLOW_COPY);
+        source->setTexCoordArray(unit, array, osg::Array::BIND_PER_VERTEX);
+        mSourceGeometry = source;
+        // New skinned copies sharing the current (already skinned) arrays.
+        // The draw thread may still hold last frame's copy; it stays as is.
+        for (unsigned int i = 0; i < 2; ++i)
+        {
+            if (!mGeometry[i])
+                continue;
+            osg::ref_ptr<osg::Geometry> geometry = new osg::Geometry(*mGeometry[i], osg::CopyOp::SHALLOW_COPY);
+            geometry->setTexCoordArray(unit, array, osg::Array::BIND_PER_VERTEX);
+            // The copy does not keep what setSourceGeometry set on the skinned
+            // copies: updateBounds writes through these callbacks (a null one
+            // crashed in duels, riggeometry.cpp updateBounds, 10-08).
+            geometry->setSupportsDisplayList(false);
+            geometry->setUseVertexBufferObjects(true);
+            geometry->setCullingActive(false);
+            auto* box = new CopyBoundingBoxCallback();
+            box->boundingBox = _boundingBox;
+            geometry->setComputeBoundingBoxCallback(box);
+            auto* sphere = new CopyBoundingSphereCallback();
+            sphere->boundingSphere = _boundingSphere;
+            geometry->setComputeBoundingSphereCallback(sphere);
+            geometry->dirtyBound();
+            mGeometry[i] = geometry;
+        }
+    }
+
+    osg::ref_ptr<osg::Geometry> RigGeometry::copyDeformedGeometry() const
+    {
+        return new osg::Geometry(*getGeometry(mLastFrameNumber), osg::CopyOp::DEEP_COPY_ARRAYS);
+    }
+
     bool RigGeometry::initFromParentSkeleton(osg::NodeVisitor* nv)
     {
         const osg::NodePath& path = nv->getNodePath();

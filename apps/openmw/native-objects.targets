@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Imported only for openmw-lib in explicit object-library mode.
+       CMake supplies its objects to both executable consumers. Preserve
+       normal dependency resolution/compilation; omit only the unused archive. -->
+  <Target Name="_Lib" />
+</Project>

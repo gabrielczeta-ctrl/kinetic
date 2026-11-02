@@ -1,0 +1,1 @@
+return { seconds = 45 }

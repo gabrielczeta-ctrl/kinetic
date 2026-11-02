@@ -3,6 +3,8 @@
 
 #include <deque>
 
+#include "ragdollattackstate.hpp"
+
 #include <components/esm3/loadweap.hpp>
 
 #include "../mwworld/ptr.hpp"
@@ -178,6 +180,14 @@ namespace MWMechanics
         MWWorld::Ptr mAttackVictim;
         osg::Vec3f mAttackHitPos;
         bool mAttackSuccess{ false };
+        RagdollAttackState mRagdollAttack;
+        bool mRagdollAttackHeld = false;
+        bool mRagdollAttackPressed = false;
+        std::string mRagdollAttackInputWeapon;
+        // Stays latched after cancellation until a new attack starts, so a
+        // late text key cannot regain damage authority after a weapon drops.
+        bool mPhysicalAttackOwnsHit = false;
+        bool mRagdollAttackFatigueApplied = false;
 
         bool mSkipAnim{ false };
 
@@ -217,6 +227,9 @@ namespace MWMechanics
         void refreshIdleAnims(CharacterState idle, bool force = false);
 
         bool updateWeaponState();
+        void cancelRagdollAttack();
+        void updateRagdollAttackInput();
+        void publishRagdollAttack();
         void updateIdleStormState(bool inwater) const;
 
         std::string chooseRandomAttackAnimation() const;
@@ -318,11 +331,20 @@ namespace MWMechanics
         bool isRunning() const;
         bool isTurning() const;
         bool isAttackingOrSpell() const;
+        /// True through the wind-up, release and follow-through of an attack
+        /// animation, not only while the attack input is held.
+        bool isAttackAnimationActive() const;
 
         void setVisibility(float visibility) const;
         void castSpell(const ESM::RefId& spellId, bool scriptedSpell = false);
         void setAIAttackType(std::string_view attackType);
+        /// Record the attack type for the current swing. The physical melee
+        /// pipeline reads it to pick the authored damage band (chop, slash or
+        /// thrust) that the animation actually plays.
+        void setAttackType(std::string_view attackType);
         static std::string_view getRandomAttackType();
+        /// Hooks and straights only: an unarmed blow never plays a chop.
+        static std::string_view getRandomHandToHandAttackType();
 
         bool readyToPrepareAttack() const;
         bool readyToStartAttack() const;

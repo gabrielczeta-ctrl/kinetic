@@ -10,6 +10,7 @@
 #include "mwgui/debugwindow.hpp"
 
 #include "engine.hpp"
+#include "mwlua/kineticbindings.hpp"
 #include "options.hpp"
 
 #include <boost/program_options/variables_map.hpp>
@@ -225,6 +226,7 @@ int runApplication(int argc, char* argv[])
 
     if (parseOptions(argc, argv, *engine, cfgMgr))
     {
+        MWLua::setKineticSwitchesDefaultPath(cfgMgr.getUserDataPath() / "kinetic-switches.cfg");
         if (!Misc::checkRequiredOSGPluginsArePresent())
             return 1;
 

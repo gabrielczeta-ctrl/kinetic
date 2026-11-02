@@ -1,6 +1,8 @@
 #ifndef OPENMW_MWPHYSICS_JOLTLISTENERS_H
 #define OPENMW_MWPHYSICS_JOLTLISTENERS_H
 
+#include <algorithm>
+
 #include <components/debug/debuglog.hpp>
 #include <components/misc/convert.hpp>
 
@@ -11,6 +13,29 @@ namespace MWPhysics
     // Note: this is called from a job so whatever you do here needs to be thread safe.
     class JoltContactListener : public JPH::ContactListener
     {
+        static void observeContact(const JPH::Body& body1, const JPH::Body& body2,
+            const JPH::ContactManifold& manifold, float friction)
+        {
+            PtrHolder* ptr1 = Misc::Convert::toPointerFromUserData<PtrHolder>(body1.GetUserData());
+            PtrHolder* ptr2 = Misc::Convert::toPointerFromUserData<PtrHolder>(body2.GetUserData());
+            if (ptr1 == nullptr && ptr2 == nullptr)
+                return;
+
+            if (ptr1)
+                ptr1->onContactObserved(body1, body2, manifold, true, friction);
+            if (ptr2)
+                ptr2->onContactObserved(body2, body1, manifold, false, friction);
+        }
+
+        static void adjustContact(const JPH::Body& body1, const JPH::Body& body2,
+            const JPH::ContactManifold& manifold, JPH::ContactSettings& ioSettings)
+        {
+            if (PtrHolder* ptr1 = Misc::Convert::toPointerFromUserData<PtrHolder>(body1.GetUserData()))
+                ptr1->onContactSettingsSided(body1, body2, manifold, ioSettings, true);
+            if (PtrHolder* ptr2 = Misc::Convert::toPointerFromUserData<PtrHolder>(body2.GetUserData()))
+                ptr2->onContactSettingsSided(body2, body1, manifold, ioSettings, false);
+        }
+
     public:
         JoltContactListener() {}
 
@@ -23,13 +48,13 @@ namespace MWPhysics
 
             ptr = Misc::Convert::toPointerFromUserData<PtrHolder>(inBody1.GetUserData());
             if (ptr)
-                canCollide = ptr->onContactValidate(inBody2);
+                canCollide = ptr->onContactValidatePair(inBody1, inBody2);
 
             if (canCollide)
             {
                 ptr = Misc::Convert::toPointerFromUserData<PtrHolder>(inBody2.GetUserData());
                 if (ptr)
-                    canCollide = ptr->onContactValidate(inBody1);
+                    canCollide = ptr->onContactValidatePair(inBody2, inBody1);
             }
 
             if (canCollide)
@@ -51,6 +76,19 @@ namespace MWPhysics
             PtrHolder* ptr2 = Misc::Convert::toPointerFromUserData<PtrHolder>(inBody2.GetUserData());
             if (ptr2)
                 ptr2->onContactAdded(inBody1, inManifold, ioSettings);
+
+            adjustContact(inBody1, inBody2, inManifold, ioSettings);
+            // A contact made a sensor passes through: it is not a touch.
+            if (!ioSettings.mIsSensor)
+                observeContact(inBody1, inBody2, inManifold, ioSettings.mCombinedFriction);
+        }
+
+        void OnContactPersisted(const JPH::Body& inBody1, const JPH::Body& inBody2,
+            const JPH::ContactManifold& inManifold, JPH::ContactSettings& ioSettings) override
+        {
+            adjustContact(inBody1, inBody2, inManifold, ioSettings);
+            if (!ioSettings.mIsSensor)
+                observeContact(inBody1, inBody2, inManifold, ioSettings.mCombinedFriction);
         }
     };
 }

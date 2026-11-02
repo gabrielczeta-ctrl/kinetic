@@ -85,6 +85,17 @@ namespace MWInput
             case A_Rest:
                 rest();
                 break;
+            case A_PhysicalGrip:
+                // GRIP-05: a long blade's grip, normal -> half-sword ->
+                // murder-stroke -> normal.
+                if (!windowManager->isGuiMode() && inputManager->getControlSwitch("playercontrols"))
+                    MWBase::Environment::get().getWorld()->cycleActorRagdollGrip();
+                break;
+            case A_PhysicalDodge:
+                // The dodge (OPENMW_RAGDOLL_DODGE; off: nothing happens).
+                if (!windowManager->isGuiMode() && inputManager->getControlSwitch("playercontrols"))
+                    MWBase::Environment::get().getWorld()->dodgeActorRagdoll();
+                break;
             case A_QuickKey1:
                 quickKey(1);
                 break;

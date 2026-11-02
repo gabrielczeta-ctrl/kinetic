@@ -98,7 +98,8 @@ namespace MWLua
             {
                 { "World", MWPhysics::Layers::WORLD },
                 { "Door", MWPhysics::Layers::DOOR },
-                { "Actor", MWPhysics::Layers::ACTOR },
+                { "Actor", MWPhysics::Layers::ACTOR | MWPhysics::Layers::POWERED_ACTOR },
+                { "PoweredActor", MWPhysics::Layers::POWERED_ACTOR },
                 { "HeightMap", MWPhysics::Layers::HEIGHTMAP },
                 { "Projectile", MWPhysics::Layers::PROJECTILE },
                 { "Water", MWPhysics::Layers::WATER },

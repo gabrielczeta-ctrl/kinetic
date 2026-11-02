@@ -97,8 +97,15 @@ namespace MWBase
         virtual void skillUse(const MWWorld::Ptr& actor, ESM::RefId skillId, int useType, float scale) = 0;
         virtual void onHit(const MWWorld::Ptr& attacker, const MWWorld::Ptr& victim, const MWWorld::Ptr& weapon,
             const MWWorld::Ptr& ammo, int attackType, float attackStrength, float attackWindUp, float damage,
-            bool isHealth, const osg::Vec3f& hitPos, bool successful, MWMechanics::DamageSourceType)
+            bool isHealth, const osg::Vec3f& hitPos, bool successful, MWMechanics::DamageSourceType,
+            std::uint64_t physicalHitId = 0)
             = 0;
+        // NET-01 duel: a blow the opponent's game priced, paid by this victim.
+        virtual void onNetHit(const MWWorld::Ptr& /*attacker*/, const MWWorld::Ptr& /*victim*/, float /*damage*/,
+            bool /*isHealth*/, const osg::Vec3f& /*hitPos*/, bool /*successful*/, int /*attackType*/,
+            float /*attackStrength*/)
+        {
+        }
         virtual void exteriorCreated(MWWorld::CellStore& cell) = 0;
         virtual void actorDied(const MWWorld::Ptr& actor) = 0;
         virtual void onDialogueResponse(

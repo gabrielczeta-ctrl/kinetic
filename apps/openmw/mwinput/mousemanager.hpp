@@ -3,6 +3,10 @@
 
 #include <components/sdlutil/events.hpp>
 #include <components/settings/settings.hpp>
+#include <optional>
+
+#include "ragdolltapdrag.hpp"
+#include "../mwworld/ptr.hpp"
 
 namespace SDLUtil
 {
@@ -34,21 +38,46 @@ namespace MWInput
         void warpMouse();
         void warpMouseToWidget(MyGUI::Widget* widget);
 
-        void setMouseLookEnabled(bool enabled) { mMouseLookEnabled = enabled; }
+        void setMouseLookEnabled(bool enabled);
+        void cancelRagdollUse();
         void setGuiCursorEnabled(bool enabled) { mGuiCursorEnabled = enabled; }
 
         int getMouseMoveX() const { return mMouseMoveX; }
         int getMouseMoveY() const { return mMouseMoveY; }
 
     private:
+        void cancelInvalidRagdollTapDrag();
         BindingsManager* mBindingsManager;
         SDLUtil::InputWrapper* mInputWrapper;
+        SDL_Window* mWindow;
+        bool mWindowHadFocus = false;
 
         float mGuiCursorX;
         float mGuiCursorY;
         int mMouseWheel;
         bool mMouseLookEnabled;
         bool mGuiCursorEnabled;
+        bool mRagdollUseClaimed = false;
+        bool mRagdollAnimationUseClaimed = false;
+        bool mRagdollSwingHeld = false;
+        bool mRagdollGuardHeld = false;
+        // Right-click guard (OPENMW_RAGDOLL_RMB_GUARD=1): held, and how long; a
+        // short tap keeps the guard up a moment (a timed parry).
+        bool mRmbGuardHeld = false;
+        float mRmbGuardHeldTime = 0.0f;
+        float mRmbGuardTapLeft = 0.0f;
+        // SHOVE-01: a second right press this soon after the last is a shove.
+        float mRmbSincePress = 10.0f;
+        // Right clicks this soon after the last one, once a shove started,
+        // add power to it instead of raising the guard.
+        float mRmbShoveBurst = 0.0f;
+        // GUARD-03: an attack press while the guard is up lowers it until the
+        // guard input is let go (OPENMW_RAGDOLL_GUARD_TO_ATTACK).
+        bool mGuardYielded = false;
+        bool mRagdollThrustClaimed = false;
+        RagdollTapDrag mRagdollTapDrag;
+        std::optional<MWWorld::Ptr> mRagdollTapDragWeapon;
+        std::optional<bool> mPendingRagdollMouseUse;
         float mLastWarpX;
         float mLastWarpY;
 

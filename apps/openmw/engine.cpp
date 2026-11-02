@@ -1,4 +1,7 @@
 #include "engine.hpp"
+#include "fpsfixture.hpp"
+#include "testworktiming.hpp"
+#include "teststepscheduler.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -291,6 +294,9 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 
         // update physics
         {
+#ifdef OPENMW_RAGDOLL_DEV_API
+            OMW::TestWorkTiming::Scope work(OMW::TestWorkTiming::physics);
+#endif
             ScopedProfile<UserStatsType::Physics> profile(frameStart, frameNumber, *timer, *stats);
 
             if (mStateManager->getState() != MWBase::StateManager::State_NoGame)
@@ -357,7 +363,19 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
     // if there is a separate Lua thread, it starts the update now
     mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
 
-    mViewer->renderingTraversals();
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        OMW::TestWorkTiming::Scope work(OMW::TestWorkTiming::render);
+#endif
+        if (
+#ifdef OPENMW_RAGDOLL_DEV_API
+            OMW::TestStepScheduler::drawFrame
+#else
+            true
+#endif
+        )
+            mViewer->renderingTraversals();
+    }
 
     mLuaWorker->finishUpdate(frameStart, frameNumber, *stats);
 
@@ -1039,12 +1057,51 @@ void OMW::Engine::go()
     MWWorld::DateTimeManager& timeManager = *mWorld->getTimeManager();
     Misc::FrameRateLimiter frameRateLimiter = Misc::makeFrameRateLimiter(mEnvironment.getFrameRateLimit());
     const std::chrono::steady_clock::duration maxSimulationInterval(std::chrono::milliseconds(200));
+#ifdef OPENMW_RAGDOLL_DEV_API
+    const int fixtureRate = OMW::FpsFixture::requestedRate();
+    bool fixtureArmReported = false;
+    unsigned testBatchTick = 0;
+    if (fixtureRate)
+        Log(Debug::Info) << "RAGDOLL_FPS_CLOCK schema=1 prelude_fps=60 requested_fps=" << fixtureRate
+                        << " post_arm_prelude_frames=" << OMW::FpsFixture::postArmPreludeFrames();
+#endif
     while (!mViewer->done() && !mStateManager->hasQuitRequest())
     {
-        const double dt = std::chrono::duration_cast<std::chrono::duration<double>>(
+#ifdef OPENMW_RAGDOLL_DEV_API
+        const auto workStart = OMW::TestWorkTiming::enabled() ? OMW::TestWorkTiming::read() : OMW::TestWorkTiming::Reading{};
+        OMW::TestWorkTiming::physics = {};
+        OMW::TestWorkTiming::render = {};
+        const bool acceleratedTest = OMW::TestStepScheduler::requested() && OMW::TestStepScheduler::active.load();
+        if (!acceleratedTest) testBatchTick = 0;
+        OMW::TestStepScheduler::drawFrame = !acceleratedTest
+            || ++testBatchTick >= OMW::TestStepScheduler::requested();
+        if (OMW::TestStepScheduler::drawFrame) testBatchTick = 0;
+#endif
+        double dt = std::chrono::duration_cast<std::chrono::duration<double>>(
                               std::min(frameRateLimiter.getLastFrameDuration(), maxSimulationInterval))
                               .count()
             * timeManager.getSimulationTimeScale();
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (acceleratedTest)
+        {
+            if (timeManager.getSimulationTimeScale() != 1.0 || (fixtureRate && fixtureRate != 60))
+                throw std::runtime_error("Native test scheduler requires a 60 Hz timeline and time scale 1");
+            dt = 1.0 / 60.0;
+        }
+        if (fixtureRate)
+        {
+            if (timeManager.getSimulationTimeScale() != 1.0)
+                throw std::runtime_error("FPS fixture requires simulation time scale 1");
+            dt = 1.0 / OMW::FpsFixture::currentRate();
+            if (OMW::FpsFixture::cadenceSelected && !fixtureArmReported)
+            {
+                Log(Debug::Info) << "RAGDOLL_FPS_CLOCK_ARMED schema=1 fps=" << fixtureRate
+                                << " simulation_time=" << timeManager.getSimulationTime()
+                                << " post_arm_prelude_frames=" << OMW::FpsFixture::armedFrames;
+                fixtureArmReported = true;
+            }
+        }
+#endif
 
         mViewer->advance(timeManager.getRenderingSimulationTime());
 
@@ -1077,7 +1134,23 @@ void OMW::Engine::go()
             }
         }
 
-        frameRateLimiter.limit();
+        {
+#ifdef OPENMW_RAGDOLL_DEV_API
+            OMW::TestWorkTiming::Scope work(OMW::TestWorkTiming::limiter);
+#endif
+            if (
+#ifdef OPENMW_RAGDOLL_DEV_API
+                OMW::TestStepScheduler::drawFrame
+#else
+                true
+#endif
+            )
+                frameRateLimiter.limit();
+        }
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (OMW::TestWorkTiming::enabled())
+            OMW::TestWorkTiming::emit(frameNumber, OMW::TestWorkTiming::read() - workStart);
+#endif
     }
 
     mLuaWorker->join();

@@ -63,7 +63,7 @@
 -- @return #any
 -- @usage local skillBonus = core.getGMST('fMinorSkillBonus') -- get a numeric GMST from ESM data
 -- @usage local jailFormatString = core.getGMST('sNotifyMessage42') -- get a string GMST from ESM data
--- @usage local bloodTextureName = core.getGMST('Blood_Texture_1') -- get a "fallback" parameter value from openmw.cfg (always a string)
+-- @usage local bloodTextureName = core.getGMST('Blood_Texture_1') -- get a "fallback" parameter value from openmw.cfg (string or number, according to its declared type)
 
 ---
 -- The game's difficulty setting.

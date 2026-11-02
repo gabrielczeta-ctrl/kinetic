@@ -468,6 +468,40 @@ Game Settings
         - Cylinder
 
 .. omw-setting::
+   :title: enable passive ragdolls
+   :type: boolean
+   :range: true, false
+   :default: false
+
+   Enables the experimental data-driven Jolt passive-ragdoll vertical slice.
+   Unsupported skeletons or failed ragdoll creation retain the ordinary death pose.
+
+.. omw-setting::
+   :title: geometric melee connection
+   :type: boolean
+   :range: true, false
+   :default: false
+
+   Decides whether a melee attack connects from reach and geometry rather than
+   Morrowind's to-hit dice. Vanilla rolls against weapon skill, agility, luck
+   and fatigue before any geometry is considered, so a swing that visibly
+   passes through a target can still be a miss. With this enabled a swing that
+   is in reach and within the usual angle tolerances always connects, and the
+   skill roll moves to damage instead: a less skilled attacker lands the blow
+   but does proportionally less with it. Damage is never increased, and a
+   swing that reaches nothing still misses.
+
+.. omw-setting::
+   :title: passive ragdoll cap
+   :type: int
+   :range: 0, 100
+   :default: 20
+
+   Limits the number of simulated passive corpse ragdolls. Sleeping ragdolls are
+   evicted before active ragdolls, then stable creation order breaks ties. A value
+   of zero disables passive-ragdoll creation even when the feature is enabled.
+
+.. omw-setting::
    :title: player movement ignores animation
    :type: boolean
    :range: true, false

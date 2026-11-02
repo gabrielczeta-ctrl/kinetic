@@ -50,6 +50,8 @@ namespace MWRender
         // WeaponAnimation
         osg::Group* getArrowBone() override;
         osg::Node* getWeaponNode() override;
+        // The carried shield's mesh (the KINETIC shield body, CREATURE-02).
+        osg::Node* getShieldNode();
         Resource::ResourceSystem* getResourceSystem() override;
         void showWeapon(bool show) override { showWeapons(show); }
         void setWeaponGroup(const std::string& group, bool relativeDuration) override

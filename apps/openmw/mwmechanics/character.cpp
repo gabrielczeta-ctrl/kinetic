@@ -18,6 +18,7 @@
  */
 
 #include "character.hpp"
+#include <ragdollcore/tuning.hpp>
 
 #include <array>
 #include <unordered_set>
@@ -51,30 +52,69 @@
 #include "actorutil.hpp"
 #include "aicombataction.hpp"
 #include "creaturestats.hpp"
+#include "combat.hpp"
 #include "movement.hpp"
 #include "npcstats.hpp"
 #include "security.hpp"
 #include "spellcasting.hpp"
 #include "weapontype.hpp"
 
+#ifdef OPENMW_RAGDOLL_DEV_API
+#include <cstdlib>
+#include <components/debug/debuglog.hpp>
+#include "../mwrender/npcanimation.hpp"
+#endif
+
 namespace
 {
 
     const ESM::RefId wolfRun = ESM::RefId::stringRefId("WolfRun");
 
-    std::string_view getBestAttack(const ESM::Weapon* weapon)
+#ifdef OPENMW_RAGDOLL_DEV_API
+    void traceTwoHandWeaponVisibility(std::string_view event, const MWWorld::Ptr& ptr,
+        MWRender::Animation* animation, MWMechanics::UpperBodyState oldState,
+        MWMechanics::UpperBodyState newState, std::string_view currentWeapon, bool applied = false)
     {
-        int slash = weapon->mData.mSlash[0] + weapon->mData.mSlash[1];
-        int chop = weapon->mData.mChop[0] + weapon->mData.mChop[1];
-        int thrust = weapon->mData.mThrust[0] + weapon->mData.mThrust[1];
-        if (slash == chop && slash == thrust)
+        if (!RagdollCore::tuningText("OPENMW_RAGDOLL_TWO_HAND_TRACE") || ptr != MWMechanics::getPlayer())
+            return;
+        static unsigned rows = 0;
+        if (rows >= 256)
+            return;
+        ++rows;
+        auto* npcAnimation = dynamic_cast<MWRender::NpcAnimation*>(animation);
+        Log(Debug::Info) << "RAGDOLL_WEAPON_VISIBILITY event=" << event
+            << " old_upper=" << static_cast<int>(oldState) << " new_upper=" << static_cast<int>(newState)
+            << " current_weapon=" << currentWeapon << " applied=" << applied
+            << " shown=" << (animation && animation->getWeaponsShown())
+            << " weapon_node=" << (npcAnimation && npcAnimation->getWeaponNode())
+            << " root=" << static_cast<const void*>(animation ? animation->getObjectRoot() : nullptr);
+    }
+#endif
+
+    std::string_view getBestAttack(const ESM::Weapon* weapon, bool stable = false)
+    {
+        // Best among the attack types this weapon class can actually perform,
+        // with a random pick among ties so a dagger alternates slash and stab
+        // instead of always playing the same authored band.
+        const MWMechanics::WeaponAttackCandidates candidates
+            = MWMechanics::weaponAttackCandidates(weapon);
+        const int slash = candidates.mSlash ? weapon->mData.mSlash[0] + weapon->mData.mSlash[1] : 0;
+        const int chop = candidates.mChop ? weapon->mData.mChop[0] + weapon->mData.mChop[1] : 0;
+        const int thrust = candidates.mThrust ? weapon->mData.mThrust[0] + weapon->mData.mThrust[1] : 0;
+        const int best = std::max({ slash, chop, thrust });
+        std::vector<std::string_view> top;
+        if (slash == best && slash > 0)
+            top.push_back("slash");
+        if (chop == best && chop > 0)
+            top.push_back("chop");
+        if (thrust == best && thrust > 0)
+            top.push_back("thrust");
+        if (top.empty())
             return "slash";
-        else if (thrust >= chop && thrust >= slash)
-            return "thrust";
-        else if (slash >= chop && slash >= thrust)
-            return "slash";
-        else
-            return "chop";
+        if (top.size() == 1 || stable)
+            return top.front();
+        auto& prng = MWBase::Environment::get().getWorld()->getPrng();
+        return top[Misc::Rng::rollDice(static_cast<int>(top.size()), prng)];
     }
 
     // Converts a movement Run state to its equivalent Walk state, if there is one.
@@ -368,6 +408,7 @@ namespace MWMechanics
 
     void CharacterController::resetCurrentWeaponState()
     {
+        cancelRagdollAttack();
         clearStateAnimation(mCurrentWeapon);
         mUpperBodyState = UpperBodyState::None;
     }
@@ -388,7 +429,8 @@ namespace MWMechanics
         bool knockout = stats.getFatigue().getCurrent() < 0 || stats.getFatigue().getBase() == 0;
         bool recovery = stats.getHitRecovery();
         bool knockdown = stats.getKnockedDown();
-        bool block = stats.getBlock() && !knockout && !recovery && !knockdown;
+        const bool blockRequested = stats.getBlock();
+        bool block = blockRequested && !knockout && !recovery && !knockdown;
         bool isSwimming = world->isSwimming(mPtr);
 
         stats.setBlock(false);
@@ -421,6 +463,26 @@ namespace MWMechanics
             else if (isKnockedOut())
                 mAnimation->setLoopingEnabled(mCurrentHit, knockout);
             return;
+        }
+
+        // A powered body reacts to blows physically (sway, stumble, catch
+        // steps, falls). Morrowind's flinch and knockdown clips on top of it
+        // - creature bites, arrows, spells, the animation hit path, long falls
+        // - played a canned reaction through the body (user 2026-09-29: "get
+        // rid of the vanilla attack reaction animations"). Knockout from
+        // exhaustion (fatigue below zero) still plays.
+        // OPENMW_RAGDOLL_VANILLA_STAGGER=1 keeps the clips.
+        static const auto vanillaStagger_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_VANILLA_STAGGER");
+            return text != nullptr && std::atoi(text) != 0;
+        });
+        static const auto& vanillaStagger = vanillaStagger_tuned.get();
+        if (!knockout && (recovery || knockdown) && !vanillaStagger && world->isPoweredRagdoll(mPtr))
+        {
+            recovery = knockdown = false;
+            stats.setHitRecovery(false);
+            stats.setKnockedDown(false);
+            block = blockRequested;
         }
 
         if (!knockout && !knockdown && !recovery && !block)
@@ -636,6 +698,8 @@ namespace MWMechanics
     {
         if (movement == mMovementState && !force)
             return;
+        // A forced refresh of the same movement state (a weapon change).
+        const bool sameMovementVariant = movement == mMovementState;
 
         std::string_view movementAnimGroup = movementStateToAnimGroup(movement);
 
@@ -707,6 +771,22 @@ namespace MWMechanics
         float startpoint = 0.f;
         if (!mCurrentMovement.empty() && movementAnimName == mCurrentMovement)
             mAnimation->getInfo(mCurrentMovement, &startpoint);
+        else if (!mCurrentMovement.empty() && sameMovementVariant)
+        {
+            // The same movement in another weapon's variant (drawing or
+            // sheathing on the move: runforward -> runforward2c) goes on from
+            // the same point of its cycle (user 11-02 bookmark: drawing while
+            // running "the running animation gets stuck"; the clip restarted
+            // at 0 mid-stride and the legs' gait clock lost its place for
+            // ~1 s: one foot lifted twice, the other stood 0.8 s).
+            // OPENMW_RAGDOLL_MOVE_PHASE_KEEP=0 = off.
+            static const auto keep_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_MOVE_PHASE_KEEP");
+                return !(text && std::atoi(text) == 0);
+            });
+            if (keep_tuned.get())
+                mAnimation->getInfo(mCurrentMovement, &startpoint);
+        }
 
         mMovementAnimationHasMovement = true;
 
@@ -752,6 +832,15 @@ namespace MWMechanics
 
         playBlendedAnimation(mCurrentMovement, Priority_Movement, movemask, false, 1.f, "start", "stop", startpoint,
             std::numeric_limits<uint32_t>::max(), true);
+        // The player's movement clip as it changes (user 11-02 bookmark:
+        // drawing the weapon while running "the running animation gets
+        // stuck"). OPENMW_RAGDOLL_MOVE_TRACE (set = on).
+        static const auto moveTrace_tuned = RagdollCore::tuned<bool>(
+            [] { return RagdollCore::tuningText("OPENMW_RAGDOLL_MOVE_TRACE") != nullptr; });
+        if (moveTrace_tuned.get() && mPtr == MWMechanics::getPlayer())
+            Log(Debug::Info) << "RAGDOLL_MOVE_ANIM group=" << mCurrentMovement << " mask=" << movemask
+                             << " speed=" << mMovementAnimSpeed << " start=" << startpoint
+                             << " upper=" << static_cast<int>(mUpperBodyState) << " weapon=" << mWeaponTypeId;
     }
 
     void CharacterController::refreshIdleAnims(CharacterState idle, bool force)
@@ -1069,10 +1158,20 @@ namespace MWMechanics
         std::string_view action = evt.substr(groupname.size() + 2);
         if (action == "equip attach")
         {
+#ifdef OPENMW_RAGDOLL_DEV_API
+            const UpperBodyState oldUpperBodyState = mUpperBodyState;
+            traceTwoHandWeaponVisibility("equip_attach_before", mPtr, mAnimation,
+                oldUpperBodyState, mUpperBodyState, mCurrentWeapon);
+#endif
             if (groupname == "shield")
                 mAnimation->showCarriedLeft(true);
             else if (mUpperBodyState == UpperBodyState::Equipping)
                 mAnimation->showWeapons(true);
+#ifdef OPENMW_RAGDOLL_DEV_API
+            traceTwoHandWeaponVisibility("equip_attach_after", mPtr, mAnimation,
+                oldUpperBodyState, mUpperBodyState, mCurrentWeapon,
+                groupname == "shield" || oldUpperBodyState == UpperBodyState::Equipping);
+#endif
         }
         else if (action == "unequip detach")
         {
@@ -1103,8 +1202,14 @@ namespace MWMechanics
             // and processing multiple hit keys for a single attack
             if (mReadyToHit)
             {
-                charClass.hit(
-                    mPtr, mAttackStrength, mAttackWindUp, attackType, mAttackVictim, mAttackHitPos, mAttackSuccess);
+                // An attached physical weapon resolves damage from its Jolt
+                // contact event. Animation text keys may still arrive while
+                // transitioning into the mode, but they have no combat
+                // authority and must not manufacture a second ranged hit.
+                if (!mPhysicalAttackOwnsHit
+                    && !MWBase::Environment::get().getWorld()->hasActorRagdollWeaponAttached(mPtr))
+                    charClass.hit(mPtr, mAttackStrength, mAttackWindUp, attackType,
+                        mAttackVictim, mAttackHitPos, mAttackSuccess);
                 mReadyToHit = false;
             }
         }
@@ -1134,16 +1239,20 @@ namespace MWMechanics
                 // State update doesn't expect the start key to be the hit key,
                 // so we have to do this early.
                 prepareHit();
-
-                if (groupname == "attack1" || groupname == "swimattack1")
-                    charClass.hit(mPtr, mAttackStrength, mAttackWindUp, ESM::Weapon::AT_Chop, mAttackVictim,
-                        mAttackHitPos, mAttackSuccess);
-                else if (groupname == "attack2" || groupname == "swimattack2")
-                    charClass.hit(mPtr, mAttackStrength, mAttackWindUp, ESM::Weapon::AT_Slash, mAttackVictim,
-                        mAttackHitPos, mAttackSuccess);
-                else if (groupname == "attack3" || groupname == "swimattack3")
-                    charClass.hit(mPtr, mAttackStrength, mAttackWindUp, ESM::Weapon::AT_Thrust, mAttackVictim,
-                        mAttackHitPos, mAttackSuccess);
+                if (!mPhysicalAttackOwnsHit
+                    && !MWBase::Environment::get().getWorld()->hasActorRagdollWeaponAttached(mPtr))
+                {
+                    if (groupname == "attack1" || groupname == "swimattack1")
+                        charClass.hit(mPtr, mAttackStrength, mAttackWindUp, ESM::Weapon::AT_Chop, mAttackVictim,
+                            mAttackHitPos, mAttackSuccess);
+                    else if (groupname == "attack2" || groupname == "swimattack2")
+                        charClass.hit(mPtr, mAttackStrength, mAttackWindUp, ESM::Weapon::AT_Slash, mAttackVictim,
+                            mAttackHitPos, mAttackSuccess);
+                    else if (groupname == "attack3" || groupname == "swimattack3")
+                        charClass.hit(mPtr, mAttackStrength, mAttackWindUp, ESM::Weapon::AT_Thrust, mAttackVictim,
+                            mAttackHitPos, mAttackSuccess);
+                }
+                mReadyToHit = false;
             }
         }
         else if (action == "shoot attach")
@@ -1248,6 +1357,27 @@ namespace MWMechanics
         if (mReadyToHit)
             return;
 
+        if (mPhysicalAttackOwnsHit)
+        {
+            if (mRagdollAttack.mPhase == RagdollAttackPhase::Idle)
+                return;
+            // Contact determines a physical hit. A vanilla ray/RNG miss must
+            // not erase the held charge or choose a shorter recovery clip.
+            mAttackStrength = std::clamp(calculateWindUp(), 0.f, 1.f);
+            mAttackWindUp = mAttackStrength;
+            mRagdollAttack.mStrength = mAttackStrength;
+            if (!mRagdollAttackFatigueApplied)
+            {
+                // DMG-04: a click plays a whole physical swing, priced by its
+                // speed rather than the hold time, so it costs a full attack.
+                applyFatigueLoss(mPtr, mWeapon, 1.0f);
+                mRagdollAttackFatigueApplied = true;
+            }
+            playSwishSound();
+            mReadyToHit = true;
+            return;
+        }
+
         auto& prng = MWBase::Environment::get().getWorld()->getPrng();
         mAttackStrength = calculateWindUp();
         mAttackWindUp = mAttackStrength;
@@ -1266,6 +1396,108 @@ namespace MWMechanics
         }
 
         mReadyToHit = true;
+    }
+
+    void CharacterController::cancelRagdollAttack()
+    {
+        mRagdollAttackHeld = false;
+        mRagdollAttackPressed = false;
+        mRagdollAttackInputWeapon.clear();
+        if (mRagdollAttack.mPhase == RagdollAttackPhase::Idle)
+            return;
+        if (mAnimation && !mCurrentWeapon.empty())
+            mAnimation->disable(mCurrentWeapon);
+        mReadyToHit = false;
+        setAttackingOrSpell(false);
+        if (mUpperBodyState == UpperBodyState::AttackWindUp || mUpperBodyState == UpperBodyState::AttackRelease
+            || mUpperBodyState == UpperBodyState::AttackEnd)
+            mUpperBodyState = UpperBodyState::WeaponEquipped;
+        mRagdollAttack.mPhase = RagdollAttackPhase::Idle;
+        mRagdollAttack.mPlaybackComplete = false;
+#ifdef OPENMW_RAGDOLL_DEV_API
+        traceTwoHandWeaponVisibility("native_cancel", mPtr, mAnimation,
+            mUpperBodyState, mUpperBodyState, mCurrentWeapon);
+#endif
+        MWBase::Environment::get().getWorld()->updateActorRagdollAttack(mPtr, mRagdollAttack);
+    }
+
+    void CharacterController::updateRagdollAttackInput()
+    {
+        const auto world = MWBase::Environment::get().getWorld();
+        if (mPtr != getPlayer())
+            return;
+        if (const auto input = world->consumeActorRagdollAttackInput(mPtr))
+        {
+            if (input->mCancelled)
+            {
+                cancelRagdollAttack();
+                return;
+            }
+            mRagdollAttackHeld = input->mHeld;
+            mRagdollAttackPressed = input->mPressed;
+            mRagdollAttackInputWeapon = input->mWeaponRecordId;
+        }
+        if (!mRagdollAttackPressed && mRagdollAttack.mPhase == RagdollAttackPhase::Idle)
+            return;
+        const auto& cls = mPtr.getClass();
+        const auto& inventory = cls.getInventoryStore(mPtr);
+        const auto equipped = inventory.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
+        const auto combatState = getRagdollCombatState(mPtr);
+        const bool sameEquipment = equipped == inventory.end() ? mRagdollAttackInputWeapon.empty()
+            : equipped->getCellRef().getRefId().serializeText() == mRagdollAttackInputWeapon;
+        const bool valid = world->usesPlayerRagdollAttackAnimation() && sameEquipment
+            && combatState && RagdollCore::isDrivenControllerMode(combatState->mMode)
+            && !cls.getCreatureStats(mPtr).isDead() && !isKnockedDown() && !isKnockedOut()
+            && !isRecovery() && !isScriptedAnimPlaying() && !mSkipAnim;
+        if (!valid)
+        {
+            world->cancelPlayerRagdollAttackInput();
+            cancelRagdollAttack();
+            return;
+        }
+        // Lua updates ordinary controls before this controller. Only the
+        // claimed native pair overrides Use, and only until it is released.
+        if (mRagdollAttack.mPhase != RagdollAttackPhase::Idle)
+            setAttackingOrSpell(mRagdollAttackHeld && mUpperBodyState == UpperBodyState::AttackWindUp);
+    }
+
+    void CharacterController::publishRagdollAttack()
+    {
+        if (mRagdollAttack.mPhase == RagdollAttackPhase::Idle)
+            return;
+#ifdef OPENMW_RAGDOLL_DEV_API
+        const RagdollAttackPhase oldPhase = mRagdollAttack.mPhase;
+#endif
+        if (mUpperBodyState == UpperBodyState::AttackWindUp)
+        {
+            mRagdollAttack.mPhase = RagdollAttackPhase::WindUp;
+            mRagdollAttack.mStrength = std::clamp(calculateWindUp(), 0.f, 1.f);
+        }
+        else if (mUpperBodyState == UpperBodyState::AttackRelease)
+        {
+            // An early tap commits release before its min-attack key. Keep
+            // contact damage disarmed until the native release clip starts.
+            const float minimum = mAnimation->getTextKeyTime(mCurrentWeapon + ": " + mAttackType + " min attack");
+            mRagdollAttack.mPhase = mAnimation->getCurrentTime(mCurrentWeapon) < minimum
+                ? RagdollAttackPhase::WindUp : RagdollAttackPhase::Release;
+        }
+        else if (mUpperBodyState == UpperBodyState::AttackEnd)
+            mRagdollAttack.mPhase = RagdollAttackPhase::FollowThrough;
+        else
+        {
+            mRagdollAttack.mPhase = RagdollAttackPhase::Idle;
+            mRagdollAttack.mPlaybackComplete = true;
+        }
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (mRagdollAttack.mPhase != oldPhase)
+        {
+            constexpr std::array<std::string_view, 4> events{
+                "native_idle", "native_wind_up", "native_release", "native_follow_through" };
+            traceTwoHandWeaponVisibility(events[static_cast<std::size_t>(mRagdollAttack.mPhase)],
+                mPtr, mAnimation, mUpperBodyState, mUpperBodyState, mCurrentWeapon);
+        }
+#endif
+        MWBase::Environment::get().getWorld()->updateActorRagdollAttack(mPtr, mRagdollAttack);
     }
 
     bool CharacterController::updateWeaponState()
@@ -1313,6 +1545,14 @@ namespace MWMechanics
 
             if (mWeapon != newWeapon)
             {
+                if (mRagdollAttackPressed || mRagdollAttack.mPhase != RagdollAttackPhase::Idle)
+                {
+                    // Equal record IDs can still be different inventory
+                    // instances with different condition. Never carry a
+                    // queued/charged attack across an equipment replacement.
+                    world->cancelPlayerRagdollAttackInput();
+                    cancelRagdollAttack();
+                }
                 mWeapon = newWeapon;
                 weaponChanged = true;
             }
@@ -1360,11 +1600,15 @@ namespace MWMechanics
         // We should not play equipping animation and sound during weapon->weapon transition
         const bool isStillWeapon = isWeaponOrToolType(mWeaponTypeId) && isWeaponOrToolType(weaponTypeId);
 
-        // If the current weapon type was changed in the middle of attack (e.g. by Equip console command or when bound
-        // spell expires), we should force actor to the "weapon equipped" state, interrupt attack and update animations.
+        // A weapon-to-weapon replacement also completes an interrupted equip.
+        // Disable its old group before mCurrentWeapon changes below; otherwise
+        // the finished equip state survives and keeps upperBodyReady false.
+        // During an attack (e.g. an Equip command or expiring bound spell),
+        // force the actor to "weapon equipped" and interrupt the old attack.
         // Morrowind does this at the end of the attack (see #4646 and PR 1972).
         // If we decide to cope with the resulting problems, the thrown weapon->H2H case below should be extended.
-        if (isStillWeapon && mWeaponTypeId != weaponTypeId && mUpperBodyState > UpperBodyState::WeaponEquipped)
+        if (isStillWeapon && mWeaponTypeId != weaponTypeId
+            && (mUpperBodyState == UpperBodyState::Equipping || mUpperBodyState > UpperBodyState::WeaponEquipped))
         {
             forcestateupdate = true;
             if (!mCurrentWeapon.empty())
@@ -1507,6 +1751,18 @@ namespace MWMechanics
         float complete = 0.f;
         bool animPlaying = false;
         ESM::WeaponType::Class weapclass = getWeaponType(mWeaponTypeId)->mWeaponClass;
+        const bool startsPhysicalAttack = mRagdollAttackPressed && mPtr == getPlayer()
+            && mUpperBodyState == UpperBodyState::WeaponEquipped
+            && (mHitState == CharState_None || mHitState == CharState_Block)
+            && ((mWeaponTypeId == ESM::WeaponType::HandToHand && mRagdollAttackInputWeapon.empty())
+                || (!mWeapon.isEmpty() && mWeapon.getType() == ESM::Weapon::sRecordId
+                    && weapclass == ESM::WeaponType::Melee
+                    && mWeapon.getCellRef().getRefId().serializeText() == mRagdollAttackInputWeapon))
+            && world->usesPlayerRagdollAttackAnimation();
+        if (startsPhysicalAttack)
+            setAttackingOrSpell(true);
+        // A click during equip/recovery is not queued to fire a later weapon.
+        mRagdollAttackPressed = false;
         if (getAttackingOrSpell())
         {
             mResetIdleOnAttackEnd = true;
@@ -1515,6 +1771,8 @@ namespace MWMechanics
             {
                 mAttackStrength = -1.f;
                 mReadyToHit = false;
+                mPhysicalAttackOwnsHit = startsPhysicalAttack;
+                mRagdollAttackFatigueApplied = false;
 
                 // Randomize attacks for non-bipedal creatures
                 if (!cls.isBipedal(mPtr)
@@ -1676,28 +1934,35 @@ namespace MWMechanics
                             mAttackType = "shoot";
                         else if (mPtr == getPlayer())
                         {
-                            if (Settings::game().mBestAttack)
+                            if (startsPhysicalAttack)
+                            {
+                                // One repeatable quick attack per record. Held
+                                // mouse gestures retain their independent arc.
+                                setAttackType(mWeaponTypeId == ESM::WeaponType::HandToHand ? "thrust"
+                                    : getBestAttack(mWeapon.get<ESM::Weapon>()->mBase, true));
+                            }
+                            else if (Settings::game().mBestAttack)
                             {
                                 if (!mWeapon.isEmpty() && mWeapon.getType() == ESM::Weapon::sRecordId)
                                 {
-                                    mAttackType = getBestAttack(mWeapon.get<ESM::Weapon>()->mBase);
+                                    setAttackType(getBestAttack(mWeapon.get<ESM::Weapon>()->mBase));
                                 }
                                 else
                                 {
                                     // There is no "best attack" for Hand-to-Hand
-                                    mAttackType = getRandomAttackType();
+                                    setAttackType(getRandomHandToHandAttackType());
                                 }
                             }
                             else
                             {
-                                mAttackType = getMovementBasedAttackType();
+                                setAttackType(getMovementBasedAttackType());
                             }
                         }
                         else if (aiInactive)
                         {
-                            mAttackType = getDesiredAttackType();
+                            setAttackType(getDesiredAttackType());
                             if (mAttackType == "")
-                                mAttackType = getRandomAttackType();
+                                setAttackType(getRandomAttackType());
                         }
 
                         // else if (mPtr != getPlayer()) use mAttackType set by AiCombat
@@ -1706,6 +1971,19 @@ namespace MWMechanics
                     }
 
                     mUpperBodyState = UpperBodyState::AttackWindUp;
+                    if (startsPhysicalAttack)
+                    {
+                        // Main-thread IDs survive replacement of the player's
+                        // CharacterController while its physics body persists.
+                        static std::uint64_t nextPhysicalAttackId = 0;
+                        mRagdollAttack = { RagdollAttackPhase::WindUp, ++nextPhysicalAttackId,
+                            mRagdollAttackInputWeapon, mAttackType, 0.f };
+#ifdef OPENMW_RAGDOLL_DEV_API
+                        traceTwoHandWeaponVisibility("native_wind_up", mPtr, mAnimation,
+                            mUpperBodyState, mUpperBodyState, mCurrentWeapon);
+#endif
+                        world->updateActorRagdollAttack(mPtr, mRagdollAttack);
+                    }
 
                     // Reset the attack results when the attack starts.
                     // Strictly speaking this should probably be done when the attack ends,
@@ -1719,6 +1997,12 @@ namespace MWMechanics
                 }
             }
         }
+
+        // Start and release a tap even when both button edges were captured
+        // before this update. The native release state waits for min attack;
+        // it never plays a preliminary quick hit while a press is held.
+        if (startsPhysicalAttack && !mRagdollAttackHeld)
+            setAttackingOrSpell(false);
 
         // Random attack and pick/probe animations never have wind up and are played to their end.
         // Other animations must be released when the attack state is unset.
@@ -1865,14 +2149,20 @@ namespace MWMechanics
         }
 
         mAnimation->setPitchFactor(0.f);
+        const bool physicalMeleeAim = mPhysicalAttackOwnsHit
+            && mRagdollAttack.mPhase != RagdollAttackPhase::Idle
+            && (weapclass == ESM::WeaponType::Melee || mWeaponTypeId == ESM::WeaponType::HandToHand);
         if (mUpperBodyState > UpperBodyState::WeaponEquipped
-            && (weapclass == ESM::WeaponType::Ranged || weapclass == ESM::WeaponType::Thrown))
+            && (weapclass == ESM::WeaponType::Ranged || weapclass == ESM::WeaponType::Thrown || physicalMeleeAim))
         {
             mAnimation->setPitchFactor(1.f);
 
             // A smooth transition can be provided if a pre-wind-up section is defined. Random attack animations never
-            // have one.
-            if (mUpperBodyState == UpperBodyState::AttackWindUp && !isRandomAttackAnimation(mCurrentWeapon))
+            // have one. A released physical tap can still be travelling to
+            // min attack; retain that same pitch ramp until its release starts.
+            if ((mUpperBodyState == UpperBodyState::AttackWindUp
+                    || (physicalMeleeAim && mUpperBodyState == UpperBodyState::AttackRelease))
+                && !isRandomAttackAnimation(mCurrentWeapon))
             {
                 float currentTime = mAnimation->getCurrentTime(mCurrentWeapon);
                 float minAttackTime = mAnimation->getTextKeyTime(mCurrentWeapon + ": " + mAttackType + " min attack");
@@ -1892,6 +2182,7 @@ namespace MWMechanics
         }
 
         mAnimation->setAccurateAiming(mUpperBodyState > UpperBodyState::WeaponEquipped);
+        publishRagdollAttack();
 
         return forcestateupdate;
     }
@@ -1976,6 +2267,8 @@ namespace MWMechanics
         updateMagicEffects();
 
         bool isPlayer = mPtr == MWMechanics::getPlayer();
+        if (isPlayer)
+            updateRagdollAttackInput();
         bool isFirstPersonPlayer = isPlayer && MWBase::Environment::get().getWorld()->isFirstPerson();
         bool godmode = isPlayer && MWBase::Environment::get().getWorld()->getGodModeState();
 
@@ -2009,6 +2302,13 @@ namespace MWMechanics
             bool isrunning = cls.getCreatureStats(mPtr).getStance(MWMechanics::CreatureStats::Stance_Run) && !flying;
             CreatureStats& stats = cls.getCreatureStats(mPtr);
             Movement& movementSettings = cls.getMovementSettings(mPtr);
+            // A shoved physical body steps with the push for a moment instead
+            // of sliding its feet (soft root; see PhysicsSystem stumble).
+            if (const osg::Vec2f stumble = world->getActorRagdollStumble(mPtr); stumble.length2() > 0.0f)
+            {
+                movementSettings.mPosition[0] = stumble.x();
+                movementSettings.mPosition[1] = stumble.y();
+            }
 
             // Force Jump Logic
 
@@ -2398,9 +2698,12 @@ namespace MWMechanics
             }
             else if (mMovementState != CharState_None && mAdjustMovementAnimSpeed)
             {
-                // Vanilla caps the played animation speed.
+                // Vanilla caps the played animation speed. The active ragdoll
+                // route publishes a persistent scale so the played stride can
+                // match the actor's movement speed.
                 const float maxSpeedMult = 10.f;
-                const float speedMult = speed / mMovementAnimSpeed;
+                const float speedMult
+                    = speed / mMovementAnimSpeed * mAnimation->getLocomotionSpeedScale();
                 mAnimation->adjustSpeedMult(mCurrentMovement, std::min(maxSpeedMult, speedMult));
                 // Make sure the actual speed is the "expected" speed even though the animation is slower
                 if (isMovementAnimationControlled())
@@ -2449,6 +2752,9 @@ namespace MWMechanics
 
         osg::Vec3f movementFromAnimation
             = mAnimation->runAnimation(mSkipAnim && !isScriptedAnimPlaying() ? 0.f : duration);
+
+        if (cls.isActor() && !cls.getCreatureStats(mPtr).isDead())
+            world->sampleActorRagdollMotion(mPtr, duration);
 
         if (mPtr.getClass().isActor() && !isScriptedAnimPlaying())
         {
@@ -2751,7 +3057,16 @@ namespace MWMechanics
         if (mHitState != CharState_None || mDeathState != CharState_None)
             return true;
 
-        if (Settings::game().mPlayerMovementIgnoresAnimation && mPtr == getPlayer())
+        // A powered body realizes movement through contacts and joint motors.
+        // Animation root motion is not its input: individual walk frames
+        // contain lateral sway and speed pulses even with W held. This held
+        // for the player only until 2026-09-11; the NPC strafe capture (seed
+        // 90001) showed the same pulses (37-52 u/s at the walk-cycle period)
+        // reaching the walker, and the pulses alone fell it offline in 5/8
+        // runs (history/strafe-native-input-2026-09-11.txt).
+        if (MWBase::Environment::get().getWorld()->isActorPoweredRagdoll(mPtr))
+            return false;
+        if (mPtr == getPlayer() && Settings::game().mPlayerMovementIgnoresAnimation)
             return false;
 
         if (mInJump)
@@ -2782,6 +3097,12 @@ namespace MWMechanics
 
     void CharacterController::forceStateUpdate()
     {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        const UpperBodyState oldUpperBodyState = mUpperBodyState;
+        traceTwoHandWeaponVisibility("force_state_before", mPtr, mAnimation,
+            oldUpperBodyState, mUpperBodyState, mCurrentWeapon);
+#endif
+        cancelRagdollAttack();
         if (!mAnimation)
             return;
         clearAnimQueue();
@@ -2791,6 +3112,13 @@ namespace MWMechanics
         mCanCast = false;
         mCastingScriptedSpell = false;
         setAttackingOrSpell(false);
+        // Rebuilding the animation can interrupt equipping before its attach
+        // key. We are completing that transition below, so attach the still
+        // drawn item now; the discarded equip clip can no longer do it.
+        if (mUpperBodyState == UpperBodyState::Equipping && isWeaponOrToolType(mWeaponTypeId)
+            && mPtr.getClass().getCreatureStats(mPtr).getDrawState() == DrawState::Weapon
+            && !mAnimation->getWeaponsShown())
+            mAnimation->showWeapons(true);
         if (mUpperBodyState != UpperBodyState::None)
             mUpperBodyState = UpperBodyState::WeaponEquipped;
 
@@ -2804,10 +3132,15 @@ namespace MWMechanics
         updateAnimQueue();
 
         mAnimation->runAnimation(0.f);
+#ifdef OPENMW_RAGDOLL_DEV_API
+        traceTwoHandWeaponVisibility("force_state_after", mPtr, mAnimation,
+            oldUpperBodyState, mUpperBodyState, mCurrentWeapon);
+#endif
     }
 
     CharacterController::KillResult CharacterController::kill()
     {
+        cancelRagdollAttack();
         if (mDeathState == CharState_None)
         {
             playRandomDeath();
@@ -2941,6 +3274,15 @@ namespace MWMechanics
         return mUpperBodyState == UpperBodyState::AttackWindUp;
     }
 
+    bool CharacterController::isAttackAnimationActive() const
+    {
+        // The attack input only covers the wind-up; the hand travels fastest
+        // during the release and follow-through, which is where a physical
+        // arm following the animation needs its strike authority.
+        return mUpperBodyState == UpperBodyState::AttackWindUp || mUpperBodyState == UpperBodyState::AttackRelease
+            || mUpperBodyState == UpperBodyState::AttackEnd;
+    }
+
     bool CharacterController::isCastingSpell() const
     {
         return mCastingScriptedSpell || mUpperBodyState == UpperBodyState::Casting;
@@ -3007,7 +3349,13 @@ namespace MWMechanics
 
     void CharacterController::setAIAttackType(std::string_view attackType)
     {
+        setAttackType(attackType);
+    }
+
+    void CharacterController::setAttackType(std::string_view attackType)
+    {
         mAttackType = attackType;
+        mPtr.getClass().getCreatureStats(mPtr).setAttackType(attackType);
     }
 
     std::string_view CharacterController::getRandomAttackType()
@@ -3019,6 +3367,12 @@ namespace MWMechanics
         if (random >= 1 / 3.f)
             return "slash";
         return "chop";
+    }
+
+    std::string_view CharacterController::getRandomHandToHandAttackType()
+    {
+        MWBase::World* world = MWBase::Environment::get().getWorld();
+        return Misc::Rng::rollProbability(world->getPrng()) < 0.5f ? "slash" : "thrust";
     }
 
     bool CharacterController::readyToPrepareAttack() const
@@ -3063,6 +3417,14 @@ namespace MWMechanics
 
     void CharacterController::playSwishSound() const
     {
+        // SND-01: a powered body's swings whoosh from its blade's speed
+        // (OPENMW_RAGDOLL_SWING_VOICE, physicssystem.cpp), not from the clip.
+        static const auto swingVoice_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_SWING_VOICE");
+            return text && std::atof(text) > 0.0;
+        });
+        if (swingVoice_tuned.get() && MWBase::Environment::get().getWorld()->isPoweredRagdoll(mPtr))
+            return;
         static ESM::RefId weaponSwish = ESM::RefId::stringRefId("Weapon Swish");
         const ESM::RefId* soundId = &weaponSwish;
         float volume = 0.98f + mAttackStrength * 0.02f;

@@ -83,6 +83,11 @@ namespace SceneUtil
         return mSourceGeometry;
     }
 
+    osg::ref_ptr<osg::Geometry> MorphGeometry::copyDeformedGeometry() const
+    {
+        return new osg::Geometry(*getGeometry(mLastFrameNumber), osg::CopyOp::DEEP_COPY_ARRAYS);
+    }
+
     void MorphGeometry::accept(osg::NodeVisitor& nv)
     {
         if (!nv.validNodeMask(*this))
@@ -172,6 +177,18 @@ namespace SceneUtil
 
     void MorphGeometry::cull(osg::NodeVisitor* nv)
     {
+        if (const auto* source = mMorphSource.get(); source && source->mMorphTargets.size() == mMorphTargets.size())
+        {
+            for (std::size_t i = 0; i < mMorphTargets.size(); ++i)
+            {
+                const float weight = source->mMorphTargets[i].getWeight();
+                if (mMorphTargets[i].getWeight() != weight)
+                {
+                    mMorphTargets[i].setWeight(weight);
+                    mDirty = true;
+                }
+            }
+        }
         if (mLastFrameNumber == nv->getTraversalNumber() || !mDirty || mMorphTargets.size() == 0)
         {
             osg::Geometry& geom = *getGeometry(mLastFrameNumber);

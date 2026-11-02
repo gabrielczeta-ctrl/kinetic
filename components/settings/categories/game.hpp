@@ -73,6 +73,9 @@ namespace Settings
         SettingValue<bool> mDayNightSwitches{ mIndex, "Game", "day night switches" };
         SettingValue<DetourNavigator::CollisionShapeType> mActorCollisionShapeType{ mIndex, "Game",
             "actor collision shape type" };
+        SettingValue<bool> mEnablePassiveRagdolls{ mIndex, "Game", "enable passive ragdolls" };
+        SettingValue<bool> mGeometricMeleeConnection{ mIndex, "Game", "geometric melee connection" };
+        SettingValue<int> mPassiveRagdollCap{ mIndex, "Game", "passive ragdoll cap", makeClampSanitizerInt(0, 100) };
         SettingValue<bool> mPlayerMovementIgnoresAnimation{ mIndex, "Game", "player movement ignores animation" };
         SettingValue<bool> mTerrainObstructsFocus{ mIndex, "Game", "terrain obstructs focus" };
     };

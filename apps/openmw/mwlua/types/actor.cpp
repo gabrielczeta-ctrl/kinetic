@@ -1,6 +1,7 @@
 #include "types.hpp"
 
 #include <array>
+#include <optional>
 
 #include <components/detournavigator/agentbounds.hpp>
 #include <components/lua/luastate.hpp>
@@ -472,15 +473,44 @@ namespace MWLua
                 }
             }
 
+            std::optional<osg::Vec3f> hitPosition;
+            if (const sol::optional<osg::Vec3f> value = options.get<sol::optional<osg::Vec3f>>("hitPos"))
+                hitPosition = *value;
+
             context.mLuaManager->addAction(
                 [self = Object(self), damages = std::move(damageCpp),
                     attacker = options.get<sol::optional<Object>>("attacker"), weaponId,
-                    successful = options.get<bool>("successful"), sourceType = sourceType] {
+                    successful = options.get<bool>("successful"), sourceType = sourceType,
+                    hitPosition = std::move(hitPosition),
+                    physicalHitId = options.get_or<std::uint64_t>("physicalHitId", 0)] {
                     MWWorld::Ptr attackerPtr;
                     MWWorld::Ptr weaponPtr;
                     if (attacker)
                         attackerPtr = attacker->ptr();
-                    self.ptr().getClass().onHit(self.ptr(), damages, weaponId, attackerPtr, successful, sourceType);
+                    const MWWorld::Ptr victim = self.ptr();
+                    MWBase::World* world = MWBase::Environment::get().getWorld();
+                    // Claim before applying damage: repeated delivery must not
+                    // debit health twice, nor attach to a replacement body.
+                    if (physicalHitId != 0 && !world->beginPhysicalHitReceipt(victim, physicalHitId))
+                        return;
+                    auto& stats = victim.getClass().getCreatureStats(victim);
+                    const bool wasDead = stats.isDead();
+                    const float healthBefore = stats.getHealth().getCurrent();
+                    const float fatigueBefore = stats.getFatigue().getCurrent();
+                    victim.getClass().onHit(victim, damages, weaponId, attackerPtr, successful, sourceType);
+                    if (physicalHitId != 0)
+                        world->finishPhysicalHitReceipt(victim, physicalHitId,
+                            std::max(0.0f, healthBefore - stats.getHealth().getCurrent()),
+                            std::max(0.0f, fatigueBefore - stats.getFatigue().getCurrent()));
+                    const auto healthDamage = damages.find("health");
+                    if (!wasDead && victim.getClass().getCreatureStats(victim).isDead() && hitPosition
+                        && healthDamage != damages.end() && healthDamage->second > 0.0f && !attackerPtr.isEmpty())
+                    {
+                        const osg::Vec3f direction = victim.getRefData().getPosition().asVec3()
+                            - attackerPtr.getRefData().getPosition().asVec3();
+                        MWBase::Environment::get().getWorld()->recordActorKillingBlow(
+                            victim, *hitPosition, direction, healthDamage->second);
+                    }
                 },
                 "HitAction");
         };

@@ -1,7 +1,16 @@
 #include "aicombat.hpp"
+#include <ragdollcore/tuning.hpp>
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <map>
+#include <vector>
+
+#include <components/debug/debuglog.hpp>
 #include <components/detournavigator/navigatorutils.hpp>
 #include <components/esm3/aisequence.hpp>
+#include <components/esm3/loadarmo.hpp>
 #include <components/misc/coordinateconverter.hpp>
 #include <components/misc/mathutil.hpp>
 #include <components/misc/pathgridutils.hpp>
@@ -11,6 +20,7 @@
 #include "../mwphysics/raycasting.hpp"
 
 #include "../mwworld/class.hpp"
+#include "../mwworld/inventorystore.hpp"
 #include "../mwworld/esmstore.hpp"
 
 #include "../mwbase/dialoguemanager.hpp"
@@ -30,6 +40,105 @@
 
 namespace
 {
+    // CROWD (user 10-09: "better AI when fighting multiple enemies, they start
+    // overlapping each other because they grab the same path to approach the
+    // player"; chosen: all attack, spaced). Every melee attacker writes where
+    // it stands about its target each frame; each one then keeps an angle
+    // from the others round that target (all of them still attack, from
+    // their own sides), heads for its own point on the way in instead of the
+    // target's position, and holds its cut while an ally stands in the line.
+    // OPENMW_RAGDOLL_CROWD=1 (0 = each fights alone, as before).
+    bool crowdEnabled()
+    {
+        static const auto enabled_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CROWD");
+            return text && std::atoi(text) != 0;
+        });
+        static const auto& enabled = enabled_tuned.get();
+        return enabled;
+    }
+
+    struct CrowdMember
+    {
+        const void* mActor = nullptr;
+        osg::Vec3f mPosition;
+        std::chrono::steady_clock::time_point mSeen;
+    };
+
+    struct CrowdSteer
+    {
+        float mStrafe = 0.0f; // toward more room round the target (actor frame, facing the target)
+        float mBearing = 0.0f; // the angle round the target to head for (radians, world)
+        bool mHasOthers = false;
+        bool mAllyInLine = false;
+    };
+
+    std::map<const void*, std::vector<CrowdMember>>& crowdRings()
+    {
+        static std::map<const void*, std::vector<CrowdMember>> rings;
+        return rings;
+    }
+
+    CrowdSteer stepCrowd(const MWWorld::Ptr& actor, const MWWorld::Ptr& target)
+    {
+        CrowdSteer result;
+        const auto now = std::chrono::steady_clock::now();
+        const osg::Vec3f self = actor.getRefData().getPosition().asVec3();
+        const osg::Vec3f centre = target.getRefData().getPosition().asVec3();
+        auto& ring = crowdRings()[target.mRef];
+        ring.erase(std::remove_if(ring.begin(), ring.end(),
+                       [&](const CrowdMember& m) {
+                           return m.mActor == actor.mRef || now - m.mSeen > std::chrono::milliseconds(500);
+                       }),
+            ring.end());
+        osg::Vec2f radial(self.x() - centre.x(), self.y() - centre.y());
+        const float distance = radial.length();
+        const float bearing = std::atan2(radial.y(), radial.x());
+        result.mBearing = bearing;
+        // Room enough for each: a share of the circle, 50-110 degrees.
+        int others = 0;
+        for (const auto& m : ring)
+            if ((m.mPosition - centre).length() < 700.0f)
+                ++others;
+        result.mHasOthers = others > 0;
+        float push = 0.0f;
+        if (others > 0 && distance > 1.0f)
+        {
+            const float gap = std::clamp(2.0f * osg::PIf / static_cast<float>(others + 1),
+                osg::DegreesToRadians(50.0f), osg::DegreesToRadians(110.0f));
+            const osg::Vec2f toTarget = -radial / distance;
+            for (const auto& m : ring)
+            {
+                const osg::Vec2f r(m.mPosition.x() - centre.x(), m.mPosition.y() - centre.y());
+                if (r.length() > 700.0f || r.length() < 1.0f)
+                    continue;
+                float d = bearing - std::atan2(r.y(), r.x());
+                while (d > osg::PIf)
+                    d -= 2.0f * osg::PIf;
+                while (d < -osg::PIf)
+                    d += 2.0f * osg::PIf;
+                if (std::abs(d) < gap)
+                {
+                    // Even with both on one line, they part: the order of
+                    // their records decides which way each goes.
+                    const float side = std::abs(d) > 1e-3f ? (d > 0.0f ? 1.0f : -1.0f)
+                                                           : (actor.mRef < m.mActor ? 1.0f : -1.0f);
+                    push += side * (1.0f - std::abs(d) / gap);
+                }
+                // An ally between it and the target, near and in the line.
+                const osg::Vec2f toAlly(m.mPosition.x() - self.x(), m.mPosition.y() - self.y());
+                const float allyDistance = toAlly.length();
+                if (allyDistance > 1.0f && allyDistance < 120.0f && allyDistance < distance
+                    && (toAlly / allyDistance) * toTarget > std::cos(osg::DegreesToRadians(35.0f)))
+                    result.mAllyInLine = true;
+            }
+            result.mBearing = bearing + std::clamp(push, -1.0f, 1.0f) * gap;
+        }
+        // Facing the target, moving right turns the bearing up (x east, y north).
+        result.mStrafe = std::clamp(1.5f * push, -1.0f, 1.0f);
+        ring.push_back(CrowdMember{ actor.mRef, self, now });
+        return result;
+    }
 
     // chooses an attack depending on probability to avoid uniformity
     std::string_view chooseBestAttack(const ESM::Weapon* weapon);
@@ -149,9 +258,21 @@ namespace MWMechanics
                 updateLOS(actor, target, duration, storage);
                 const float targetReachedTolerance
                     = storage.mLOS && !storage.mUseCustomDestination ? storage.mAttackRange : 0.0f;
-                const osg::Vec3f destination = storage.mUseCustomDestination
+                osg::Vec3f destination = storage.mUseCustomDestination
                     ? storage.mCustomDestination
                     : target.getRefData().getPosition().asVec3();
+                // CROWD: on the way in, each heads for its own side of the
+                // target (half the way, at most 160 units out from it).
+                if (crowdEnabled() && !storage.mUseCustomDestination)
+                {
+                    const auto crowd = stepCrowd(actor, target);
+                    const float away = (actor.getRefData().getPosition().asVec3() - destination).length();
+                    if (crowd.mHasOthers && away > 180.0f)
+                    {
+                        const float out = std::min(0.5f * away, 160.0f);
+                        destination += osg::Vec3f(std::cos(crowd.mBearing), std::sin(crowd.mBearing), 0.0f) * out;
+                    }
+                }
                 const bool isTargetReached = pathTo(actor, destination, duration,
                     characterController.getSupportedMovementDirections(), targetReachedTolerance);
                 if (isTargetReached)
@@ -171,6 +292,339 @@ namespace MWMechanics
                     {
                         storage.mShouldApproach = false;
                         storage.mMovement.mPosition[1] = 0.f;
+                    }
+                }
+            }
+
+            // DUEL-AI-01 stage 1 (user 2026-09-29: "the duels slower and more
+            // thought out, instead of running and spamming at the player, they
+            // wait for the correct moment"): a powered melee fighter near its
+            // target holds at the edge of reach and steps in to strike on an
+            // opening (RagdollCore::stepDuelTactics), where vanilla ran in and
+            // attacked whenever the clip allowed, with random sidesteps.
+            // OPENMW_RAGDOLL_DUEL_TACTICS=0 restores vanilla.
+            static const auto duelTactics_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DUEL_TACTICS");
+                return !(text && std::atoi(text) == 0);
+            });
+            static const auto& duelTactics = duelTactics_tuned.get();
+            const bool wasDuelling = storage.mDuelActive;
+            storage.mDuelActive = false;
+            storage.mDuelGuardWanted = false;
+            if (duelTactics && !isRangedCombat && storage.mCurrentAction && storage.mLOS
+                && MWBase::Environment::get().getWorld()->isPoweredRagdoll(actor))
+            {
+                const float distance = getDistanceToBounds(actor, target);
+                const auto selfBody = getRagdollDuelView(actor);
+                if (selfBody && distance < 400.0f)
+                {
+                    storage.mDuelActive = true;
+                    if (!wasDuelling)
+                        storage.mDuel = RagdollCore::DuelTacticsState{};
+                    if (storage.mDuel.mSeed == 1)
+                        storage.mDuel.mSeed = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(actor.mRef)) | 1u;
+                    const auto reachOf = [](bool armed) {
+                        return armed ? cRagdollMeleePhysicalReach : cRagdollMeleeUnarmedReach;
+                    };
+                    // The reach by the weapon's length (user 10-05, build 57: enemies
+                    // should connect more and approach more thoughtfully): an armed
+                    // body's 40 units are a longsword's (tip 66 from the hand);
+                    // others hold `share` of the difference nearer or farther
+                    // (-25..+40). Off by default: at 0.6 the duels landed fewer blows
+                    // (DUEL-A02/L01/W01 + ARMS-01, one run: impacts 45 vs 66), the
+                    // long weapons holding too far. OPENMW_RAGDOLL_DUEL_WEAPON_REACH
+                    // = share (0 = 40 for every weapon).
+                    static const auto weaponReachShare_tuned = RagdollCore::tuned<float>([] {
+                        const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DUEL_WEAPON_REACH");
+                        return text ? static_cast<float>(std::atof(text)) : 0.0f;
+                    });
+                    static const auto& weaponReachShare = weaponReachShare_tuned.get();
+                    const auto bodyReach = [&](const RagdollCore::DuelBodyView& body) {
+                        if (!body.mArmed || body.mWeaponReach <= 0.0f || weaponReachShare <= 0.0f)
+                            return reachOf(body.mArmed);
+                        return cRagdollMeleePhysicalReach
+                            + std::clamp((body.mWeaponReach - 66.0f) * weaponReachShare, -25.0f, 40.0f);
+                    };
+                    RagdollCore::DuelSelfView self;
+                    self.mReach = bodyReach(*selfBody);
+                    const auto& fatigue = actorStats.getFatigue();
+                    self.mFatigue = fatigue.getModified() > 0.0f
+                        ? std::clamp(fatigue.getCurrent() / fatigue.getModified(), 0.0f, 1.0f)
+                        : 1.0f;
+                    self.mAttacking = storage.mAttack || !characterController.readyToStartAttack();
+                    self.mAggression
+                        = std::clamp(actorStats.getAiSetting(AiSetting::Fight).getModified() / 100.0f, 0.0f, 1.0f);
+                    const ESM::RefId skill
+                        = weapon ? getWeaponType(weapon->mData.mType)->mSkill : ESM::Skill::HandToHand;
+                    self.mSkill = std::clamp(actorClass.getSkill(actor, skill) / 100.0f, 0.0f, 1.0f);
+                    // Dodging learns like the guard (user 10-05, build 57: after
+                    // repeated hits "guard that side, block or dodge"): each blow
+                    // taken lately adds this much to the dodge chance (up to 0.9).
+                    // OPENMW_RAGDOLL_DUEL_DODGE_LEARN (0 = off).
+                    static const auto dodgeLearn_tuned = RagdollCore::tuned<float>([] {
+                        const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DUEL_DODGE_LEARN");
+                        return text ? static_cast<float>(std::atof(text)) : 0.08f;
+                    });
+                    static const auto& dodgeLearn = dodgeLearn_tuned.get();
+                    self.mDodgeBonus = dodgeLearn * selfBody->mHitsTaken;
+                    self.mGuardBroken = selfBody->mGuardBroken;
+                    // AI-02 fighter terms from the stats (read by the AI_* items).
+                    {
+                        RagdollCore::DuelStatsInput in;
+                        in.mWeaponSkill = actorClass.getSkill(actor, skill);
+                        in.mBlock = actorClass.getSkill(actor, ESM::Skill::Block);
+                        if (actorClass.hasInventoryStore(actor))
+                        {
+                            const MWWorld::InventoryStore& inventory = actorClass.getInventoryStore(actor);
+                            const auto left = inventory.getSlot(MWWorld::InventoryStore::Slot_CarriedLeft);
+                            in.mShield = left != inventory.end() && left->getType() == ESM::Armor::sRecordId;
+                        }
+                        in.mAgility = actorStats.getAttribute(ESM::Attribute::Agility).getModified();
+                        in.mLuck = actorStats.getAttribute(ESM::Attribute::Luck).getModified();
+                        in.mSpeed = actorStats.getAttribute(ESM::Attribute::Speed).getModified();
+                        in.mWillpower = actorStats.getAttribute(ESM::Attribute::Willpower).getModified();
+                        in.mFight = actorStats.getAiSetting(AiSetting::Fight).getModified();
+                        in.mFlee = actorStats.getAiSetting(AiSetting::Flee).getModified();
+                        if (target.getClass().isActor())
+                            in.mLevelDifference = static_cast<float>(
+                                actorStats.getLevel() - target.getClass().getCreatureStats(target).getLevel());
+                        in.mFatigueTerm = actorStats.getFatigueTerm();
+                        const RagdollCore::DuelStats terms = RagdollCore::duelStats(in);
+                        self.mAttackSkill = terms.mAttack;
+                        self.mGuardSkill = terms.mGuard;
+                        self.mNerve = terms.mNerve;
+                        self.mFootwork = terms.mFootwork;
+                        const auto& health = actorStats.getHealth();
+                        self.mHealth = health.getModified() > 0.0f
+                            ? std::clamp(health.getCurrent() / health.getModified(), 0.0f, 1.0f)
+                            : 1.0f;
+                        // AI-02 item 3: when it tires and rests.
+                        self.mWillpower = std::clamp(in.mWillpower / 100.0f, 0.0f, 1.0f);
+                        self.mEndurance = std::clamp(
+                            actorStats.getAttribute(ESM::Attribute::Endurance).getModified() / 100.0f, 0.0f, 1.0f);
+                    }
+                    // AI-02 item 5: the parry it just won (filled by the physics).
+                    self.mSinceParryWon = selfBody->mSinceParryWon;
+                    // AI-02 item 1a: seconds in the wheel's recover stage.
+                    storage.mDuelWheelRecover
+                        = selfBody->mWheelStage == 3 ? storage.mDuelWheelRecover + duration : 0.0f;
+                    RagdollCore::DuelOpponentView opponent;
+                    opponent.mDistance = distance;
+                    if (const auto targetBody = getRagdollDuelView(target))
+                    {
+                        opponent.mReach = bodyReach(*targetBody);
+                        opponent.mSwinging = targetBody->mTipSpeed > 300.0f;
+                        opponent.mSinceSwing = targetBody->mSinceFast;
+                        opponent.mSinceBounce = targetBody->mSinceBounce;
+                        opponent.mOffBalance = targetBody->mOffBalance;
+                        opponent.mDown = targetBody->mDown;
+                        opponent.mWindingUp = targetBody->mWindingUp;
+                        // Facing each other, its right is this fighter's left.
+                        opponent.mBladeSide = -targetBody->mTipSide;
+                        opponent.mCannotBlock = targetBody->mGuardBroken || targetBody->mStaggered;
+                    }
+                    else
+                    {
+                        const auto& targetStats = target.getClass().getCreatureStats(target);
+                        opponent.mSwinging = targetStats.getAttackingOrSpell();
+                        opponent.mDown = targetStats.getKnockedDown();
+                    }
+                    // AI-02 item 3: the target's fatigue share, as its own.
+                    {
+                        const auto& targetFatigue = target.getClass().getCreatureStats(target).getFatigue();
+                        opponent.mFatigue = targetFatigue.getModified() > 0.0f
+                            ? std::clamp(targetFatigue.getCurrent() / targetFatigue.getModified(), 0.0f, 1.0f)
+                            : 1.0f;
+                    }
+                    // AI-02 item 2: the target's own speed toward this fighter
+                    // (u/s, smoothed over ~0.1 s), its position differenced per frame.
+                    {
+                        const osg::Vec3f selfNow(actor.getRefData().getPosition().asVec3());
+                        const osg::Vec3f targetNow(target.getRefData().getPosition().asVec3());
+                        osg::Vec3f toSelf = selfNow - targetNow;
+                        toSelf.z() = 0.0f;
+                        const float gap = toSelf.normalize();
+                        // Another target, or a jump (a teleport, a restage): no
+                        // speed from it (review 10-08: a false charge read).
+                        const bool sameTarget = storage.mDuelTargetRef == static_cast<const void*>(target.mRef);
+                        const bool jumped = (targetNow - storage.mDuelTargetLast).length() > 50.0f;
+                        if (wasDuelling && sameTarget && storage.mDuelTargetLastValid && !jumped && duration > 0.0f
+                            && gap > 0.0f)
+                        {
+                            const float closing = std::clamp(
+                                ((targetNow - storage.mDuelTargetLast) / duration) * toSelf, -600.0f, 600.0f);
+                            storage.mDuelClosing += (closing - storage.mDuelClosing) * std::min(1.0f, duration / 0.1f);
+                        }
+                        else
+                            storage.mDuelClosing = 0.0f;
+                        storage.mDuelTargetRef = target.mRef;
+                        storage.mDuelTargetLast = targetNow;
+                        storage.mDuelTargetLastValid = true;
+                        opponent.mClosing = storage.mDuelClosing;
+                    }
+                    const RagdollCore::DuelPhase before = storage.mDuel.mPhase;
+                    // OPENMW_RAGDOLL_DUEL_CHASE = retreat speed (units/s) that starts
+                    // a chase (0 = no chase, the stage-1 tactics; see
+                    // DuelTacticsSettings::mRetreatSpeed for the default).
+                    static const auto tactics_tuned = RagdollCore::tuned<RagdollCore::DuelTacticsSettings>([] {
+                        RagdollCore::DuelTacticsSettings value;
+                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DUEL_CHASE"))
+                            value.mRetreatSpeed = static_cast<float>(std::atof(text));
+                        // OPENMW_RAGDOLL_DUEL_CIRCLE = sideways share while
+                        // measuring (0 = no footwork).
+                        // OPENMW_RAGDOLL_DUEL_CIRCLE="share,lock gap".
+                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DUEL_CIRCLE"))
+                            std::sscanf(text, "%f,%f", &value.mCircle, &value.mLockGap);
+                        // OPENMW_RAGDOLL_DUEL_DODGE_SIDE = sideways share of a
+                        // dodge (0 = straight back, the old give-ground).
+                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DUEL_DODGE_SIDE"))
+                            value.mDodgeSide = static_cast<float>(std::atof(text));
+                        // OPENMW_RAGDOLL_DUEL_DODGE_READ = units past reach within
+                        // which a read wind-up is dodged with a committed step
+                        // (DuelTacticsSettings::mDodgeRead; 0 = off, the old read
+                        // of the cut). Needs OPENMW_RAGDOLL_DODGE for the step.
+                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DUEL_DODGE_READ"))
+                            value.mDodgeRead = std::max(0.0f, static_cast<float>(std::atof(text)));
+                        // OPENMW_RAGDOLL_DUEL_COMPOSED = "patience scale, back-off
+                        // chance at skill 0, at skill 1" (build 59 bookmarks 4-5;
+                        // off: 1,0,0).
+                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DUEL_COMPOSED"))
+                            std::sscanf(text, "%f,%f,%f", &value.mPatienceScale, &value.mBackOffUnskilled,
+                                &value.mBackOffSkilled);
+                        // AI-02 (docs/ragdoll/designs/AI-02-smart-duel-ai.md), each item
+                        // off when unset (or "0").
+                        const auto aiKnob = [](const char* name) -> const char* {
+                            const char* text = RagdollCore::tuningText(name);
+                            return text && std::string_view(text) != "0" ? text : nullptr;
+                        };
+                        // OPENMW_RAGDOLL_AI_AIM = "lead s, hold share, depth, grace s" (item 1a,
+                        // start 0.45,1,30,0.3).
+                        if (const char* text = aiKnob("OPENMW_RAGDOLL_AI_AIM"))
+                            value.mAim = std::sscanf(text, "%f,%f,%f,%f", &value.mAimLead, &value.mAimHoldShare,
+                                             &value.mAimDepth, &value.mAimGrace)
+                                >= 1;
+                        // OPENMW_RAGDOLL_AI_THREAT = "1" or "charge speed u/s, threat min"
+                        // (item 2; 1 = 180, 0.35).
+                        if (const char* text = aiKnob("OPENMW_RAGDOLL_AI_THREAT"))
+                        {
+                            value.mThreat = true;
+                            float speed = 0.0f, least = value.mThreatMin;
+                            if (std::sscanf(text, "%f,%f", &speed, &least) >= 1 && speed > 1.0f)
+                                value.mChargeSpeed = speed;
+                            value.mThreatMin = least;
+                        }
+                        // OPENMW_RAGDOLL_AI_STAMINA = "pace, exploit below" (item 3, start 1.5,0.3).
+                        if (const char* text = aiKnob("OPENMW_RAGDOLL_AI_STAMINA"))
+                            value.mStamina
+                                = std::sscanf(text, "%f,%f", &value.mStaminaPace, &value.mStaminaExploit) >= 1;
+                        // OPENMW_RAGDOLL_AI_RIPOSTE = "window s, chance A0, A100, wind share"
+                        // (item 5, start 0.6,0.3,0.9,0.5; window 0 = off).
+                        if (const char* text = aiKnob("OPENMW_RAGDOLL_AI_RIPOSTE"))
+                            std::sscanf(text, "%f,%f,%f,%f", &value.mRiposteWindow, &value.mRiposteChance0,
+                                &value.mRiposteChance100, &value.mRiposteWindShare);
+                        return value;
+                    });
+                    static const auto& tactics = tactics_tuned.get();
+                    // AI-02 item 1a (AI_AIM): its own attack lasts as long as the
+                    // wheel's wind-up and cut (and the recover's first 0.2 s), not
+                    // only the animation's attack (NPCHIT-01 10-07: that ended first,
+                    // so it stepped out before the cut started).
+                    if (tactics.mAim)
+                    {
+                        const int stage = selfBody->mWheelStage;
+                        storage.mDuelWheelTime = stage == 1 || stage == 2 ? storage.mDuelWheelTime + duration : 0.0f;
+                        // At most 1.5 s: a stalled wind-up must not hold the
+                        // step-in for ever (review 10-08).
+                        self.mAttacking = self.mAttacking || ((stage == 1 || stage == 2) && storage.mDuelWheelTime < 1.5f)
+                            || (stage == 3 && storage.mDuelWheelRecover < 0.2f);
+                        self.mStrikeLead = tactics.mAimLead;
+                    }
+                    storage.mDuelSinceDown = selfBody->mDown ? 0.0f : storage.mDuelSinceDown + duration;
+                    self.mSinceDown = storage.mDuelSinceDown;
+                    const auto out = RagdollCore::stepDuelTactics(storage.mDuel, self, opponent, duration, tactics);
+                    storage.stopCombatMove();
+                    storage.mShouldApproach = false;
+                    storage.mMovement.mPosition[0] = out.mStrafe;
+                    bool crowdHold = false;
+                    if (crowdEnabled())
+                    {
+                        // CROWD: room round the target; no cut through an ally.
+                        const auto crowd = stepCrowd(actor, target);
+                        if (crowd.mHasOthers)
+                        {
+                            storage.mMovement.mPosition[0]
+                                = std::clamp(out.mStrafe + crowd.mStrafe, -1.0f, 1.0f);
+                            crowdHold = crowd.mAllyInLine;
+                            if (crowdHold && std::abs(crowd.mStrafe) < 0.3f)
+                                storage.mMovement.mPosition[0] = actor.mRef < target.mRef ? 1.0f : -1.0f;
+                        }
+                    }
+                    storage.mMovement.mPosition[1] = out.mForward;
+                    // A read dodge's committed step (AI dodges, DODGE_READ).
+                    if (out.mDodgeBurst)
+                    {
+                        const osg::Vec3f toTarget = target.getRefData().getPosition().asVec3()
+                            - actor.getRefData().getPosition().asVec3();
+                        osg::Vec3f away(-toTarget.x(), -toTarget.y(), 0.0f);
+                        away.normalize();
+                        const osg::Vec3f right(-away.y(), away.x(), 0.0f); // the fighter's right, facing the target
+                        osg::Vec3f direction = right * out.mDodgeSideways + away * out.mDodgeBack;
+                        direction.normalize();
+                        MWBase::Environment::get().getWorld()->requestActorRagdollDodge(actor, direction);
+                    }
+                    storage.mReadyToAttack = out.mAttack && !crowdHold;
+                    storage.mDuelRun = out.mRun;
+                    // AI-02 item 2: a backpedal from a charge raises the guard.
+                    storage.mDuelGuardWanted = out.mGuard;
+                    if (out.mGuard)
+                        requestRagdollAiGuard(actor, 0.3f);
+                    // AI-02 item 5: the vanilla 0.1-1.0 s attack cooldown
+                    // (updateAttack) would eat the riposte window.
+                    if (out.mReason == "riposte")
+                        storage.mAttackCooldown = 0.0f;
+                    // ... and only a decided riposte winds up short (review 10-08:
+                    // every attack in the window did, also after a "no").
+                    if (out.mRiposte)
+                        requestRagdollAiRiposte(actor);
+                    actorStats.setMovementFlag(CreatureStats::Flag_Run, out.mRun);
+                    const osg::Vec3f actorPos(actor.getRefData().getPosition().asVec3());
+                    const osg::Vec3f targetPos(target.getRefData().getPosition().asVec3());
+                    storage.mMovement.mRotation[2] = getZAngleToDir(targetPos - actorPos);
+                    updateActorsMovement(actor, duration, storage);
+                    static const auto trace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_DAMAGE_TRACE") != nullptr; });
+                    static const auto& trace = trace_tuned.get();
+                    // Dodges are logged too (they keep the phase).
+                    const bool dodging = out.mReason == "side-step" || out.mReason == "give ground";
+                    if (trace && (out.mPhase != before || !wasDuelling || (dodging && !storage.mDuelDodgeLogged)))
+                        Log(Debug::Info) << "RAGDOLL_DUEL actor=" << actor.getCellRef().getRefId()
+                                         << " phase=" << RagdollCore::duelPhaseName(out.mPhase)
+                                         << " reason=" << out.mReason << " distance=" << static_cast<int>(distance)
+                                         << " fatigue=" << self.mFatigue << " closing=" << opponent.mClosing;
+                    storage.mDuelDodgeLogged = dodging;
+                    // AI-02 trace: one line per decision (OPENMW_RAGDOLL_AI_TRACE=1).
+                    static const auto ai2Trace_tuned = RagdollCore::tuned<bool>([] {
+                        const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_AI_TRACE");
+                        return text && std::atoi(text) != 0;
+                    });
+                    static const auto& ai2Trace = ai2Trace_tuned.get();
+                    if (ai2Trace)
+                    {
+                        if (!out.mThreatRead.empty())
+                            Log(Debug::Info) << "RAGDOLL_AI2 actor=" << actor.getCellRef().getRefId()
+                                             << " what=threat T=" << out.mThreat << " N=" << self.mNerve
+                                             << " response=" << out.mThreatRead
+                                             << " closing=" << static_cast<int>(opponent.mClosing)
+                                             << " distance=" << static_cast<int>(distance);
+                        if (out.mPaceRead)
+                            Log(Debug::Info) << "RAGDOLL_AI2 actor=" << actor.getCellRef().getRefId()
+                                             << " what=pace fatigue=" << self.mFatigue
+                                             << " patience=" << storage.mDuel.mPatience
+                                             << " foe=" << opponent.mFatigue;
+                        if (!out.mRiposteRead.empty())
+                            Log(Debug::Info) << "RAGDOLL_AI2 actor=" << actor.getCellRef().getRefId()
+                                             << " what=riposte chosen=" << out.mRiposteRead
+                                             << " chance=" << out.mRiposteChance << " since=" << self.mSinceParryWon
+                                             << " distance=" << static_cast<int>(distance);
                     }
                 }
             }
@@ -237,7 +691,8 @@ namespace MWMechanics
                 return true;
         }
 
-        stats.setMovementFlag(CreatureStats::Flag_Run, true);
+        // Duel tactics walk at measure and run only to close a long gap.
+        stats.setMovementFlag(CreatureStats::Flag_Run, !storage.mDuelActive || storage.mDuelRun);
         float& actionCooldown = storage.mActionCooldown;
         std::unique_ptr<Action>& currentAction = storage.mCurrentAction;
 
@@ -276,6 +731,12 @@ namespace MWMechanics
         bool isRangedCombat = false;
         float& rangeAttack = storage.mAttackRange;
         rangeAttack = currentAction->getCombatRange(isRangedCombat);
+        // A powered ragdoll fights with physical blows: it must close to the
+        // body's reach, otherwise the animation hit path lands contactless
+        // blows from the authored combat distance. Fists are shorter still.
+        if (!isRangedCombat && MWBase::Environment::get().getWorld()->isPoweredRagdoll(actor))
+            rangeAttack = std::min(rangeAttack,
+                currentAction->getWeapon() == nullptr ? cRagdollMeleeUnarmedReach : cRagdollMeleePhysicalReach);
 
         ESM::Position pos = actor.getRefData().getPosition();
         const osg::Vec3f vActorPos(pos.asVec3());
@@ -745,21 +1206,30 @@ namespace
     {
         if (weapon != nullptr)
         {
-            // the more damage attackType deals the more probability it has
-            int slash = (weapon->mData.mSlash[0] + weapon->mData.mSlash[1]) / 2;
-            int chop = (weapon->mData.mChop[0] + weapon->mData.mChop[1]) / 2;
-            int thrust = (weapon->mData.mThrust[0] + weapon->mData.mThrust[1]) / 2;
+            // Only the attack types this weapon class can actually perform,
+            // weighted by the damage each deals. A dagger slashes and stabs;
+            // it never plays a chop.
+            const MWMechanics::WeaponAttackCandidates candidates
+                = MWMechanics::weaponAttackCandidates(weapon);
+            int slash = candidates.mSlash ? (weapon->mData.mSlash[0] + weapon->mData.mSlash[1]) / 2 : 0;
+            int chop = candidates.mChop ? (weapon->mData.mChop[0] + weapon->mData.mChop[1]) / 2 : 0;
+            int thrust = candidates.mThrust ? (weapon->mData.mThrust[0] + weapon->mData.mThrust[1]) / 2 : 0;
+            const int total = slash + chop + thrust;
+            if (total <= 0)
+                return "thrust";
 
             auto& prng = MWBase::Environment::get().getWorld()->getPrng();
-            const float roll = Misc::Rng::rollClosedProbability(prng) * static_cast<float>(slash + chop + thrust);
-            if (roll <= static_cast<float>(slash))
+            const float roll = Misc::Rng::rollClosedProbability(prng) * static_cast<float>(total);
+            if (slash > 0 && roll <= static_cast<float>(slash))
                 return "slash";
-            else if (roll <= static_cast<float>(slash + thrust))
+            if (thrust > 0 && roll <= static_cast<float>(slash + thrust))
                 return "thrust";
-            else
+            if (chop > 0)
                 return "chop";
+            return thrust > 0 ? "thrust" : "slash";
         }
-        return MWMechanics::CharacterController::getRandomAttackType();
+        // Unarmed: hooks and straights only, never a chop.
+        return MWMechanics::CharacterController::getRandomHandToHandAttackType();
     }
 
 }

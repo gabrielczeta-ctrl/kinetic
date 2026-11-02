@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include <osg/Array>
@@ -78,7 +79,7 @@ namespace MWRender
         osg::ref_ptr<osg::StateSet> stateSet;
         Batch mEmptyBatch;
 
-        bool mDebugOn = false;
+        std::atomic_bool mDebugOn = false;
 
         std::mutex mCollisionMutex;
         JPH::Mutex mPrimitivesLock;
@@ -87,12 +88,16 @@ namespace MWRender
 
         JPH::PhysicsSystem* mPhysicsSystem;
         std::vector<CollisionView> mCollisionViews;
+        std::vector<std::pair<osg::Vec3f, osg::Vec3f>> mRagdollTargetLines;
         osg::ref_ptr<osg::Group> mShapesRoot;
+        osg::ref_ptr<osg::Geometry> mObservationGeometry;
 
         void createGeometry();
         void destroyGeometry();
 
     public:
+        struct ObservationLine { osg::Vec3f from, to; osg::Vec4f color; };
+        void setObservationLines(const std::vector<ObservationLine>& lines);
         JPH_OVERRIDE_NEW_DELETE
 
         JoltDebugDrawer(osg::ref_ptr<osg::Group> parentNode, JPH::PhysicsSystem* physicsSystem, int debugMode = 1);
@@ -103,6 +108,10 @@ namespace MWRender
         void addCollision(const osg::Vec3f& orig, const osg::Vec3f& normal);
 
         void showCollisions();
+
+        void setRagdollTargetLines(std::vector<std::pair<osg::Vec3f, osg::Vec3f>> lines);
+
+        void showRagdollTargets();
 
         // 0 for off, anything else for on.
         void setDebugMode(int isOn);

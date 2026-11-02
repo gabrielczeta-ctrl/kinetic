@@ -1,7 +1,9 @@
 #include "worldimp.hpp"
+#include <ragdollcore/tuning.hpp>
 
 #include <array>
 #include <charconv>
+#include <cstdlib>
 #include <vector>
 
 #include <osg/ComputeBoundsVisitor>
@@ -62,6 +64,7 @@
 #include <components/settings/values.hpp>
 
 #include "../mwbase/environment.hpp"
+#include "../mwbase/inputmanager.hpp"
 #include "../mwbase/luamanager.hpp"
 #include "../mwbase/mechanicsmanager.hpp"
 #include "../mwbase/scriptmanager.hpp"
@@ -71,6 +74,7 @@
 
 #include "../mwmechanics/actorutil.hpp"
 #include "../mwmechanics/aiavoiddoor.hpp" //Used to tell actors to avoid doors
+#include "../mwmechanics/character.hpp"
 #include "../mwmechanics/combat.hpp"
 #include "../mwmechanics/creaturestats.hpp"
 #include "../mwmechanics/levelledlist.hpp"
@@ -78,6 +82,7 @@
 #include "../mwmechanics/spellcasting.hpp"
 #include "../mwmechanics/spellutil.hpp"
 #include "../mwmechanics/summoning.hpp"
+#include "../mwmechanics/weapontype.hpp"
 
 #include "../mwrender/animation.hpp"
 #include "../mwrender/camera.hpp"
@@ -102,6 +107,7 @@
 #include "containerstore.hpp"
 #include "datetimemanager.hpp"
 #include "inventorystore.hpp"
+#include "kineticnet.hpp"
 #include "manualref.hpp"
 #include "player.hpp"
 #include "projectilemanager.hpp"
@@ -357,6 +363,8 @@ namespace MWWorld
 
     void World::clear()
     {
+        cancelPlayerRagdollAttackInput();
+        mPlayerRagdollAttackInput.reset();
         mWeatherManager->clear();
         mRendering->clear();
         mProjectileManager->clear();
@@ -513,7 +521,12 @@ namespace MWWorld
 
     void World::useDeathCamera()
     {
-        mRendering->getCamera()->setMode(MWRender::Camera::Mode::ThirdPerson);
+        MWRender::Camera* camera = mRendering->getCamera();
+        camera->setMode(MWRender::Camera::Mode::ThirdPerson);
+        // Player death can create a ragdoll before the normal camera update.
+        // Rebuild the third-person skeleton now so the ragdoll never binds to
+        // first-person nodes that the deferred view change would destroy.
+        camera->processViewChange();
     }
 
     MWWorld::Player& World::getPlayer()
@@ -1188,6 +1201,19 @@ namespace MWWorld
              * clamping.
              */
             objRot[0] = std::clamp(objRot[0], -osg::PI_2f, osg::PI_2f);
+            // The powered player's first-person view stops short of its own
+            // neck (camera.cpp, OPENMW_RAGDOLL_FP_PITCH_DOWN); the look itself
+            // is capped too, so the mouse has no dead travel past the limit.
+            if (ptr == getPlayerPtr() && isFirstPerson() && isActorPoweredRagdoll(ptr))
+            {
+                static const auto down_tuned = RagdollCore::tuned<float>([] {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_FP_PITCH_DOWN");
+                    const float value = text ? static_cast<float>(std::atof(text)) : 65.0f;
+                    return osg::DegreesToRadians(std::isfinite(value) ? std::clamp(value, 10.0f, 89.9f) : 65.0f);
+                });
+                static const auto& down = down_tuned.get();
+                objRot[0] = std::min(objRot[0], down);
+            }
             objRot[1] = static_cast<float>(Misc::normalizeAngle(objRot[1]));
             objRot[2] = static_cast<float>(Misc::normalizeAngle(objRot[2]));
         }
@@ -1380,10 +1406,41 @@ namespace MWWorld
     {
         processDoors(duration);
         mProjectileManager->update(duration);
+#ifdef OPENMW_RAGDOLL_DEV_API
+        // The cut aims at the crosshair point (user 10-06, aim item 1): the
+        // camera ray is kept fresh every frame, not only while the button is
+        // held, so a click's cut follows the crosshair after the release.
+        // OPENMW_RAGDOLL_HSC_AIM_POINT=0 = the look's pitch around the chest.
+        static const auto aimPointRay_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_AIM_POINT");
+            return text && std::atof(text) > 0.0;
+        });
+        static const auto& aimPointRay = aimPointRay_tuned.get();
+        // Only with a weapon drawn (the cut's only user): the ray takes the
+        // simulation lock, every frame otherwise.
+        if (aimPointRay && mPlayer && !getPlayerPtr().isEmpty() && mRendering && mRendering->getCamera()
+            && getPlayerPtr().getClass().getCreatureStats(getPlayerPtr()).getDrawState()
+                == MWMechanics::DrawState::Weapon)
+        {
+            // Only the player's own views: a vanity, preview or static camera
+            // looks at the player from elsewhere, and its ray would aim the
+            // cut there (the cut then takes the look's pitch).
+            const MWRender::Camera& camera = *mRendering->getCamera();
+            const auto mode = camera.getMode();
+            if (mode == MWRender::Camera::Mode::FirstPerson || mode == MWRender::Camera::Mode::ThirdPerson)
+            {
+                const osg::Vec3d look = camera.getOrient() * osg::Vec3d(0, 1, 0);
+                mPhysics->setRagdollSwingAimRay(getPlayerPtr(), osg::Vec3f(camera.getPosition()), osg::Vec3f(look));
+            }
+            else
+                mPhysics->setRagdollSwingAimRay(getPlayerPtr(), osg::Vec3f(), osg::Vec3f());
+        }
+#endif
         mPhysics->stepSimulation(duration, mDiscardMovements, frameStart, frameNumber, stats);
         mProjectileManager->processHits();
         mDiscardMovements = false;
         mPhysics->moveActors();
+        mPhysics->updatePassiveRagdolls();
     }
 
     void World::updateNavigator()
@@ -1439,7 +1496,8 @@ namespace MWWorld
         /// \todo should use convexSweepTest here
         bool collisionWithActor = false;
         for (auto& [ptr, point, normal] :
-            mPhysics->getCollisionsPoints(door, MWPhysics::Layers::DOOR, MWPhysics::Layers::ACTOR))
+            mPhysics->getCollisionsPoints(door, MWPhysics::Layers::DOOR,
+                MWPhysics::Layers::ACTOR | MWPhysics::Layers::POWERED_ACTOR))
         {
 
             if (ptr.getClass().isActor())
@@ -1579,10 +1637,26 @@ namespace MWWorld
 
         mPlayer->update();
 
+        updateKineticNet(duration);
+
         mPhysics->debugDraw();
+
+        if (const auto [kick, roll] = mPhysics->takePlayerCameraKick(); kick > 0.0f || roll != 0.0f)
+        {
+            mRendering->getCamera()->addKick(kick);
+            mRendering->getCamera()->addRollKick(roll);
+        }
 
         mWorldScene->update(duration);
 
+        if (!paused)
+        {
+            mRendering->setWeaponBlades(mPhysics->getWeaponBlades());
+            // GRIP-05: a weapon held reversed is drawn reversed.
+            for (const auto& [actor, turn] : mPhysics->getWeaponGripTurns())
+                if (MWRender::Animation* animation = mRendering->getAnimation(actor))
+                    animation->setWeaponGripTurn(turn);
+        }
         mRendering->update(duration, paused);
 
         updateSoundListener();
@@ -1608,6 +1682,13 @@ namespace MWWorld
         if (!paused)
         {
             doPhysics(duration, frameStart, frameNumber, stats);
+            // Physical deaths that ended (OPENMW_RAGDOLL_DEATH_PHYSICAL) go limp now.
+            for (const MWWorld::Ptr& actor : mPhysics->takeFinishedDeaths())
+            {
+                MWRender::Animation* animation = mRendering->getAnimation(actor);
+                if (animation != nullptr && animation->getSkeleton() != nullptr)
+                    mPhysics->addPassiveRagdoll(actor, *animation->getSkeleton(), true);
+            }
         }
         else
         {
@@ -2230,6 +2311,7 @@ namespace MWWorld
 
     void World::saveLoaded(const ESM::ESMReader& reader)
     {
+        mPlayerRagdollAttackInput.reset();
         mStore.rebuildIdsIndex();
         mStore.validateDynamic();
         mTimeManager->setup(mGlobalVariables);
@@ -2238,6 +2320,8 @@ namespace MWWorld
 
     void World::setupPlayer()
     {
+        cancelPlayerRagdollAttackInput();
+        mPlayerRagdollAttackInput.reset();
         const ESM::NPC* player = mStore.get<ESM::NPC>().find(ESM::RefId::stringRefId("Player"));
         if (!mPlayer)
             mPlayer = std::make_unique<MWWorld::Player>(player);
@@ -2260,6 +2344,7 @@ namespace MWWorld
 
     void World::renderPlayer()
     {
+        cancelPlayerRagdollAttackInput();
         MWBase::Environment::get().getMechanicsManager()->remove(getPlayerPtr(), true);
 
         MWWorld::Ptr player = getPlayerPtr();
@@ -2541,6 +2626,11 @@ namespace MWWorld
         }
     }
 
+    bool World::isPoweredRagdoll(const MWWorld::ConstPtr& actor) const
+    {
+        return !actor.isEmpty() && mPhysics->isPoweredRagdoll(actor);
+    }
+
     bool World::getLOS(const MWWorld::ConstPtr& actor, const MWWorld::ConstPtr& targetActor)
     {
         if (!targetActor.getRefData().isEnabled() || !actor.getRefData().isEnabled())
@@ -2574,9 +2664,595 @@ namespace MWWorld
     void World::enableActorCollision(const MWWorld::Ptr& actor, bool enable)
     {
         MWPhysics::Actor* physicActor = mPhysics->getActor(actor);
-        if (physicActor)
-            physicActor->enableCollisionBody(enable);
+        if (!physicActor)
+            return;
+
+        if (enable)
+        {
+            mPhysics->removePassiveRagdoll(actor);
+            physicActor->enableCollisionBody(true);
+            return;
+        }
+
+        if (Settings::game().mEnablePassiveRagdolls)
+        {
+            MWRender::Animation* animation = mRendering->getAnimation(actor);
+            if (animation != nullptr && animation->getSkeleton() != nullptr
+                && mPhysics->addPassiveRagdoll(actor, *animation->getSkeleton()))
+                return;
+        }
+
+        // A failed or unsupported ragdoll falls back to the conventional dead
+        // actor path. Do not retain a killing impact that can no longer be used.
+        mPhysics->removePassiveRagdoll(actor);
+        physicActor->enableCollisionBody(false);
     }
+
+    bool World::beginPhysicalHitReceipt(const MWWorld::Ptr& actor, std::uint64_t id)
+    {
+        return mPhysics->beginPhysicalHitReceipt(actor, id);
+    }
+
+    bool World::isNetPuppet(const MWWorld::ConstPtr& actor) const
+    {
+        return mPhysics->isNetPuppet(actor);
+    }
+
+    bool World::setNetPuppet(const MWWorld::Ptr& actor)
+    {
+        return mPhysics->setNetPuppet(actor);
+    }
+
+    void World::clearNetPuppet()
+    {
+        mPhysics->clearNetPuppet();
+    }
+
+    void World::updateKineticNet(float duration)
+    {
+        KineticNet& net = KineticNet::get();
+        // The link opens once, from OPENMW_KINETIC_DUEL (no variable, no link).
+        static const bool started = net.startFromEnvironment();
+        (void)started;
+        if (!net.isActive())
+            return;
+        net.update(duration);
+        const bool connected = net.state() == KineticNet::State::Connected;
+        mPhysics->setNetActive(connected);
+        if (!connected)
+            return;
+        mPhysics->receiveNetPoses(net.takePoses());
+        mPhysics->receiveNetBlows(net.takeBlows());
+        for (const NetPose& pose : mPhysics->takeNetPlayerPoses())
+            net.sendPose(pose);
+        for (const NetBlow& blow : mPhysics->takeNetBlows())
+            net.sendBlow(blow);
+        // Damage the opponent's game priced for a blow on this player: it goes
+        // through the player's own armour in the combat script.
+        const std::vector<NetHit> hits = net.takeHits();
+        if (hits.empty() || !mPlayer)
+            return;
+        const MWWorld::Ptr player = getPlayerPtr();
+        const MWWorld::Ptr puppet = mPhysics->getNetPuppet();
+        for (const NetHit& hit : hits)
+        {
+            Log(Debug::Info) << "KINETIC_NET hit received damage=" << hit.mDamage << " health=" << hit.mHealth
+                             << " successful=" << hit.mSuccessful;
+            MWBase::Environment::get().getLuaManager()->onNetHit(puppet, player, hit.mDamage, hit.mHealth,
+                osg::Vec3f(hit.mHitPos[0], hit.mHitPos[1], hit.mHitPos[2]), hit.mSuccessful, hit.mType,
+                hit.mStrength);
+        }
+    }
+
+    void World::finishPhysicalHitReceipt(const MWWorld::Ptr& actor, std::uint64_t id, float health, float fatigue)
+    {
+        mPhysics->finishPhysicalHitReceipt(actor, id, health, fatigue);
+    }
+
+    void World::recordActorKillingBlow(
+        const MWWorld::Ptr& actor, const osg::Vec3f& worldPoint, const osg::Vec3f& direction, float healthDamage)
+    {
+        if (!Settings::game().mEnablePassiveRagdolls)
+            return;
+
+        if (actor == getPlayerPtr())
+            useDeathCamera();
+
+        mPhysics->recordKillingBlow(actor, worldPoint, direction, healthDamage);
+        MWRender::Animation* animation = mRendering->getAnimation(actor);
+        if (animation != nullptr && animation->getSkeleton() != nullptr)
+            mPhysics->addPassiveRagdoll(actor, *animation->getSkeleton());
+    }
+
+    osg::Vec2f World::getActorRagdollStumble(const MWWorld::Ptr& actor)
+    {
+        const osg::Vec3f world = mPhysics->getPassiveRagdollStumble(actor);
+        if (world.length2() < 1e-6f)
+            return osg::Vec2f();
+        const osg::Quat orientation(actor.getRefData().getPosition().rot[2], osg::Vec3f(0, 0, -1));
+        const osg::Vec3f local = orientation.inverse() * world;
+        return osg::Vec2f(local.x(), local.y());
+    }
+
+    void World::sampleActorRagdollMotion(const MWWorld::Ptr& actor, float duration)
+    {
+        if (!std::isfinite(duration) || duration <= 0.0f
+            || (!Settings::game().mEnablePassiveRagdolls && !mPhysics->hasPassiveRagdoll(actor)))
+            return;
+        MWRender::Animation* animation = mRendering->getAnimation(actor);
+        if (animation == nullptr || animation->getSkeleton() == nullptr)
+            return;
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (const auto recovery = mPhysics->getPoweredRagdollRecoveryState(actor);
+            recovery && recovery->mFaceUp)
+        {
+            std::string_view group = *recovery->mFaceUp ? "knockdown" : "knockout";
+            const auto hasRecoverySegment = [animation](std::string_view candidate) {
+                return animation->hasAnimation(candidate)
+                    && animation->getTextKeyTime(std::string(candidate) + ": loop stop") >= 0.0f
+                    && animation->getTextKeyTime(std::string(candidate) + ": stop") >= 0.0f;
+            };
+            if (!hasRecoverySegment(group))
+            {
+                const std::string_view alternate = *recovery->mFaceUp ? "knockout" : "knockdown";
+                if (hasRecoverySegment(alternate))
+                {
+                    if (!recovery->mAnimationStarted)
+                    {
+                        Log(Debug::Warning) << "Powered ragdoll recovery animation " << group
+                                            << " has no complete get-up segment for "
+                                            << actor.getCellRef().getRefId() << "; using " << alternate;
+                    }
+                    group = alternate;
+                }
+            }
+            if (!recovery->mAnimationStarted)
+            {
+                if (!hasRecoverySegment(group))
+                {
+                    Log(Debug::Warning) << "Powered ragdoll recovery animation " << group
+                                        << " is missing required loop-stop/stop text keys for "
+                                        << actor.getCellRef().getRefId();
+                    mPhysics->failPoweredRagdollControl(actor);
+                    return;
+                }
+                // The physical body follows the get-up clip through a soft root
+                // that grows in over 1.2 s; at full clip speed it lagged by over
+                // 100 degrees and then caught up in one snap that flung the arms
+                // (look knockdown 2026-09-26). At half speed (3.5 s) the body
+                // goes to hands and knees, kneels and stands with it: hand peak
+                // above the chest 5-7 units against 9-18. OPENMW_RAGDOLL_GETUP_SPEED
+                // = clip speed multiplier.
+                static const auto getUpSpeed_tuned = RagdollCore::tuned<float>([] {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_GETUP_SPEED");
+                    const float value = text ? static_cast<float>(std::atof(text)) : 0.5f;
+                    return value > 0.05f ? value : 0.5f;
+                });
+                static const auto& getUpSpeed = getUpSpeed_tuned.get();
+                // Alpha 1.0 skill parity: get-up speed by Agility and fatigue
+                // (vanilla's knockdown recovery is Agility-driven): the clip
+                // speed times 0.75 + Agility/200 (Agility 50 = 1.0, 100 = 1.25),
+                // times 0.8..1 by the fatigue share. OPENMW_RAGDOLL_GETUP_AGILITY=1.
+                static const auto getUpAgility_tuned = RagdollCore::tuned<bool>([] {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_GETUP_AGILITY");
+                    return !(text && std::atoi(text) == 0); // on: knockdowns/KNOCKRUN fine, 0 re-falls
+                });
+                static const auto& getUpAgility = getUpAgility_tuned.get();
+                float speed = getUpSpeed;
+                if (getUpAgility && actor.getClass().isActor())
+                {
+                    const auto& stats = actor.getClass().getCreatureStats(actor);
+                    const float agility = stats.getAttribute(ESM::Attribute::Agility).getModified();
+                    const auto& fatigue = stats.getFatigue();
+                    const float rested = fatigue.getModified() > 0.0f
+                        ? std::clamp(fatigue.getCurrent() / fatigue.getModified(), 0.0f, 1.0f)
+                        : 1.0f;
+                    speed *= std::clamp(0.75f + agility / 200.0f, 0.7f, 1.4f) * (0.8f + 0.2f * rested);
+                }
+                // ACRO-01: times `getup low..high` (OPENMW_RAGDOLL_ACRO_ROLL
+                // fields 7-8, documented in passiveragdollentry.inl) by
+                // Acrobatics x fatigue term / 125.
+                static const auto acroGetUp_tuned = RagdollCore::tuned<std::optional<std::array<float, 2>>>([] {
+                    std::optional<std::array<float, 2>> value;
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_ACRO_ROLL");
+                    if (!text || std::string_view(text) == "0")
+                        return value;
+                    std::array<float, 10> f{ 1.0f, 8.0f, 8.0f, 0.45f, 0.2f, 0.3f, 0.85f, 1.5f, 0.8f, 0.0f };
+                    std::sscanf(text, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6],
+                        &f[7], &f[8], &f[9]);
+                    value = std::array<float, 2>{ f[6], f[7] };
+                    return value;
+                });
+                if (const auto& acroGetUp = acroGetUp_tuned.get(); acroGetUp && actor.getClass().isNpc())
+                {
+                    const float acrobatics = actor.getClass().getSkill(actor, ESM::Skill::Acrobatics);
+                    const float q = std::clamp(
+                        acrobatics * actor.getClass().getCreatureStats(actor).getFatigueTerm() / 125.0f, 0.0f, 1.0f);
+                    speed *= (*acroGetUp)[0] + ((*acroGetUp)[1] - (*acroGetUp)[0]) * q;
+                }
+                Log(Debug::Info) << "RAGDOLL_GETUP_START actor=" << actor.getCellRef().getRefId() << " group=" << group
+                                 << " speed=" << speed;
+                animation->play(group, MWRender::Animation::AnimPriority(MWMechanics::Priority_Knockdown),
+                    MWRender::BlendMask_All, true, speed, "loop stop", "stop", 0.0f, 0);
+                if (!animation->isPlaying(group)
+                    || !mPhysics->setPoweredRagdollRecoveryAnimationStarted(actor))
+                {
+                    Log(Debug::Warning) << "Powered ragdoll recovery animation " << group
+                                        << " failed to start for " << actor.getCellRef().getRefId();
+                    mPhysics->failPoweredRagdollControl(actor);
+                    return;
+                }
+            }
+            else if (!recovery->mAnimationFinished && !animation->isPlaying(group)
+                && !mPhysics->setPoweredRagdollRecoveryAnimationFinished(actor))
+            {
+                mPhysics->failPoweredRagdollControl(actor);
+                return;
+            }
+            if (RagdollCore::tuningText("OPENMW_RAGDOLL_SAMPLE_RECOVERY_REFERENCE") != nullptr)
+            {
+                // runAnimation precedes this function, but play above starts a new
+                // clip after that update. Sample its actual source time instead of
+                // consuming the binding's previous traversal pose.
+                const auto source = animation->getRagdollAnimationSource(group);
+                const float time = animation->isPlaying(group) ? animation->getCurrentTime(group)
+                    : animation->getTextKeyTime(std::string(group) + ": stop");
+                if (!source || !source->mKeyframes || time < 0.0f
+                    || !mPhysics->samplePoweredRecoveryTarget(actor, *source->mKeyframes, time,
+                        source->mAccumulationBone, source->mAccumulationAxes))
+                {
+                    Log(Debug::Warning) << "Powered ragdoll recovery source sampling failed";
+                    mPhysics->failPoweredRagdollControl(actor);
+                    return;
+                }
+            }
+        }
+#endif
+        mPhysics->samplePassiveRagdollMotion(actor, *animation->getSkeleton(), duration);
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (const auto yaw = mPhysics->finishPoweredRagdollRecovery(actor))
+        {
+            // Keep the existing physical body and root synchronization. Only
+            // align gameplay facing with the body's completed recovery heading.
+            const osg::Vec3f rotation = actor.getRefData().getPosition().asRotationVec3();
+            rotateObject(actor, osg::Vec3f(rotation.x(), rotation.y(), *yaw), MWBase::RotationFlag_none);
+        }
+#endif
+    }
+
+    bool World::setActorRagdollGuard(bool held)
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (!mPlayer)
+            return false;
+        const MWWorld::Ptr player = getPlayerPtr();
+        if (player.isEmpty())
+            return false;
+        if (held && (!MWBase::Environment::get().getInputManager()->getControlSwitch("playercontrols")
+                        || player.getClass().getCreatureStats(player).isParalyzed()
+                        || player.getClass().getCreatureStats(player).getDrawState() != MWMechanics::DrawState::Weapon))
+            return false;
+        // Facing: where the player looks (the physics side's default).
+        return mPhysics->setPassiveRagdollGuard(player, held);
+#else
+        return false;
+#endif
+    }
+
+    bool World::shoveActorRagdoll()
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (!mPlayer)
+            return false;
+        const MWWorld::Ptr player = getPlayerPtr();
+        if (player.isEmpty() || !MWBase::Environment::get().getInputManager()->getControlSwitch("playercontrols")
+            || player.getClass().getCreatureStats(player).isParalyzed()
+            || player.getClass().getCreatureStats(player).getKnockedDown())
+            return false;
+        return mPhysics->shovePassiveRagdoll(player);
+#else
+        return false;
+#endif
+    }
+
+    bool World::dodgeActorRagdoll()
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (!mPlayer)
+            return false;
+        const MWWorld::Ptr player = getPlayerPtr();
+        if (player.isEmpty() || player.getClass().getCreatureStats(player).getKnockedDown())
+            return false;
+        return mPhysics->requestRagdollDodge(player, std::nullopt);
+#else
+        return false;
+#endif
+    }
+
+    bool World::requestActorRagdollDodge(const MWWorld::ConstPtr& actor, const osg::Vec3f& direction)
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        return mPhysics->requestRagdollDodge(actor, direction);
+#else
+        return false;
+#endif
+    }
+
+    bool World::cycleActorRagdollGrip()
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (!mPlayer)
+            return false;
+        const MWWorld::Ptr player = getPlayerPtr();
+        if (player.isEmpty() || player.getClass().getCreatureStats(player).getKnockedDown())
+            return false;
+        return mPhysics->cycleRagdollGrip(player);
+#else
+        return false;
+#endif
+    }
+
+    bool World::driveActorRagdollGuardZone(float aimRight, float aimUp, bool reset)
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (!mPlayer)
+            return false;
+        const MWWorld::Ptr player = getPlayerPtr();
+        if (player.isEmpty())
+            return false;
+        // The wheel's mouse counts: 256 per look unit.
+        return mPhysics->drivePassiveRagdollGuardZone(player, aimRight * 256.0f, aimUp * 256.0f, reset);
+#else
+        return false;
+#endif
+    }
+
+    bool World::driveActorRagdollSwing(float aimRight, float aimUp, bool held, bool thrust)
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        // Input is also polled during content loading and menus, before the
+        // player has been constructed.
+        if (!mPlayer)
+            return false;
+        const MWWorld::Ptr player = getPlayerPtr();
+        if (player.isEmpty())
+            return false;
+        if (held && (!MWBase::Environment::get().getInputManager()->getControlSwitch("playercontrols")
+                        || player.getClass().getCreatureStats(player).isParalyzed()))
+            return false;
+        // Spells and ranged weapons retain their ordinary input even when
+        // their owner happens to have a powered body.
+        if (player.getClass().getCreatureStats(player).getDrawState() == MWMechanics::DrawState::Spell)
+            return false;
+        const auto& inventory = player.getClass().getInventoryStore(player);
+        const auto equipped = inventory.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
+        if (equipped != inventory.end())
+        {
+            if (equipped->getType() != ESM::Weapon::sRecordId)
+                return false;
+            const auto type = equipped->get<ESM::Weapon>()->mBase->mData.mType;
+            if (MWMechanics::getWeaponType(type)->mWeaponClass != ESM::WeaponType::Melee)
+                return false;
+        }
+        // The stroke frame is the camera's: right is screen-right and up is
+        // screen-up, pitch included. A yaw-only frame meant looking down at a
+        // target still swung across the world's horizontal plane, so the
+        // crosshair and the weapon pointed at different places. A camera-less
+        // caller (tests, content loading) falls back to the body yaw.
+        osg::Vec3f forward;
+        osg::Vec3f up = osg::Vec3f(0.0f, 0.0f, 1.0f);
+        if (mRendering && mRendering->getCamera())
+        {
+            const MWRender::Camera& camera = *mRendering->getCamera();
+            forward = osg::Vec3f(camera.getOrient() * osg::Vec3d(0, 1, 0));
+            up = osg::Vec3f(camera.getOrient() * osg::Vec3d(0, 0, 1));
+        }
+        else
+        {
+            const ESM::Position& position = player.getRefData().getPosition();
+            forward = osg::Quat(position.rot[2], osg::Vec3(0, 0, -1)) * osg::Vec3f(0, 1, 0);
+        }
+        if (!forward.valid() || forward.length2() < 1e-6f)
+            return false;
+        osg::Vec3f right = forward ^ up;
+        if (right.length2() < 1e-6f)
+            right = forward ^ osg::Vec3f(0.0f, 0.0f, 1.0f);
+        if (right.length2() < 1e-6f)
+            return false;
+        right.normalize();
+        up = right ^ forward;
+        if (!up.valid() || up.length2() < 1e-6f)
+            up = osg::Vec3f(0.0f, 0.0f, 1.0f);
+        else
+            up.normalize();
+        // What the crosshair rests on decides which body part the stroke is
+        // pointed at.
+        if (held && mRendering && mRendering->getCamera())
+        {
+            const MWRender::Camera& camera = *mRendering->getCamera();
+            const osg::Vec3d look = camera.getOrient() * osg::Vec3d(0, 1, 0);
+            mPhysics->setRagdollSwingAimRay(player, osg::Vec3f(camera.getPosition()), osg::Vec3f(look));
+        }
+        // This queues input only. Physics consumes it once per fixed step;
+        // the legacy Lua API duration is validated but does not advance time.
+        constexpr float nominalStep = 1.0f / 60.0f;
+        return mPhysics
+            ->driveRagdollWeaponSwing(player, true, right, forward, up, aimRight, aimUp, held, nominalStep, true, thrust)
+            .has_value();
+#else
+        (void)aimRight;
+        (void)aimUp;
+        (void)held;
+        return false;
+#endif
+    }
+
+    bool World::usesPlayerRagdollAttackAnimation() const
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (!mPlayer || getPlayerConstPtr().isEmpty())
+            return false;
+        const MWWorld::Ptr player = mPlayer->getPlayer();
+        if (!isActorPoweredRagdoll(player)
+            || !MWBase::Environment::get().getInputManager()->getControlSwitch("playercontrols")
+            || player.getClass().getCreatureStats(player).isParalyzed()
+            || player.getClass().getCreatureStats(player).getDrawState() != MWMechanics::DrawState::Weapon)
+            return false;
+        const auto& inventory = player.getClass().getInventoryStore(player);
+        const auto equipped = inventory.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
+        return equipped == inventory.end() || (hasActorRagdollWeaponAttached(player)
+            && equipped->getType() == ESM::Weapon::sRecordId
+            && MWMechanics::getWeaponType(equipped->get<ESM::Weapon>()->mBase->mData.mType)->mWeaponClass
+                == ESM::WeaponType::Melee);
+#else
+        return false;
+#endif
+    }
+
+    bool World::queuePlayerRagdollAttackInput(bool held)
+    {
+        if (!held)
+        {
+            if (mPlayerRagdollAttackInput)
+                mPlayerRagdollAttackInput->mHeld = false;
+            return true;
+        }
+        if (!usesPlayerRagdollAttackAnimation())
+            return false;
+        // Under hand control a tap is its own click attack (the cut
+        // wheel's, at the weapon's pace), not Morrowind's attack clip: with the
+        // clip the body played two attacks at once. The press and the release
+        // reach the physics as one latched click. Returning false cancels the
+        // native input. OPENMW_RAGDOLL_HSC_NATIVE_TAP=1 = the clip as before.
+        static const auto nativeTap_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_NATIVE_TAP");
+            return text && std::atoi(text) != 0;
+        });
+        static const auto& nativeTap = nativeTap_tuned.get();
+        if (!nativeTap && mPhysics->isPassiveRagdollHandControlActive(getPlayerPtr()))
+        {
+            driveActorRagdollSwing(0.0f, 0.0f, true, false);
+            driveActorRagdollSwing(0.0f, 0.0f, false, false);
+            return false;
+        }
+        const MWWorld::Ptr player = getPlayerPtr();
+        const auto& inventory = player.getClass().getInventoryStore(player);
+        const auto equipped = inventory.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
+        const std::string record = equipped == inventory.end() ? std::string{}
+            : equipped->getCellRef().getRefId().serializeText();
+        // Multiple events cannot retarget a queued press to a newly equipped
+        // item. CharacterController validates the snapshot before starting.
+        if (!mPlayerRagdollAttackInput || mPlayerRagdollAttackInput->mCancelled)
+            mPlayerRagdollAttackInput = MWMechanics::RagdollAttackInput{ true, true, false, record };
+        else if (mPlayerRagdollAttackInput->mWeaponRecordId != record)
+            cancelPlayerRagdollAttackInput();
+        else
+        {
+            mPlayerRagdollAttackInput->mPressed |= !mPlayerRagdollAttackInput->mHeld;
+            mPlayerRagdollAttackInput->mHeld = true;
+        }
+        return true;
+    }
+
+    void World::cancelPlayerRagdollAttackInput()
+    {
+        mPlayerRagdollAttackInput = MWMechanics::RagdollAttackInput{ false, false, true, {} };
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (mPlayer && !getPlayerPtr().isEmpty())
+            updateActorRagdollAttack(getPlayerPtr(), {});
+#endif
+    }
+
+    std::optional<MWMechanics::RagdollAttackInput> World::consumeActorRagdollAttackInput(const MWWorld::Ptr& actor)
+    {
+        if (!mPlayer || actor != getPlayerPtr() || !mPlayerRagdollAttackInput)
+            return std::nullopt;
+        auto result = mPlayerRagdollAttackInput;
+        mPlayerRagdollAttackInput->mPressed = false;
+        if (!result->mHeld)
+            mPlayerRagdollAttackInput.reset();
+        return result;
+    }
+
+    void World::updateActorRagdollAttack(const MWWorld::Ptr& actor, const MWMechanics::RagdollAttackState& state)
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (!mPlayer || actor.isEmpty() || actor != getPlayerPtr())
+            return;
+        if (state.mPhase != MWMechanics::RagdollAttackPhase::Idle && mRendering && mRendering->getCamera())
+        {
+            const MWRender::Camera& camera = *mRendering->getCamera();
+            const osg::Vec3d look = camera.getOrient() * osg::Vec3d(0, 1, 0);
+            mPhysics->setRagdollSwingAimRay(actor, osg::Vec3f(camera.getPosition()), osg::Vec3f(look));
+        }
+        mPhysics->setRagdollAttackAnimation(actor, state);
+#else
+        (void)actor;
+        (void)state;
+#endif
+    }
+
+    bool World::isPlayerRagdollWeaponAttached() const
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        return mPlayer && hasActorRagdollWeaponAttached(getPlayerConstPtr());
+#else
+        return false;
+#endif
+    }
+
+    bool World::hasActorRagdollWeaponAttached(const MWWorld::ConstPtr& actor) const
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        return !actor.isEmpty() && mPhysics->hasAttachedRagdollWeapon(actor);
+#else
+        (void)actor;
+        return false;
+#endif
+    }
+
+    bool World::isActorPoweredRagdoll(const MWWorld::ConstPtr& actor) const
+    {
+        return mPhysics->isPoweredRagdoll(actor);
+    }
+
+    bool World::getActorRagdollCameraPosition(const MWWorld::ConstPtr& actor, osg::Vec3f& position) const
+    {
+        const std::optional<osg::Vec3f> ragdollPosition = mPhysics->getPassiveRagdollCameraPosition(actor);
+        if (!ragdollPosition)
+            return false;
+        position = *ragdollPosition;
+        return true;
+    }
+
+#ifdef OPENMW_RAGDOLL_DEV_API
+    bool World::setActorPoweredRagdoll(const MWWorld::Ptr& actor, bool enabled)
+    {
+        if (!enabled)
+        {
+            mPhysics->removePassiveRagdoll(actor);
+            return true;
+        }
+        if (actor.isEmpty() || !actor.getClass().isActor()
+            || actor.getClass().getCreatureStats(actor).isDead())
+            return false;
+        MWRender::Animation* animation = mRendering->getAnimation(actor);
+        return animation != nullptr && animation->getSkeleton() != nullptr
+            && mPhysics->addPoweredRagdoll(actor, *animation->getSkeleton());
+    }
+
+    bool World::requestActorPoweredRagdollRecovery(const MWWorld::Ptr& actor)
+    {
+        return !actor.isEmpty() && actor.getClass().isActor()
+            && !actor.getClass().getCreatureStats(actor).isDead()
+            && mPhysics->requestPoweredRagdollRecovery(actor);
+    }
+
+    osg::Vec3f World::getCameraTrackedPosition() const
+    {
+        return osg::Vec3f(mRendering->getCamera()->getTrackedPosition());
+    }
+#endif
 
     static std::optional<ESM::Position> searchMarkerPosition(const CellStore& cellStore, std::string_view editorId)
     {
@@ -2989,9 +3665,27 @@ namespace MWWorld
         }
     }
 
-    void World::launchProjectile(MWWorld::Ptr& actor, MWWorld::Ptr& projectile, const osg::Vec3f& worldPos,
+    void World::launchProjectile(MWWorld::Ptr& actor, MWWorld::Ptr& projectile, const osg::Vec3f& bonePos,
         const osg::Quat& orient, MWWorld::Ptr& bow, float speed, float attackStrength, float attackWindUp)
     {
+        // A powered body's arrow bone follows the physical arms, which hold the
+        // bow away from the aim line (RANGED-01: the arrows flew ~55 units to
+        // the right of the crosshair, parallel, and missed). Its projectiles
+        // leave from the aim line through the head instead, as far along it as
+        // the bone was. OPENMW_RAGDOLL_PROJECTILE_AIM_LINE=0 = the bone.
+        osg::Vec3f worldPos = bonePos;
+        static const auto aimLine_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PROJECTILE_AIM_LINE");
+            return !(text && std::atoi(text) == 0);
+        });
+        static const auto& aimLine = aimLine_tuned.get();
+        if (aimLine && !actor.isEmpty() && actor.getClass().isActor() && isPoweredRagdoll(actor))
+        {
+            const osg::Vec3f forward = orient * osg::Vec3f(0, 1, 0);
+            const osg::Vec3f halfExtents = mPhysics->getHalfExtents(actor);
+            const osg::Vec3f origin = actor.getRefData().getPosition().asVec3() + osg::Vec3f(0, 0, 1.8f * halfExtents.z());
+            worldPos = origin + forward * std::max(20.0f, (bonePos - origin) * forward);
+        }
         // An initial position of projectile can be outside shooter's collision box, so any object between shooter and
         // launch position will be ignored. To avoid this issue, we should check for impact immediately before launch
         // the projectile. So we cast a 1-yard-length ray from shooter to launch position and check if there are
@@ -3621,6 +4315,12 @@ namespace MWWorld
 
             safePlaceObject(ref.getPtr(), getPlayerPtr(), getPlayerPtr().getCell(), 0, 220.f);
         }
+    }
+
+    void World::spawnSparks(const osg::Vec3f& worldPos, const osg::Vec3f& normal, float strength)
+    {
+        if (mRendering)
+            mRendering->spawnSparks(worldPos, normal, strength);
     }
 
     void World::spawnEffect(VFS::Path::NormalizedView model, const std::string& textureOverride,

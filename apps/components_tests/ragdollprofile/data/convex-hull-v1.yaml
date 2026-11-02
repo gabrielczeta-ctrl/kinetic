@@ -1,0 +1,20 @@
+# Synthetic tapered solid for profile/offline shape validation; not gameplay tuning.
+schema_version: 1
+id: convex_hull_diagnostic_v1
+bodies:
+  - name: pelvis
+    bone: pelvis
+    mass_fraction: 1.0
+    center_of_mass: [0, 0, 0]
+    shape:
+      type: convex_hull
+      points:
+        - [-1, -50, -1]
+        - [-1, -50, 1]
+        - [1, -50, -1]
+        - [1, -50, 1]
+        - [-9, 50, -1]
+        - [-9, 50, 1]
+        - [9, 50, -1]
+        - [9, 50, 1]
+landmarks: { pelvis: pelvis }

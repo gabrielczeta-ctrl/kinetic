@@ -8,10 +8,12 @@
 #include <components/debug/debuglog.hpp>
 #include <components/misc/convert.hpp>
 #include <components/sceneutil/depth.hpp>
+#include <components/sceneutil/material.hpp>
 #include <osg/PolygonMode>
 #include <osg/PolygonOffset>
 #include <osg/ShapeDrawable>
 #include <osg/StateSet>
+#include <osg/LineWidth>
 
 #include "joltdebugdraw.hpp"
 #include "vismask.hpp"
@@ -35,7 +37,7 @@ namespace MWRender
         JPH::DebugRenderer::Initialize();
 
         // Keep expensive/verbose overlays disabled by default for frame-time stability.
-        mBodyDrawSettings.mDrawCenterOfMassTransform = false;
+        mBodyDrawSettings.mDrawCenterOfMassTransform = true;
         mBodyDrawSettings.mDrawGetSupportFunction = false;
         mBodyDrawSettings.mDrawSupportDirection = false;
         mBodyDrawSettings.mDrawGetSupportingFace = false;
@@ -49,6 +51,44 @@ namespace MWRender
     JoltDebugDrawer::~JoltDebugDrawer()
     {
         destroyGeometry();
+        if (mObservationGeometry) mParentNode->removeChild(mObservationGeometry);
+    }
+
+    void JoltDebugDrawer::setObservationLines(const std::vector<ObservationLine>& lines)
+    {
+        if (!mObservationGeometry && lines.empty()) return;
+        const bool created = !mObservationGeometry;
+        if (!mObservationGeometry)
+        {
+            mObservationGeometry = new osg::Geometry;
+            mObservationGeometry->setName("PLAY-04 manual arm observations");
+            mObservationGeometry->setNodeMask(Mask_Debug);
+            mObservationGeometry->setUseDisplayList(false);
+            mObservationGeometry->setDataVariance(osg::Object::DYNAMIC);
+            auto* state = mObservationGeometry->getOrCreateStateSet();
+            osg::ref_ptr<SceneUtil::Material> material = new SceneUtil::Material;
+            material->setVertexColorMode(SceneUtil::VertexColorModes::AmbientAndDiffuse);
+            material->setStateSet(state);
+            state->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF | osg::StateAttribute::OVERRIDE);
+            state->setMode(GL_LIGHTING, osg::StateAttribute::OFF | osg::StateAttribute::OVERRIDE);
+            state->setAttributeAndModes(new osg::LineWidth(3));
+            state->setRenderBinDetails(100, "RenderBin");
+            mParentNode->addChild(mObservationGeometry);
+        }
+        osg::ref_ptr<osg::Vec3Array> vertices = new osg::Vec3Array;
+        osg::ref_ptr<osg::Vec4Array> colors = new osg::Vec4Array;
+        for (const auto& line : lines)
+        {
+            vertices->push_back(line.from); vertices->push_back(line.to);
+            colors->push_back(line.color); colors->push_back(line.color);
+        }
+        mObservationGeometry->setVertexArray(vertices);
+        mObservationGeometry->setColorArray(colors, osg::Array::BIND_PER_VERTEX);
+        mObservationGeometry->removePrimitiveSet(0, mObservationGeometry->getNumPrimitiveSets());
+        mObservationGeometry->addPrimitiveSet(new osg::DrawArrays(GL_LINES, 0, static_cast<GLsizei>(vertices->size())));
+        mObservationGeometry->dirtyBound();
+        if (created)
+            MWBase::Environment::get().getResourceSystem()->getSceneManager()->recreateShaders(mObservationGeometry, "debug");
     }
 
     void JoltDebugDrawer::createGeometry()
@@ -129,6 +169,8 @@ namespace MWRender
 
     void JoltDebugDrawer::addCollision(const osg::Vec3f& orig, const osg::Vec3f& normal)
     {
+        if (!mDebugOn.load(std::memory_order_acquire))
+            return;
         std::scoped_lock lock(mCollisionMutex);
         mCollisionViews.emplace_back(orig, normal);
     }
@@ -153,9 +195,25 @@ namespace MWRender
             mCollisionViews.end());
     }
 
+    void JoltDebugDrawer::setRagdollTargetLines(std::vector<std::pair<osg::Vec3f, osg::Vec3f>> lines)
+    {
+        mRagdollTargetLines = std::move(lines);
+    }
+
+    void JoltDebugDrawer::showRagdollTargets()
+    {
+        for (const auto& [target, physics] : mRagdollTargetLines)
+        {
+            mLinesVertices->push_back(target);
+            mLinesVertices->push_back(physics);
+            mLinesColors->push_back({ 0, 1, 1, 1 });
+            mLinesColors->push_back({ 0, 1, 1, 1 });
+        }
+    }
+
     void JoltDebugDrawer::step()
     {
-        if (mDebugOn)
+        if (mDebugOn.load(std::memory_order_acquire))
         {
             mLinesVertices->clear();
             mTrisVertices->clear();
@@ -166,6 +224,7 @@ namespace MWRender
             mPhysicsSystem->DrawConstraintLimits(static_cast<JPH::DebugRenderer*>(this));
             mPhysicsSystem->DrawConstraintReferenceFrame(static_cast<JPH::DebugRenderer*>(this));
             showCollisions();
+            showRagdollTargets();
             const auto toGLsizei = [](std::size_t value) {
                 constexpr auto maxCount = static_cast<std::size_t>(std::numeric_limits<GLsizei>::max());
                 return static_cast<GLsizei>(std::min(value, maxCount));
@@ -182,9 +241,9 @@ namespace MWRender
 
     void JoltDebugDrawer::setDebugMode(int isOn)
     {
-        mDebugOn = (isOn != 0);
+        mDebugOn.store(isOn != 0, std::memory_order_release);
 
-        if (!mDebugOn)
+        if (!mDebugOn.load(std::memory_order_acquire))
             destroyGeometry();
         else
             createGeometry();
@@ -192,7 +251,7 @@ namespace MWRender
 
     int JoltDebugDrawer::getDebugMode() const
     {
-        return mDebugOn;
+        return mDebugOn.load(std::memory_order_acquire);
     }
 
     void JoltDebugDrawer::DrawLine(JPH::RVec3Arg inFrom, JPH::RVec3Arg inTo, JPH::ColorArg inColor)

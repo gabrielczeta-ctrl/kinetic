@@ -1,4 +1,5 @@
 #include "camera.hpp"
+#include <ragdollcore/tuning.hpp>
 
 #include <osg/Camera>
 
@@ -19,6 +20,8 @@
 #include "../mwphysics/raycasting.hpp"
 
 #include "npcanimation.hpp"
+
+#include <cstdlib>
 
 namespace
 {
@@ -85,6 +88,13 @@ namespace MWRender
 
     osg::Vec3d Camera::calculateTrackedPosition() const
     {
+        if (mMode != Mode::FirstPerson && !mTrackingPtr.isEmpty())
+        {
+            osg::Vec3f ragdollPosition;
+            if (MWBase::Environment::get().getWorld()->getActorRagdollCameraPosition(
+                    MWWorld::ConstPtr(mTrackingPtr), ragdollPosition))
+                return osg::Vec3d(ragdollPosition);
+        }
         if (!mTrackingNode)
             return osg::Vec3d();
         osg::NodePathList nodepaths = mTrackingNode->getParentalNodePaths();
@@ -141,15 +151,64 @@ namespace MWRender
         wm->showCrosshair(!wm->isGuiMode() && mShowCrosshair);
 
         if (!paused)
+        {
             updateFocalPointOffset(duration);
+            mKick *= std::exp(-14.0f * duration);
+            mRollKick *= std::exp(-10.0f * duration);
+        }
         updatePosition();
+    }
+
+    namespace
+    {
+        // First person on a powered body (user 2026-10-01: "move the player
+        // camera a liiitle bit forwards and limit it so it cannot look down
+        // the neck"): the eye sits OPENMW_RAGDOLL_FP_FORWARD units ahead of the
+        // head bone along the view (default 5) and looks down at most
+        // OPENMW_RAGDOLL_FP_PITCH_DOWN degrees (default 65; vanilla ~90).
+        float poweredFirstPersonSetting(const char* name, float fallback)
+        {
+            const char* text = RagdollCore::tuningText(name);
+            const float value = text ? static_cast<float>(std::atof(text)) : fallback;
+            return std::isfinite(value) ? value : fallback;
+        }
+
+        // The lowest first-person pitch, radians below level.
+        float poweredPitchDown()
+        {
+            static const auto down_tuned = RagdollCore::tuned<float>([] { return osg::DegreesToRadians(
+                std::clamp(poweredFirstPersonSetting("OPENMW_RAGDOLL_FP_PITCH_DOWN", 65.0f), 10.0f, 89.9f)); });
+            return down_tuned.get();
+        }
+
+        bool poweredFirstPerson(const MWWorld::Ptr& tracked)
+        {
+            return !tracked.isEmpty()
+                && MWBase::Environment::get().getWorld()->isActorPoweredRagdoll(MWWorld::ConstPtr(tracked));
+        }
     }
 
     osg::Vec3d Camera::calculateFirstPersonPosition(const osg::Vec3d& trackedPosition) const
     {
         osg::Vec3d res = trackedPosition;
-        osg::Vec2f horizontalOffset
-            = Misc::rotateVec2f(osg::Vec2f(mFirstPersonOffset.x(), mFirstPersonOffset.y()), mYaw);
+        osg::Vec2f firstPersonOffset(mFirstPersonOffset.x(), mFirstPersonOffset.y());
+        if (poweredFirstPerson(mTrackingPtr))
+        {
+            static const auto forward_tuned = RagdollCore::tuned<float>([] { return poweredFirstPersonSetting("OPENMW_RAGDOLL_FP_FORWARD", 5.0f); });
+            static const auto& forward = forward_tuned.get();
+            firstPersonOffset.y() += forward;
+            // FPBODY-01 (10-31, user: looking down "I see it from inside,
+            // it's transparent"): at a wide field of view (83) the bottom of
+            // the screen looks back down the collar into the torso. Looking
+            // down slides the eye forward over the chest, up to
+            // OPENMW_RAGDOLL_FP_DOWN_FORWARD units at the lowest pitch
+            // (default 8; 0 = off; 14 drops the chest out of view).
+            static const auto downForward_tuned = RagdollCore::tuned<float>(
+                [] { return poweredFirstPersonSetting("OPENMW_RAGDOLL_FP_DOWN_FORWARD", 8.0f); });
+            const float down = std::clamp(-mPitch / poweredPitchDown(), 0.0f, 1.0f);
+            firstPersonOffset.y() += downForward_tuned.get() * down;
+        }
+        osg::Vec2f horizontalOffset = Misc::rotateVec2f(firstPersonOffset, mYaw);
         res.x() += horizontalOffset.x();
         res.y() += horizontalOffset.y();
         res.z() += mFirstPersonOffset.z();
@@ -209,7 +268,7 @@ namespace MWRender
 
     osg::Quat Camera::getOrient() const
     {
-        return osg::Quat(mRoll + mExtraRoll, osg::Vec3d(0, 1, 0)) * osg::Quat(mPitch + mExtraPitch, osg::Vec3d(1, 0, 0))
+        return osg::Quat(mRoll + mExtraRoll + mRollKick, osg::Vec3d(0, 1, 0)) * osg::Quat(mPitch + mExtraPitch + mKick, osg::Vec3d(1, 0, 0))
             * osg::Quat(mYaw + mExtraYaw, osg::Vec3d(0, 0, 1));
     }
 
@@ -323,8 +382,15 @@ namespace MWRender
     {
         const float epsilon = 0.000001f;
         float limit = static_cast<float>(osg::PI_2) - epsilon;
+        float lowest = -limit;
+        // Positive pitch looks up: a powered body's first-person view stops
+        // short of looking straight down into its own neck.
+        if (mMode == Mode::FirstPerson && poweredFirstPerson(mTrackingPtr))
+        {
+            lowest = -poweredPitchDown();
+        }
         if (!mLockPitch || force)
-            mPitch = std::clamp(angle, -limit, limit);
+            mPitch = std::clamp(angle, lowest, limit);
         if (force)
             mLockPitch = true;
     }

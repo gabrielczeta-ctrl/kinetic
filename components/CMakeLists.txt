@@ -1,5 +1,7 @@
 project (Components)
 
+add_subdirectory(ragdollcore)
+
 if(APPLE)
     set(BUNDLE_RESOURCES_DIR "${APP_BUNDLE_DIR}/Contents/Resources")
     set(OPENMW_RESOURCES_ROOT ${BUNDLE_RESOURCES_DIR})
@@ -121,6 +123,10 @@ add_component_dir (physicshelpers
     operators
     processtrianglecallback
     transformboundingbox
+    )
+
+add_component_dir (ragdollprofile
+    loader skeletonadapter
     )
 
 add_component_dir (vfs
@@ -634,6 +640,7 @@ target_link_libraries(components
     ZLIB::ZLIB
 
     ${JOLT_LIBRARIES}
+    ragdollcore
     )
 
 if(yaml-cpp_VERSION VERSION_GREATER_EQUAL 0.8.0)
@@ -690,7 +697,6 @@ endif()
 set(COMPONENT_FILES ${COMPONENT_FILES} PARENT_SCOPE)
 
 target_compile_definitions(components PUBLIC
-    DOUBLE_PRECISION
     MYGUI_DONT_USE_OBSOLETE=ON
 )
 

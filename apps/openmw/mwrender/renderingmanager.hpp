@@ -202,6 +202,10 @@ namespace MWRender
 
         void removeEffect(std::string_view effectId);
 
+        void spawnSparks(const osg::Vec3f& worldPosition, const osg::Vec3f& normal, float strength);
+        /// TRAIL-01: this frame's held blades (EffectManager::setWeaponBlades).
+        void setWeaponBlades(const std::vector<std::pair<const void*, std::pair<osg::Vec3f, osg::Vec3f>>>& blades);
+
         /// Clear all savegame-specific data
         void clear();
 

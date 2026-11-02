@@ -1,3 +1,125 @@
+KINETIC
+=======
+
+**Physical melee combat for Morrowind, built on OpenMW.**
+
+*Your body. Your blade. Every swing is real.*
+
+KINETIC replaces Morrowind's dice-roll melee with physics. Every fighter, you
+and every humanoid NPC, is a powered physical body that walks on simulated
+legs, sways, steps to keep its balance, stumbles when struck, falls and gets
+back up. Your weapon is a real object in your hands. You steer it with the
+mouse, it has weight and momentum, and a blow lands only where the steel
+actually touches.
+
+It is still Morrowind. Your weapon skill decides how steady the blade is.
+Strength and Agility shape your blows and your footing, armour protects the
+slot it covers, fatigue wears you down, and a heavy blow can knock a fighter
+flat by the game's own knockdown odds. Physics decides *whether and where* a
+blow lands; Morrowind's formulas decide *how much it matters*.
+
+Features
+--------
+
+- **Physical bodies for everyone.** Catch steps when pushed, stumbles, drop
+  rolls off ledges, falls that are earned, get-ups that happen in the world.
+- **A weapon you actually hold.** Hold the left button and move the mouse to
+  guard, wind up and cut along your own stroke. Click for a full physical
+  swing at the brass reticle. The middle button thrusts.
+- **Contact decides everything.** The speed and angle at the point of contact
+  decide whether a blow bites, glances or stops. Blades cut with the edge,
+  stab with the point and bruise with the flat.
+- **Skill feels like skill.** A novice's blade wanders and waits for its
+  recovery. From weapon skill 50 attacks chain and carry their momentum into
+  the next cut.
+- **Combos.** A cut that winds up where the last one ended flows on faster
+  and for less fatigue; a click right after a parry you won is a quick
+  riposte; bare fists go jab, cross, jab.
+- **Guard, parry, shove.** The right button guards (tap to parry). Two quick
+  right clicks shove. You can attack straight out of a held guard.
+- **Reactions with weight.** A flinch, a stagger with catch steps or a
+  knockdown, decided by where the blow landed, how hard it was, and whether
+  the body could still find its feet.
+- **Wounds where they landed.** Cuts and punctures leave marks and blood; a
+  wounded limb works worse.
+- **NPCs fight by the same rules.** They use the same bodies and weapons. They
+  read your guard, keep their distance, feint and pace their attacks.
+- **Every melee weapon type.** One-handers, two-handers with both hands on
+  the grip, spears with a lunging thrust, staffs, daggers and fists. Shields
+  have their own physical body.
+- **Smooth at any frame rate.** Physics steps at 60 Hz and the bodies are drawn
+  smoothly between steps at 120 fps or uncapped.
+
+Play
+----
+
+Download the release zip from
+[Releases](https://github.com/gabrielczeta-ctrl/kinetic/releases) (or
+Nexus Mods), unpack it anywhere and run `KINETIC.cmd`. You need
+your own Morrowind (the "Data Files" folder; GOTY recommended). You don't need
+an OpenMW install, and KINETIC doesn't touch an existing one. The package
+README explains the controls, the options page (Options > Scripts > KINETIC),
+loading your other mods (`mods.cfg`) and the known limits.
+
+| Input | Action |
+|---|---|
+| Left click | Attack: a full physical swing at the reticle |
+| Hold left + move | Steer the weapon; a fast stroke is a committed swing |
+| Middle button | Thrust |
+| Right button | Guard (tap to parry) |
+| Two quick right clicks | Shove |
+
+This is a tech demo (TECH-DEMO RELEASE 0.1): the bodies and the combat work,
+and plenty is still rough. Skeletons, dremora, golden saints and liches get
+the KINETIC body (new, experimental); other creatures are still animated,
+swimming is vanilla, and a mouse drag steers the right fist only. Mods that
+change melee combat (attack, block, combat AI) will conflict with KINETIC.
+
+How it works
+------------
+
+- A 20-part powered ragdoll held to the character's capsule by a **soft
+  root**, so the body can lag, sway and be pushed off its feet.
+- **Footfall**, a gait controller that follows reference walk and run loops
+  and places each step where the body needs it.
+- **PGC**, a capture-point balance controller that plans 1-3 catch steps,
+  landings, teetering and falls.
+- A **hand controller** that plans guards, wind-ups, cuts and thrusts on a
+  wheel around the body and drives the weapon as a physical object.
+- A **contact system** that prices every blow with Morrowind's damage, hit
+  roll, armour and knockdown formulas.
+
+Every change is checked by scripted test cases (walking, balance, movement,
+combat, duels) before it reaches a play build.
+
+KINETIC is a modified OpenMW: upstream master 262d1ba0d6 (2026-08-31) with the
+Jolt physics merge request (!3919, head 953ff1c32b). It is not an official
+OpenMW release and is not endorsed by the OpenMW project.
+
+Build
+-----
+
+Windows, Visual Studio 2022, OpenMW's dependency bundle (vcpkg); CMake fetches
+Jolt, RecastNavigation and yaml-cpp.
+
+    cmake -S . -B build-release -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake ^
+        -DBUILD_OPENCS=OFF -DBUILD_LAUNCHER=OFF ^
+        -DOPENMW_RAGDOLL_DEV_API=ON -DOPENMW_RAGDOLL_TEST_LUA=OFF
+    cmake --build build-release --config Release --target openmw
+    powershell -File tools/package-kinetic.ps1 -Release -Zip
+
+The physics core is a library with its own tests (`ragdollcore-tests`).
+
+Documentation
+-------------
+
+- [docs/RELEASE-NOTES.md](docs/RELEASE-NOTES.md) - what the release contains.
+
+Licence: GPL-3.0, like OpenMW (see LICENSE). The release package adds the
+third-party notices and the source link. Made with AI assistance (Claude).
+
+---
+
 OpenMW
 ======
 

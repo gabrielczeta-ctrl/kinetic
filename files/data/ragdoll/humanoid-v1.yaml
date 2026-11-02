@@ -1,0 +1,390 @@
+# Provisional OpenMW humanoid passive-ragdoll profile.
+# Lengths are OpenMW world units. Mass fractions use a de Leva/Dempster-style
+# regional distribution as an initial engineering estimate and require tuning.
+# Fitted capsules preserve authored radius; the evaluated descendant span sets
+# their center and axial length. Short spans become spheres.
+# Motor capacities follow docs/ragdoll/actuator-budget.md for a 75 kg actor.
+# Values are kg*world-unit^2/s^2, including the squared length conversion.
+# The same limit contains pose and load demand; swing adds no extra strength.
+# Passive mode never calls the motor drive path.
+schema_version: 1
+id: openmw_humanoid_v1
+
+impact_response:
+  impulse_per_damage: 10.0
+  minimum_impulse: 40.0
+  maximum_impulse: 800.0
+  upward_bias: 0.15
+
+motion_transfer:
+  maximum_sample_duration: 0.1
+  maximum_linear_speed: 2000.0
+  maximum_angular_speed: 30.0
+
+pose_transition:
+  death_blend_duration: 0.08
+
+active_controller:
+  # PLAY-01 architecture base (docs/ragdoll/designs/PLAY-01-architecture-base.md):
+  # the game actor owns locomotion and the ragdoll root follows it as one
+  # declared kinematic body; limbs track the live animation and every impact,
+  # fall and recovery stays physical. The v5-v22 contact-root family is closed.
+  # PGC integration keeps the accepted animation-held route. The reference
+  # (Physical Gait Controller) route is the PGC branch's walker; its native
+  # walk -> hit -> physical catch -> return handoff is not integrated, and as
+  # the whole-body route it collapsed the powered player at rest (2026-09-22).
+  locomotion_route: kinematic_root
+  support_normal_minimum_dot: 0.5
+  support_margin: 4.0
+  standing_minimum_up_dot: 0.9
+  bracing_minimum_up_dot: 0.65
+  standing_maximum_speed: 60.0
+  settled_maximum_speed: 20.0
+  fallen_maximum_pelvis_height: 30.0
+  minimum_state_duration: 0.08
+  falling_exit_support_duration: 0.20
+  falling_exit_maximum_vertical_speed: 120.0
+  recovery_delay: 0.5
+  blend_back_duration: 0.25
+  pelvis_height_frequency: 3.0
+  pelvis_height_damping: 1.0
+  center_of_mass_frequency: 0.5
+  center_of_mass_damping: 1.0
+  maximum_locomotion_speed: 400.0
+  pelvis_height_settle_duration: 0.25
+  pelvis_height_settle_maximum_vertical_speed: 7.5
+  activation_support_grace_duration: 0.15
+  locomotion_support_grace_duration: 0.30
+  maximum_pelvis_force: 150000.0
+  animation_assist_horizontal_scale: 1.0
+  animation_assist_vertical_scale: 1.0
+  maximum_animation_assist_force: 150000.0
+  animation_assist_upright_scale: 1.0
+  maximum_animation_assist_torque: 1200000.0
+  # PLAY-01 Stage A batch 1. Radians, radians/s, radians/s^2 and existing
+  # engine torque units. Yaw composes with upright tilt under the final cap.
+  animation_assist_yaw_reference_maximum_rate: 3.14159265
+  animation_assist_yaw_reference_maximum_acceleration: 12.5663706
+  animation_assist_yaw_stiffness: 200000.0
+  animation_assist_yaw_damping: 50000.0
+  maximum_animation_assist_yaw_torque: 400000.0
+  animation_assist_pose_tracking_blend: 0.80
+  animation_assist_stance_anchor_compliance: 0.40
+  animation_assist_support_loss_handoff_duration: 0.10
+  animation_assist_stance_position_correction: 0.65
+  animation_assist_stance_maximum_endpoint_correction: 1.00
+  animation_assist_support_motion_frequency: 0.50
+  animation_assist_support_motion_damping: 1.00
+  animation_assist_support_position_leash: 2.00
+  animation_assist_contact_confirmation_ticks: 3
+  animation_assist_load_transfer_duration: 0.10
+  animation_assist_measured_progress_blend: 1.00
+  animation_assist_feasibility_deadline: 0.10
+  animation_assist_double_support_transfer_duration: 0.10
+  animation_assist_reentry_slip_settle_duration: 0.10
+  animation_assist_touchdown_capture_position_correction: 0.35
+  animation_assist_touchdown_capture_velocity_lookahead: 0.04
+  animation_assist_outgoing_hold_position_correction: 0.20
+  animation_assist_outgoing_hold_velocity_lookahead: 0.02
+  # Kinematic-root landings above this downward speed release the root to the
+  # passive ragdoll; softer landings are absorbed by the limbs.
+  kinematic_root_hard_landing_speed: 200.0
+  # The kinematic route retimes the clip from the actor's actual ground speed,
+  # so it can play slower than the reference gait floor without outrunning the
+  # body.
+  kinematic_root_minimum_rate: 0.25
+  # Seconds a requested jump is buffered through a crouch before takeoff.
+  kinematic_root_jump_anticipation: 0.22
+  # Route-specific pose tracking: 1.0 removes the torso/head/arm lag that read
+  # as leaning backwards while walking.
+  kinematic_root_pose_tracking_blend: 1.0
+  # Fastest the kinematic root turns, radians per second (540 deg/s). A fast
+  # mouse spin turns the actor far faster; the body follows at this rate and
+  # catches up when the spin stops, instead of flinging its limbs.
+  kinematic_root_maximum_yaw_rate: 9.4248
+  recovery_unweight_factor: 2.5
+  pelvis_upright_stiffness: 800000.0
+  pelvis_upright_damping: 120000.0
+  maximum_pelvis_torque: 1200000.0
+  spine_upright_stiffness: 480000.0
+  spine_upright_damping: 80000.0
+  maximum_spine_torque: 800000.0
+  gait:
+    minimum_step_duration: 0.18
+    nominal_step_duration: 0.42
+    maximum_step_duration: 0.75
+    contact_confirmation_duration: 0.05
+    stance_confirmation_duration: 0.05
+    maximum_touchdown_horizontal_distance: 6.0
+    maximum_landing_approach_vertical_distance: 3.0
+    maximum_touchdown_relative_vertical_speed: 5.0
+    maximum_step_reach: 55.0
+    nominal_step_width: 20.0
+    capture_point_blend: 0.35
+    swing_foot_lift: 10.0
+    swing_foot_frequency: 6.0
+    swing_foot_damping: 1.0
+    maximum_swing_foot_force: 500.0
+    maximum_swing_foot_horizontal_force: 10000.0
+    pre_lift_swing_unload_fraction: 0.5
+    swing_leg_motor_torque_scale: 1.0
+    maximum_swing_hip_target_speed: 60.0
+    swing_hip_world_stiffness: 10000.0
+    swing_hip_world_damping: 2000.0
+    maximum_swing_hip_world_torque: 20000.0
+
+bone_aliases:
+  - canonical: pelvis
+    aliases: ["bip01 pelvis", "bip01_pelvis"]
+  - canonical: spine
+    aliases: ["bip01 spine", "bip01_spine"]
+  - canonical: spine1
+    aliases: ["bip01 spine1", "bip01_spine1"]
+  - canonical: spine2
+    aliases: ["bip01 spine2", "bip01_spine2"]
+  - canonical: neck
+    aliases: ["bip01 neck", "bip01_neck"]
+  - canonical: head
+    aliases: ["bip01 head", "bip01_head"]
+  - canonical: left_clavicle
+    aliases: ["bip01 l clavicle", "bip01_l_clavicle"]
+  - canonical: left_upper_arm
+    aliases: ["bip01 l upperarm", "bip01_l_upperarm"]
+  - canonical: left_forearm
+    aliases: ["bip01 l forearm", "bip01_l_forearm"]
+  - canonical: left_hand
+    aliases: ["bip01 l hand", "bip01_l_hand"]
+  - canonical: right_clavicle
+    aliases: ["bip01 r clavicle", "bip01_r_clavicle"]
+  - canonical: right_upper_arm
+    aliases: ["bip01 r upperarm", "bip01_r_upperarm"]
+  - canonical: right_forearm
+    aliases: ["bip01 r forearm", "bip01_r_forearm"]
+  - canonical: right_hand
+    aliases: ["bip01 r hand", "bip01_r_hand"]
+  - canonical: left_thigh
+    aliases: ["bip01 l thigh", "bip01_l_thigh"]
+  - canonical: left_calf
+    aliases: ["bip01 l calf", "bip01_l_calf"]
+  - canonical: left_foot
+    aliases: ["bip01 l foot", "bip01_l_foot"]
+  - canonical: right_thigh
+    aliases: ["bip01 r thigh", "bip01_r_thigh"]
+  - canonical: right_calf
+    aliases: ["bip01 r calf", "bip01_r_calf"]
+  - canonical: right_foot
+    aliases: ["bip01 r foot", "bip01_r_foot"]
+
+bodies:
+  - name: pelvis
+    bone: pelvis
+    mass_fraction: 0.142
+    self_collision_group: 30
+    shape: { type: box, half_extents: [8.0, 11.0, 7.0] }
+    material: { friction: 0.8, restitution: 0.0, linear_damping: 0.12, angular_damping: 0.18 }
+
+  # The spine springs carry the whole upper body (arms, head) that Jolt does
+  # not count when it sizes them, so frequency and damping are scaled up
+  # together (as the arms below). At 14/1.2 the chest twisted +-14 degrees
+  # against the walk and buzzed at 30 Hz getting up; 28/4 halves the twist
+  # and ends the buzz (2026-09-26).
+  # The spine joints bend 3x their old cones (twist 2x): at 10-12 deg per
+  # joint they clipped the vanilla run's forward lean - the chest ran 4-11
+  # deg behind it whatever the springs (stiffer springs changed nothing).
+  # Now 1-3 deg behind, side sway 8 -> 13 deg of the animation's 21
+  # (course, 2026-09-28).
+  - name: spine
+    bone: spine
+    parent: pelvis
+    mass_fraction: 0.100
+    self_collision_group: 30
+    shape: { type: capsule, radius: 7.0, half_height: 5.0, fit_to_bone: spine1 }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.66, plane_half_cone_angle: 0.54, twist_min_angle: -0.28, twist_max_angle: 0.28, motor: { frequency: 28.0, damping: 4.0, maximum_torque: 1029071.9 } }
+
+  - name: spine1
+    bone: spine1
+    parent: spine
+    mass_fraction: 0.100
+    self_collision_group: 30
+    shape: { type: capsule, radius: 7.5, half_height: 5.5, fit_to_bone: spine2 }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.60, plane_half_cone_angle: 0.54, twist_min_angle: -0.28, twist_max_angle: 0.28, motor: { frequency: 28.0, damping: 4.0, maximum_torque: 831553.3 } }
+
+  - name: spine2
+    bone: spine2
+    parent: spine1
+    mass_fraction: 0.100
+    self_collision_group: 30
+    shape: { type: capsule, radius: 8.0, half_height: 6.0, fit_to_bone: neck }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.72, plane_half_cone_angle: 0.60, twist_min_angle: -0.36, twist_max_angle: 0.36, motor: { frequency: 28.0, damping: 4.0, maximum_torque: 634034.7 } }
+
+  # Neck and head springs 80 Hz / 8 (were 10 / 1, never scaled for the load
+  # they carry): the head pitched 30 deg walking and 45 running against the
+  # animation's 5-6, and kept nodding 23 deg after a stop. Now 9 / 15 / 4
+  # (course, 2026-09-28; 40 Hz got most of it, 120 no better than 80).
+  # Twist (turning the head on the neck) +-0.6 neck, +-0.5 head (were 0.35 and
+  # 0.30, about a third of a human neck's turn): with the chest turning in a
+  # swing the head could not stay on the target (FLOW-01 longsword head turn
+  # p50/p90 9.7/31.9 -> 6.7/16.7 deg against the chest's 26.6/52.9;
+  # falls and daze unchanged, 2026-10-04).
+  - name: neck
+    bone: neck
+    parent: spine2
+    mass_fraction: 0.015
+    shape: { type: capsule, radius: 3.0, half_height: 2.5, fit_to_bone: head }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.35, plane_half_cone_angle: 0.30, twist_min_angle: -0.6, twist_max_angle: 0.6, motor: { frequency: 80.0, damping: 8.0, maximum_torque: 106660.0 } }
+
+  - name: head
+    bone: head
+    parent: neck
+    mass_fraction: 0.066
+    # The head bone is the atlas pivot, not the skull centre. Centred on the
+    # pivot, the sphere sat 10.17 units from the spine2 sphere (radii 15) and
+    # 7.6 from each clavicle (radii 9.5), and no neck/head rotation can move a
+    # sphere centred on its own pivot: the joints stretched instead (spine2-neck
+    # 1.537 units at step 1 of every PLAY-01 case, 2026-09-24). +X is the
+    # Biped head bone's up axis; 5.5 clears the chest over the neck/head cones.
+    # The centre of mass stays on the pivot (center_of_mass default).
+    shape: { type: sphere, radius: 7.0, local_transform: { translation: [5.5, 0.0, 0.0] } }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.30, plane_half_cone_angle: 0.28, twist_min_angle: -0.5, twist_max_angle: 0.5, motor: { frequency: 80.0, damping: 8.0, maximum_torque: 86908.2 } }
+
+  # Arm springs carry the load of the chain below each joint. Jolt sizes a
+  # joint spring for its two bodies only, so the authored 4 Hz on the upper
+  # arm acted near the 1 Hz walk swing with the forearm and hand hanging off
+  # it: bare hands 42 units (p90) off the clip in the chest frame, swinging
+  # out and up, "zombie arms". Frequency and damping scaled together (the
+  # weapon arms' sqrt(load) rule): 29 units, arms hang and swing (2026-09-26).
+  # Five times that (clavicle 40/10, upper arm 70/16, forearm 40/10, hand
+  # 30/7) on 2026-09-27: the free hand beside a one-handed weapon still lagged
+  # the clip by 17 frames with a wider swing (a resonance near the walk's 1 Hz),
+  # 44 units off it walking; now 13 (course), gates unchanged.
+  - name: left_clavicle
+    bone: left_clavicle
+    parent: spine2
+    mass_fraction: 0.020
+    self_collision_group: 10
+    shape: { type: capsule, radius: 2.5, half_height: 5.0, fit_to_bone: left_upper_arm }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.25, plane_half_cone_angle: 0.20, twist_min_angle: -0.15, twist_max_angle: 0.15, motor: { frequency: 40, damping: 10, maximum_torque: 92175.3438 } }
+
+  - name: left_upper_arm
+    bone: left_upper_arm
+    parent: left_clavicle
+    mass_fraction: 0.028
+    self_collision_group: 10
+    shape: { type: capsule, radius: 3.0, half_height: 8.0, fit_to_bone: left_forearm }
+    constraint: { derive_frame: true, frame_axis_bone: left_forearm, normal_half_cone_angle: 0.85, plane_half_cone_angle: 0.75, twist_min_angle: -0.65, twist_max_angle: 0.65, motor: { frequency: 70, damping: 16, maximum_torque: 49379.6484 } }
+
+  - name: left_forearm
+    bone: left_forearm
+    parent: left_upper_arm
+    mass_fraction: 0.016
+    self_collision_group: 10
+    shape: { type: capsule, radius: 2.4, half_height: 7.0, fit_to_bone: left_hand }
+    constraint: { type: hinge, derive_frame: true, limit_min_angle: -0.15, limit_max_angle: 2.0, motor: { frequency: 40, damping: 10, maximum_torque: 14484.6973 } }
+
+  - name: left_hand
+    bone: left_hand
+    parent: left_forearm
+    mass_fraction: 0.006
+    self_collision_group: 10
+    shape: { type: box, half_extents: [3.0, 4.5, 1.8] }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.45, plane_half_cone_angle: 0.35, twist_min_angle: -0.30, twist_max_angle: 0.30, motor: { frequency: 30, damping: 7, maximum_torque: 1975.18604 } }
+
+  - name: right_clavicle
+    bone: right_clavicle
+    parent: spine2
+    mass_fraction: 0.020
+    self_collision_group: 11
+    shape: { type: capsule, radius: 2.5, half_height: 5.0, fit_to_bone: right_upper_arm }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.25, plane_half_cone_angle: 0.20, twist_min_angle: -0.15, twist_max_angle: 0.15, motor: { frequency: 40, damping: 10, maximum_torque: 92175.3438 } }
+
+  - name: right_upper_arm
+    bone: right_upper_arm
+    parent: right_clavicle
+    mass_fraction: 0.028
+    self_collision_group: 11
+    shape: { type: capsule, radius: 3.0, half_height: 8.0, fit_to_bone: right_forearm }
+    constraint: { derive_frame: true, frame_axis_bone: right_forearm, normal_half_cone_angle: 0.85, plane_half_cone_angle: 0.75, twist_min_angle: -0.65, twist_max_angle: 0.65, motor: { frequency: 70, damping: 16, maximum_torque: 49379.6484 } }
+
+  - name: right_forearm
+    bone: right_forearm
+    parent: right_upper_arm
+    mass_fraction: 0.016
+    self_collision_group: 11
+    shape: { type: capsule, radius: 2.4, half_height: 7.0, fit_to_bone: right_hand }
+    constraint: { type: hinge, derive_frame: true, limit_min_angle: -0.15, limit_max_angle: 2.0, motor: { frequency: 40, damping: 10, maximum_torque: 14484.6973 } }
+
+  - name: right_hand
+    bone: right_hand
+    parent: right_forearm
+    mass_fraction: 0.006
+    self_collision_group: 11
+    shape: { type: box, half_extents: [3.0, 4.5, 1.8] }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.45, plane_half_cone_angle: 0.35, twist_min_angle: -0.30, twist_max_angle: 0.30, motor: { frequency: 30, damping: 7, maximum_torque: 1975.18604 } }
+
+  # The leg springs carry the leg below each joint, so frequency and damping
+  # are scaled together (as the spine and arms). At 8 Hz / damping 1 the hip
+  # overshot at the end of every swing: the shin kicked the foot 12-17 units
+  # past its landing spot and it hung in the air for a quarter second, then
+  # landed late ("shorter steps or oversteps", 2026-09-27). 16/6, 12/4, 8/2:
+  # sideways landing spread 5.5 -> 0.8 units running, step length variation
+  # 48 -> 20-25%.
+  - name: left_thigh
+    bone: left_thigh
+    parent: pelvis
+    mass_fraction: 0.100
+    self_collision_group: 20
+    shape: { type: capsule, radius: 4.5, half_height: 10.5, fit_to_bone: left_calf }
+    constraint: { derive_frame: true, frame_axis_bone: left_calf, normal_half_cone_angle: 0.65, plane_half_cone_angle: 0.90, twist_min_angle: -0.60, twist_max_angle: 0.60, motor: { frequency: 16, damping: 6, maximum_torque: 822994.125 } }
+
+  - name: left_calf
+    bone: left_calf
+    parent: left_thigh
+    mass_fraction: 0.0465
+    self_collision_group: 20
+    shape: { type: capsule, radius: 3.5, half_height: 10.0, fit_to_bone: left_foot }
+    constraint: { type: hinge, derive_frame: true, limit_min_angle: -2.1, limit_max_angle: 0.12, motor: { frequency: 12, damping: 4, maximum_torque: 822994.125 } }
+
+  # The foot box sits 4 units below the ankle (local +x points down at
+  # rest): centred on the ankle, the ragdoll stood the ankle 4 units lower
+  # than the animation (3.6 vs 7.8 at idle), the whole body with it, the
+  # head 6-8 units under the vanilla character's (2026-09-26).
+  - name: left_foot
+    bone: left_foot
+    parent: left_calf
+    mass_fraction: 0.022
+    self_collision_group: 20
+    shape: { type: box, half_extents: [4.0, 8.0, 2.5], local_transform: { translation: [4.0, 0.0, 0.0] } }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.32, plane_half_cone_angle: 0.25, twist_min_angle: -0.18, twist_max_angle: 0.18, motor: { frequency: 8, damping: 2, maximum_torque: 329197.656 } }
+
+  - name: right_thigh
+    bone: right_thigh
+    parent: pelvis
+    mass_fraction: 0.100
+    self_collision_group: 21
+    shape: { type: capsule, radius: 4.5, half_height: 10.5, fit_to_bone: right_calf }
+    constraint: { derive_frame: true, frame_axis_bone: right_calf, normal_half_cone_angle: 0.65, plane_half_cone_angle: 0.90, twist_min_angle: -0.60, twist_max_angle: 0.60, motor: { frequency: 16, damping: 6, maximum_torque: 822994.125 } }
+
+  - name: right_calf
+    bone: right_calf
+    parent: right_thigh
+    mass_fraction: 0.0465
+    self_collision_group: 21
+    shape: { type: capsule, radius: 3.5, half_height: 10.0, fit_to_bone: right_foot }
+    constraint: { type: hinge, derive_frame: true, limit_min_angle: -2.1, limit_max_angle: 0.12, motor: { frequency: 12, damping: 4, maximum_torque: 822994.125 } }
+
+  - name: right_foot
+    bone: right_foot
+    parent: right_calf
+    mass_fraction: 0.022
+    self_collision_group: 21
+    shape: { type: box, half_extents: [4.0, 8.0, 2.5], local_transform: { translation: [4.0, 0.0, 0.0] } }
+    constraint: { derive_frame: true, normal_half_cone_angle: 0.32, plane_half_cone_angle: 0.25, twist_min_angle: -0.18, twist_max_angle: 0.18, motor: { frequency: 8, damping: 2, maximum_torque: 329197.656 } }
+
+landmarks:
+  pelvis: pelvis
+  spine: [spine, spine1, spine2]
+  head: head
+  left_hand: left_hand
+  right_hand: right_hand
+  left_foot: left_foot
+  right_foot: right_foot

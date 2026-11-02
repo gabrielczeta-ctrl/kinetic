@@ -88,6 +88,7 @@ namespace MWPhysics
             mHitPoint = traceCallback.mHitPointWorld;
             mHitObject = traceCallback.mHitCollisionObject;
             mHitObjectLayer = traceCallback.mHitCollisionLayer;
+            mHitObjectUserData = traceCallback.mHitUserData;
         }
         else
         {
@@ -96,8 +97,9 @@ namespace MWPhysics
             mPlaneNormal = osg::Vec3f(0.0f, 0.0f, 1.0f);
             mFraction = 1.0f;
             mHitPoint = end;
-            mHitObject = nullptr;
+            mHitObject = JPH::BodyID();
             mHitObjectLayer = 0;
+            mHitObjectUserData = 0;
         }
     }
 

@@ -45,7 +45,14 @@ option(BUILD_NAVMESHTOOL        "Build navmesh tool" ON)
 option(BUILD_PHYSICSOBJECTTOOL   "Build Physics object tool" ON)
 option(BUILD_OPENCS_TESTS       "Build OpenMW Construction Set tests" OFF)
 option(BUILD_OPENMW_TESTS       "Build OpenMW tests" OFF)
+option(OPENMW_RAGDOLL_DEV_API   "Expose unsafe ragdoll integration-test Lua bindings" OFF)
+# Release builds keep the ragdoll gameplay (DEV_API) but drop the test Lua packages.
+option(OPENMW_RAGDOLL_TEST_LUA  "With OPENMW_RAGDOLL_DEV_API: register openmw.ragdolltest and openmw.manualobservation" ON)
 option(PRECOMPILE_HEADERS_WITH_MSVC "Precompile most common used headers with MSVC (alternative to ccache)" ON)
+
+if (BUILD_COMPONENTS_TESTS OR BUILD_OPENCS_TESTS OR BUILD_OPENMW_TESTS)
+    enable_testing()
+endif()
 
 set(OpenGL_GL_PREFERENCE LEGACY)  # Use LEGACY as we use GL2; GLNVD is for GL3 and up.
 
@@ -125,10 +132,6 @@ include(WholeArchive)
 configure_file ("${OpenMW_SOURCE_DIR}/docs/mainpage.hpp.cmake" "${OpenMW_BINARY_DIR}/docs/mainpage.hpp")
 
 option(QT_STATIC "Link static build of Qt into the binaries" FALSE)
-
-set(_jolt_static_default ON)
-option(JOLT_STATIC "Build Jolt Physics static libraries" ${_jolt_static_default})
-add_definitions(-DJPH_DEBUG_RENDERER=1)
 
 option(OPENMW_USE_SYSTEM_OSG "Use system provided OpenSceneGraph libraries" ON)
 if(OPENMW_USE_SYSTEM_OSG)
@@ -670,6 +673,8 @@ endif()
 
 if (BUILD_COMPONENTS_TESTS)
     add_subdirectory(apps/components_tests)
+    add_subdirectory(apps/ragdollcore_tests)
+    add_subdirectory(apps/ragdollcore_walksearch)
 endif()
 
 if (BUILD_BENCHMARKS)

@@ -41,6 +41,7 @@ namespace MWPhysics
         , mOnSlope(false)
         , mInternalCollisionMode(true)
         , mExternalCollisionMode(true)
+        , mCollideWithActors(true)
         , mActive(false)
         , mTaskScheduler(scheduler)
     {
@@ -99,6 +100,7 @@ namespace MWPhysics
         }
 
         updateScaleUnsafe();
+        mSimulationPosition = mPosition;
 
         if (!mRotationallyInvariant)
         {
@@ -132,17 +134,22 @@ namespace MWPhysics
         mInternalCollisionMode = collision;
     }
 
-    void Actor::enableCollisionBody(bool collision)
+    void Actor::enableCollisionBody(bool collision, bool collideWithActors)
     {
         std::scoped_lock lock(mMutex);
-        if (mExternalCollisionMode != collision)
+        const bool changed = mExternalCollisionMode != collision || mCollideWithActors != collideWithActors;
+        if (changed)
         {
             mExternalCollisionMode = collision;
+            mCollideWithActors = collideWithActors;
 
             // If collision is intended to be disabled on this object (i,e for a corpse)
-            // then we need to update the body to a new layer to prevent other things colliding with it
+            // then we need to update the body to a new layer to prevent other things colliding with it.
+            // A powered kinematic body keeps world collision on POWERED_ACTOR, which no other actor capsule collides with.
             JPH::BodyInterface& bodyInterface = mTaskScheduler->getBodyInterface();
-            bodyInterface.SetObjectLayer(getPhysicsBody(), mExternalCollisionMode ? Layers::ACTOR : Layers::DEBRIS);
+            const JPH::ObjectLayer layer = !mExternalCollisionMode ? Layers::DEBRIS
+                : (mCollideWithActors ? Layers::ACTOR : Layers::POWERED_ACTOR);
+            bodyInterface.SetObjectLayer(getPhysicsBody(), layer);
         }
     }
 
@@ -228,6 +235,22 @@ namespace MWPhysics
         return mPreviousPosition != mPosition;
     }
 
+    void Actor::setPoweredRagdollPosition(const osg::Vec3f& position)
+    {
+        std::scoped_lock lock(mMutex);
+        applyOffsetChange();
+        mPreviousPosition = mPosition;
+        mPosition = position;
+        mSimulationPosition = position;
+        mSkipSimulation = false;
+    }
+
+    osg::Vec3f Actor::getPhysicsPosition() const
+    {
+        std::scoped_lock lock(mMutex);
+        return osg::Vec3f(mPosition);
+    }
+
     void Actor::adjustPosition(const osg::Vec3f& offset)
     {
         std::scoped_lock lock(mMutex);
@@ -250,6 +273,31 @@ namespace MWPhysics
     {
         std::scoped_lock lock(mMutex);
         mRotation = quat;
+    }
+
+    osg::Quat Actor::getRotation() const
+    {
+        std::scoped_lock lock(mMutex);
+        return mRotation;
+    }
+
+    osg::Vec3f Actor::getScale() const
+    {
+        std::scoped_lock lock(mMutex);
+        return mScale;
+    }
+
+    osg::Vec3f Actor::getQueuedVelocity() const
+    {
+        std::scoped_lock lock(mMutex);
+        return mVelocity;
+    }
+
+    osg::Vec3f Actor::getQueuedWorldVelocity() const
+    {
+        std::scoped_lock lock(mMutex);
+        const float yaw = mPtr.getRefData().getPosition().rot[2];
+        return osg::Quat(yaw, osg::Vec3f(0.0f, 0.0f, -1.0f)) * mVelocity;
     }
 
     bool Actor::isRotationallyInvariant() const

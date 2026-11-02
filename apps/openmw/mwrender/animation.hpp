@@ -17,6 +17,8 @@
 #include <components/sceneutil/util.hpp>
 #include <components/vfs/pathutil.hpp>
 
+#include <osg/Matrixf>
+
 #include <map>
 #include <optional>
 #include <span>
@@ -211,6 +213,10 @@ namespace MWRender
 
         std::shared_ptr<AnimationTime> mAnimationTimePtr[sNumBlendMasks];
 
+        // See setLocomotionSpeedScale. Gameplay-computed movement animation
+        // speeds are multiplied by this; default 1 keeps vanilla behaviour.
+        float mLocomotionSpeedScale = 1.0f;
+
         mutable NodeMap mNodeMap;
         mutable bool mNodeMapCreated;
 
@@ -341,6 +347,8 @@ namespace MWRender
 
         osg::Group* getObjectRoot();
 
+        SceneUtil::Skeleton* getSkeleton() const { return mSkeleton; }
+
         /**
          * @brief Add an effect mesh attached to a bone or the insert scene node
          * @param model
@@ -406,6 +414,69 @@ namespace MWRender
          */
         void adjustSpeedMult(const std::string& groupname, float speedmult);
 
+        /** Persistent scale applied to every movement-animation speed computed
+         *  by gameplay. Unlike adjustSpeedMult it is not overwritten each
+         *  frame; the active ragdoll route uses it to match the played stride
+         *  to the actor's movement speed.
+         */
+        void setLocomotionSpeedScale(float scale);
+        float getLocomotionSpeedScale() const { return mLocomotionSpeedScale; }
+
+        /** Development aid for localized limb damage: tint the body parts of
+         *  one anatomical region (RagdollCore::regionName) red, 0 = untouched
+         *  and 1 = fully red. Only actors assembled from body parts (NPCs)
+         *  can show it; the default does nothing.
+         */
+        virtual void setAnatomicalDamageTint(std::string_view region, float intensity) {}
+        virtual void clearAnatomicalDamageTints() {}
+        virtual bool addLocalizedWound(std::string_view region, int kind, const osg::Vec3f& point,
+            const osg::Vec3f& normal, const osg::Vec3f& tangent, float severity) { return false; }
+        /** WOUNDFX-01 look check: one shader wound of a given shape on a
+         *  region's skin (OPENMW_RAGDOLL_WOUND_FX=1). point: world, near the
+         *  skin; normal: out of it; direction: the stroke (a stab's edge
+         *  axis); length and halfWidth: game units (a bruise's radius);
+         *  kind: 1 bruise, 2 slash (a chop from severity 0.8), 3 stab, 4 chop;
+         *  the drawn kind follows the struck surface (at level 3 a stain on
+         *  clothing, a scratch or dent on armour). Only NPCs can show it.
+         */
+        virtual bool addWoundFx(std::string_view region, const osg::Vec3f& point, const osg::Vec3f& normal,
+            const osg::Vec3f& direction, float length, float halfWidth, float severity, int kind)
+        {
+            return false;
+        }
+        virtual std::size_t getWoundFxCount() const { return 0; }
+        /** The kind the last addWoundFx drew (main thread): 1 bruise, 2 slash,
+         *  3 stab, 4 chop on skin; 5 a stain on clothing, 6 a scratch or dent
+         *  on armour (OPENMW_RAGDOLL_WOUND_FX=3); 0 none.
+         */
+        virtual int getLastWoundFxKind() const { return 0; }
+        /** What the last addLocalizedWound found to strike (OPENMW_RAGDOLL_WOUND_FX
+         *  on; read right after it, on the same thread): 0 bare skin, 1
+         *  clothing, 2 armour; -1 nothing, or FX off.
+         */
+        virtual int getLastWoundSurface() const { return -1; }
+        /** WOUNDFX-01 FX4 (OPENMW_RAGDOLL_WOUND_FX=4): blood on this actor's
+         *  held weapon where it went in. alongFrom..alongTo: the bloodied
+         *  range along the weapon, 0 the grip, 1 the tip (as
+         *  LiveWeaponAttachment's hand-to-contact over tipDistanceFromHand);
+         *  strength 0..1 (flesh: the wound's severity, through cloth less);
+         *  bloodType: the victim's (0 red, 1 skeleton dust, 2 Dwemer: none).
+         *  Any thread: queued, drawn at the next runAnimation on the main
+         *  thread; up to 3 marks per weapon, wet red drying dark over minutes.
+         *  Only NPCs and the player show it.
+         */
+        /** GRIP-05 murder-stroke: the held weapon drawn turned in the right
+         *  hand by `handFrame` (a transform in the hand bone's frame; none =
+         *  as the mesh is attached). Only NPCs and the player show it.
+         */
+        virtual void setWeaponGripTurn(const std::optional<osg::Matrixf>& handFrame) {}
+        virtual bool addWeaponBlood(float alongFrom, float alongTo, float strength, int bloodType = 0)
+        {
+            return false;
+        }
+        /** How many weapon blood marks were drawn so far (FX4, tests). */
+        virtual std::size_t getWeaponBloodCount() const { return 0; }
+
         /** Returns true if the named animation group is playing. */
         bool isPlaying(std::string_view groupname) const;
 
@@ -429,6 +500,14 @@ namespace MWRender
 
         /// Get the absolute position in the animation track of the text key
         float getTextKeyTime(std::string_view textKey) const;
+
+        struct RagdollAnimationSource
+        {
+            const SceneUtil::KeyframeHolder* mKeyframes = nullptr;
+            std::string mAccumulationBone;
+            osg::Vec3f mAccumulationAxes;
+        };
+        std::optional<RagdollAnimationSource> getRagdollAnimationSource(std::string_view group) const;
 
         /// Get the current absolute position in the animation track for the animation that is currently playing from
         /// the given group.

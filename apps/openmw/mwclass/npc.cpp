@@ -1,6 +1,7 @@
 ﻿#include "npc.hpp"
 
 #include <MyGUI_TextIterator.h>
+#include <ragdollcore/tuning.hpp>
 #include <MyGUI_UString.h>
 
 #include <format>
@@ -562,6 +563,22 @@ namespace MWClass
         victim = MWWorld::Ptr();
         hitPosition = osg::Vec3f();
 
+        // A powered body deals damage only through its physical contact path:
+        // the ragdoll contact prices the blow and the animation hit is never
+        // armed. Reporting "nothing hit" keeps the attack itself valid (the
+        // controller plays it, the swing is driven from it) while no animation
+        // contact can land. The player's powered bare-handed body is physical
+        // too; an attached physical weapon keeps the existing claimed-swing
+        // input path.
+        {
+            const MWBase::World* world = MWBase::Environment::get().getWorld();
+            const bool powered = world->isPoweredRagdoll(ptr);
+            const bool player = ptr == MWMechanics::getPlayer();
+            const bool playerUnarmed = player && !world->hasActorRagdollWeaponAttached(ptr);
+            if (powered && (!player || playerUnarmed))
+                return true;
+        }
+
         // Get the weapon used (if hand-to-hand, weapon = inv.end())
         MWWorld::InventoryStore& inv = getInventoryStore(ptr);
         MWWorld::ContainerStoreIterator weaponslot = inv.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
@@ -584,6 +601,19 @@ namespace MWClass
         ESM::RefId weapskill = ESM::Skill::HandToHand;
         if (!weapon.isEmpty())
             weapskill = weapon.getClass().getEquipmentSkill(weapon);
+
+        // Connection by geometry: the target and hit position above already
+        // passed the vanilla reach and angle checks, so a swing that reaches
+        // its target lands. The skill roll is not discarded, it moves to
+        // damage in hit() below, where the same numbers scale what the blow
+        // does instead of whether it happens.
+        if (Settings::game().mGeometricMeleeConnection)
+            return true;
+        // Manual ragdoll range: the same thing for the player alone, so
+        // physical impacts can be calibrated by hand without changing how
+        // the rest of the world fights.
+        if (MWMechanics::getPlayerAlwaysHits() && ptr == MWMechanics::getPlayer())
+            return true;
 
         float hitchance = MWMechanics::getHitChance(ptr, victim, static_cast<int>(getSkill(ptr, weapskill)));
 
@@ -637,7 +667,13 @@ namespace MWClass
                 attack = weapon.get<ESM::Weapon>()->mBase->mData.mThrust.data();
             if (attack)
             {
-                damage = attack[0] + ((attack[1] - attack[0]) * attackStrength);
+                // Damage follows the momentum actually delivered rather than
+                // attack strength alone, so the weapon's maximum damage
+                // corresponds to its maximum possible momentum. A slow swing
+                // still carries the weapon's mass, so it lands above the
+                // minimum rather than at it.
+                damage = attack[0]
+                    + ((attack[1] - attack[0]) * MWMechanics::meleeImpactMomentumFraction(weapon, attackStrength));
             }
             MWMechanics::adjustWeaponDamage(damage, weapon, ptr);
             MWMechanics::reduceWeaponCondition(damage, true, weapon, ptr);
@@ -648,6 +684,18 @@ namespace MWClass
         else
         {
             MWMechanics::getHandToHandDamage(ptr, victim, damage, healthdmg, attackStrength);
+        }
+
+        // Geometric connection moves the to-hit roll here: the blow landed
+        // because it reached, and the attacker's skill decides how much of
+        // the weapon's damage they actually manage to put into it.
+        if (Settings::game().mGeometricMeleeConnection)
+        {
+            ESM::RefId scaleSkill = ESM::Skill::HandToHand;
+            if (!weapon.isEmpty())
+                scaleSkill = weapon.getClass().getEquipmentSkill(weapon);
+            damage *= MWMechanics::meleeSkillDamageMultiplier(
+                ptr, victim, static_cast<int>(getSkill(ptr, scaleSkill)));
         }
 
         MWBase::World* world = MWBase::Environment::get().getWorld();
@@ -684,7 +732,8 @@ namespace MWClass
 
         MWMechanics::applyElementalShields(ptr, victim);
 
-        if (MWMechanics::blockMeleeAttack(ptr, victim, weapon, damage, attackStrength))
+        const bool blocked = MWMechanics::blockMeleeAttack(ptr, victim, weapon, damage, attackStrength);
+        if (blocked)
             damage = 0;
 
         if (victim == MWMechanics::getPlayer() && MWBase::Environment::get().getWorld()->getGodModeState())
@@ -692,8 +741,26 @@ namespace MWClass
 
         MWMechanics::diseaseContact(victim, ptr);
 
+#ifdef OPENMW_RAGDOLL_DEV_API
+        static const auto hitTrace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_MELEE_TRACE") != nullptr; });
+        static const auto& hitTrace = hitTrace_tuned.get();
+        static unsigned hitRows = 0;
+        if (hitTrace && hitRows < 300 && ptr != MWMechanics::getPlayer())
+        {
+            ++hitRows;
+            Log(Debug::Info) << "RAGDOLL_MELEE_HIT attacker=" << ptr.getCellRef().getRefId()
+                << " victim=" << victim.getCellRef().getRefId() << " damage=" << damage
+                << " healthdmg=" << healthdmg
+                << " victimLuaScripts=" << (victim.getRefData().getLuaScripts() != nullptr);
+        }
+#endif
+
         MWBase::Environment::get().getLuaManager()->onHit(ptr, victim, weapon, MWWorld::Ptr(), type, attackStrength,
             attackWindUp, damage, healthdmg, hitPosition, true, MWMechanics::DamageSourceType::Melee);
+
+        // Every landed melee contact pushes a ragdolled victim at the hit
+        // point, hand-to-hand and armed alike; the weapon's mass scales it.
+        MWMechanics::applyMeleeRagdollImpulse(ptr, victim, weapon, hitPosition, attackStrength, blocked);
     }
 
     void Npc::onHit(const MWWorld::Ptr& ptr, const std::map<std::string, float>& damages, ESM::RefId object,
@@ -701,6 +768,20 @@ namespace MWClass
     {
         MWMechanics::CreatureStats& stats = getCreatureStats(ptr);
         bool wasDead = stats.isDead();
+#ifdef OPENMW_RAGDOLL_DEV_API
+        static const auto onHitTrace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_MELEE_TRACE") != nullptr; });
+        static const auto& onHitTrace = onHitTrace_tuned.get();
+        static unsigned onHitRows = 0;
+        if (onHitTrace && onHitRows < 300)
+        {
+            ++onHitRows;
+            const auto found = damages.find("health");
+            Log(Debug::Info) << "RAGDOLL_MELEE_ONHIT victim=" << ptr.getCellRef().getRefId()
+                << " successful=" << successful << " damage="
+                << (found != damages.end() ? found->second : 0.0f)
+                << " health_before=" << stats.getHealth().getCurrent();
+        }
+#endif
 
         bool setOnPcHitMe = true;
 
@@ -1109,17 +1190,8 @@ namespace MWClass
 
         const ESM::Race* race = MWBase::Environment::get().getESMStore()->get<ESM::Race>().find(ref->mBase->mRace);
 
-        // Race weight should not affect 1st-person meshes, otherwise it will change hand proportions and can break
-        // aiming.
-        if (ptr == MWMechanics::getPlayer() && ptr.isInCell() && MWBase::Environment::get().getWorld()->isFirstPerson())
-        {
-            if (ref->mBase->isMale())
-                scale *= race->mData.mMaleHeight;
-            else
-                scale *= race->mData.mFemaleHeight;
-
-            return;
-        }
+        // First person now renders the same body as third person. Preserve its
+        // proportions (and physical binding scale) across perspective changes.
 
         if (ref->mBase->isMale())
         {

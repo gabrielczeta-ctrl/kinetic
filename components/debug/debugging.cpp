@@ -482,12 +482,17 @@ namespace Debug
         }
         catch (const std::exception& e)
         {
-#if (defined(__APPLE__) || defined(__linux) || defined(__unix) || defined(__posix))
-            if (!isatty(fileno(stdin)))
-#endif
-                SDL_ShowSimpleMessageBox(0, (std::string(appName) + ": Fatal error").c_str(), e.what(), nullptr);
-
+            // Preserve the actual exception even when a desktop error dialog
+            // cannot be dismissed by an unattended integration runner.
             Log(Debug::Error) << "Fatal error: " << e.what();
+            const auto noDialog = std::getenv("OPENMW_DISABLE_ERROR_DIALOG");
+            if (noDialog == nullptr || Misc::StringUtils::toNumeric<int>(noDialog, 0) == 0)
+            {
+#if (defined(__APPLE__) || defined(__linux) || defined(__unix) || defined(__posix))
+                if (!isatty(fileno(stdin)))
+#endif
+                    SDL_ShowSimpleMessageBox(0, (std::string(appName) + ": Fatal error").c_str(), e.what(), nullptr);
+            }
 
             ret = 1;
         }

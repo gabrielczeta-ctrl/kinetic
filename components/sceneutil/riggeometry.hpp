@@ -62,6 +62,23 @@ namespace SceneUtil
 
         osg::ref_ptr<osg::Geometry> getSourceGeometry() const;
 
+        // WOUNDFX-01 FX1: add a per-vertex array skinning leaves alone (the
+        // bind position) to the source and both skinned copies. The array is
+        // shared, so it costs nothing per frame. Main thread only.
+        void setSharedTexCoordArray(unsigned int unit, osg::ref_ptr<osg::Array> array);
+
+        // Main/update-thread surface projection, like intersection traversal:
+        // copy the last culled mesh so callers never mutate render buffers.
+        osg::ref_ptr<osg::Geometry> copyDeformedGeometry() const;
+
+        // Recompute the culling bounds from the skeleton's current node
+        // matrices. The update traversal does this once per frame, which is
+        // too early for anything that rewrites the bones after the animation
+        // (the ragdoll pose override): the mesh would be culled by where the
+        // animation put it, not by where it is drawn. The visitor's node path
+        // must lead from the skeleton to this drawable.
+        void refreshBounds(osg::NodeVisitor& nv) { updateBounds(&nv); }
+
         void accept(osg::NodeVisitor& nv) override;
         bool supports(const osg::PrimitiveFunctor&) const override { return true; }
         void accept(osg::PrimitiveFunctor&) const override;

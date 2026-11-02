@@ -367,6 +367,8 @@ namespace MWRender
         sceneRoot->getOrCreateStateSet()->addUniform(new osg::Uniform("distortionStrength", 0.f));
         sceneRoot->getOrCreateStateSet()->addUniform(new osg::Uniform("alpha", 1.f));
         sceneRoot->getOrCreateStateSet()->addUniform(new osg::Uniform("actorFade", 1.f));
+        sceneRoot->getOrCreateStateSet()->addUniform(new osg::Uniform("anatomicalDamageTint", 0.f));
+        sceneRoot->getOrCreateStateSet()->addUniform(new osg::Uniform("nearDissolve", osg::Vec3f()));
 
         resourceSystem->getSceneManager()->setUpNormalsRTForStateSet(sceneRoot->getOrCreateStateSet(), true);
 
@@ -1094,6 +1096,21 @@ namespace MWRender
         bool loop)
     {
         mEffectManager->addEffect(model, texture, worldPosition, scale, isMagicVFX, useAmbientLight, effectId, loop);
+    }
+
+    void RenderingManager::spawnSparks(const osg::Vec3f& worldPosition, const osg::Vec3f& normal, float strength)
+    {
+        mEffectManager->addSparks(worldPosition, normal, strength);
+    }
+
+    void RenderingManager::setWeaponBlades(
+        const std::vector<std::pair<const void*, std::pair<osg::Vec3f, osg::Vec3f>>>& blades)
+    {
+        std::vector<EffectManager::WeaponBlade> out;
+        out.reserve(blades.size());
+        for (const auto& [key, blade] : blades)
+            out.push_back({ key, blade.first, blade.second });
+        mEffectManager->setWeaponBlades(out);
     }
 
     void RenderingManager::removeEffect(std::string_view effectId)

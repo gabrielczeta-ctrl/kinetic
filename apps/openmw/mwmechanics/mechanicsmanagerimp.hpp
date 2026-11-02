@@ -197,6 +197,7 @@ namespace MWMechanics
         bool isReadyToBlock(const MWWorld::Ptr& ptr) const override;
         /// Is \a ptr casting spell or using weapon now?
         bool isAttackingOrSpell(const MWWorld::Ptr& ptr) const override;
+        bool isAttackAnimationActive(const MWWorld::Ptr& ptr) const override;
 
         void castSpell(const MWWorld::Ptr& ptr, const ESM::RefId& spellId, bool scriptedSpell = false) override;
 

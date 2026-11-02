@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -294,6 +295,9 @@ namespace Shader
     ShaderManager::ShaderManager()
     {
         mHotReloadManager = std::make_unique<HotReloadManager>();
+        // Resource loading can request an error/debug shader before the game
+        // rendering manager has supplied its final scene-specific overrides.
+        mGlobalDefines = getDefaultDefines();
     }
 
     ShaderManager::~ShaderManager() = default;
@@ -670,7 +674,32 @@ namespace Shader
         if (!vert || !frag)
             throw std::runtime_error("failed initializing shader: " + templateName);
 
-        return getProgram(std::move(vert), std::move(frag), programTemplate, samplers);
+        osg::ref_ptr<osg::Program> program = getProgram(std::move(vert), std::move(frag), programTemplate, samplers);
+        // WOUNDFX-01 FX1: remember the recipe so a wounded drawable can get the same program with woundVolumes.
+        // Always (a few hundred entries): gated on the OPENMW_RAGDOLL_WOUND_FX environment variable, every
+        // KINETIC package - which sets it in ragdoll.cfg, not the environment - drew no wound at all
+        // ("WOUNDFX01 no shader recipe", user 10-31: "I dont see the wounds").
+        if (program)
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mProgramSources.try_emplace(program.get(), ProgramSource{ templateName, defines, programTemplate, samplers });
+        }
+        return program;
+    }
+
+    osg::ref_ptr<osg::Program> ShaderManager::getProgramVariant(const osg::Program* program, const DefineMap& overrides)
+    {
+        ProgramSource source;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            const auto found = mProgramSources.find(program);
+            if (found == mProgramSources.end())
+                return nullptr;
+            source = found->second;
+        }
+        for (const auto& [name, value] : overrides)
+            source.mDefines[name] = value;
+        return getProgram(source.mTemplateName, source.mDefines, source.mProgramTemplate.get(), source.mSamplers);
     }
 
     osg::ref_ptr<osg::Program> ShaderManager::getProgram(osg::ref_ptr<osg::Shader> vertexShader,
@@ -869,12 +898,21 @@ namespace Shader
             { "classicFalloff", "1" },
             { "skyBlending", "0" },
             { "disableNormals", "1" },
+            // Debug geometry can request the shared core shader includes
+            // before RenderingManager has installed the LightManager defines.
+            { "maxLights", "8" },
+            { "lightingMethodClustered", "0" },
+            { "simpleLighting", "0" },
             { "useGPUShader4", "0" },
             { "useOVR_multiview", "0" },
             { "distorionRTRatio", "0" },
             { "numViews", "1" },
             { "particle", "0" },
             { "particlePointLighting", "1" },
+            // WOUNDFX-01 FX1: wound volumes, on only for wounded drawables (a per-program define).
+            { "woundVolumes", "0" },
+            // ARMOUR_MARKS: bolder scratches and dents on armour (woundfx).
+            { "woundArmourBold", "0" },
         };
     }
 }

@@ -1,0 +1,7 @@
+GLOBAL: ragdoll_manual.lua
+CUSTOM: ragdoll_manual_actor.lua
+CUSTOM: ragdoll_manual_duelist.lua
+PLAYER: ragdoll_manual_player.lua
+MENU: kinetic_settings_menu.lua
+PLAYER: kinetic_settings.lua
+GLOBAL: kinetic_stranded.lua

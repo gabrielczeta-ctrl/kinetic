@@ -23,6 +23,8 @@ file(GLOB UNITTEST_SRC_FILES
     misc/compression.cpp
     misc/progressreporter.cpp
     misc/testendianness.cpp
+    misc/testragdollattackcontact.cpp
+    misc/testragdolltapdrag.cpp
     misc/testmathutil.cpp
     misc/testresourcehelpers.cpp
     misc/teststringops.cpp
@@ -86,6 +88,10 @@ file(GLOB UNITTEST_SRC_FILES
     resource/testobjectcache.cpp
     resource/testresourcesystem.cpp
 
+    ragdollprofile/testloader.cpp
+    ragdollprofile/testscenariofixture.cpp
+    ragdollprofile/testskeletonadapter.cpp
+
     vfs/testpathutil.cpp
 
     sceneutil/osgacontroller.cpp
@@ -106,6 +112,8 @@ target_link_libraries(components-tests
     GMock::GMock
     components
 )
+
+add_test(NAME components-tests COMMAND components-tests --gtest_brief=1)
 
 if (WIN32)
     target_sources(components-tests PRIVATE ${CMAKE_SOURCE_DIR}/files/windows/other-apps.manifest)

@@ -79,6 +79,17 @@ namespace MWPhysics
         // don't hit the caster
         if (withBody.GetID() == mCasterColObj)
             return false;
+        // ... nor the caster's own ragdoll bodies: a powered body's limbs are
+        // separate bodies around its capsule, and a bolt launched from the
+        // torso struck them first (SPELL-01: the fireball never reached the
+        // target). Their user data is the ragdoll entry holding the same Ptr.
+        if (withBody.GetObjectLayer() == Layers::RAGDOLL || withBody.GetObjectLayer() == Layers::POWERED_ACTOR)
+        {
+            std::scoped_lock lock(mMutex);
+            if (const PtrHolder* holder = Misc::Convert::toPointerFromUserData<PtrHolder>(withBody.GetUserData());
+                holder != nullptr && holder != this && !mCaster.isEmpty() && holder->getPtr() == mCaster)
+                return false;
+        }
 
         // Check if projectile or actor and if we should skip collision with them
         // typically useful for NPCs whos projectiles cannot collide with someone they arent targetting
@@ -97,6 +108,7 @@ namespace MWPhysics
                 break;
             }
             case Layers::ACTOR:
+            case Layers::POWERED_ACTOR:
             {
                 if (!isValidTarget(withBody.GetID()))
                     return false;

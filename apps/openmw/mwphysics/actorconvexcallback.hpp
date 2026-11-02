@@ -10,6 +10,8 @@
 
 #include <osg/Vec3f>
 
+#include <cstdint>
+
 #include "../mwrender/joltdebugdraw.hpp"
 
 #include "joltlayers.hpp"
@@ -55,16 +57,20 @@ namespace MWPhysics
                 return;
             }
 
-            JPH::BodyLockRead lock(mPhysicsSystem->GetBodyLockInterfaceNoLock(), inResult.mBodyID2);
+            // NarrowPhaseQuery releases its candidate-body lock before calling
+            // the collector. Lock explicitly and copy all metadata needed by
+            // the movement solver; never let a Jolt Body pointer escape.
+            JPH::BodyLockRead lock(mPhysicsSystem->GetBodyLockInterface(), inResult.mBodyID2);
             if (!lock.Succeeded())
                 return;
 
-            const JPH::Body* body = &lock.GetBody();
+            const JPH::Body& body = lock.GetBody();
 
-            if (body->IsSensor())
+            if (body.IsSensor())
                 return;
 
-            const JPH::ObjectLayer collisionGroup = body->GetObjectLayer();
+            const JPH::ObjectLayer collisionGroup = body.GetObjectLayer();
+            const std::uint64_t userData = body.GetUserData();
 
             JPH::Vec3 hitNormalWorld = -inResult.mPenetrationAxis.Normalized();
 
@@ -79,7 +85,7 @@ namespace MWPhysics
                 if (isOverlapping)
                 {
                     auto originA = mSelfCenterWorld;
-                    auto originB = Misc::Convert::toOsg(body->GetCenterOfMassTransform().GetTranslation());
+                    auto originB = Misc::Convert::toOsg(body.GetCenterOfMassTransform().GetTranslation());
                     osg::Vec3f motion = Misc::Convert::toOsg(mMotion);
                     osg::Vec3f normal = (originA - originB);
                     normal.z() = 0;
@@ -94,8 +100,9 @@ namespace MWPhysics
                         if (normal * motion < 0.0f)
                         {
                             // Get the contact properties
-                            mHitCollisionObject = body;
+                            mHitCollisionObject = inResult.mBodyID2;
                             mHitCollisionLayer = collisionGroup;
+                            mHitUserData = userData;
                             mHitPointWorld = mOrigin + Misc::Convert::toOsg(inResult.mContactPointOn2);
                             mHitNormalWorld = Misc::Convert::toJolt<JPH::Vec3>(normal);
                             mClosestHitFraction = 0.0f;
@@ -121,22 +128,24 @@ namespace MWPhysics
                 UpdateEarlyOutFraction(earlyOut);
 
                 // Get the contact properties
-                mHitCollisionObject = body;
+                mHitCollisionObject = inResult.mBodyID2;
                 mHitCollisionLayer = collisionGroup;
+                mHitUserData = userData;
                 mHitPointWorld = mOrigin + Misc::Convert::toOsg(inResult.mContactPointOn2);
                 mHitNormalWorld = hitNormalWorld;
                 mClosestHitFraction = inResult.mFraction;
             }
         }
 
-        bool hasHit() const { return mHitCollisionObject != nullptr; }
+        bool hasHit() const { return !mHitCollisionObject.IsInvalid(); }
 
         float mClosestHitFraction;
         const float mMinCollisionDot;
         const JPH::BodyID mMe;
-        const JPH::Body* mHitCollisionObject = nullptr;
+        JPH::BodyID mHitCollisionObject;
 
         JPH::ObjectLayer mHitCollisionLayer;
+        std::uint64_t mHitUserData = 0;
         osg::Vec3f mHitPointWorld;
         JPH::Vec3 mHitNormalWorld;
         JPH::Vec3 mMotion;

@@ -1,0 +1,3 @@
+# Live tuning groups and sliders: their names are the plain text the page
+# registers (a missing key shows as itself). This file keeps the context known.
+reset: "reset"

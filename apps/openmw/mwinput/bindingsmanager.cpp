@@ -205,6 +205,11 @@ namespace MWInput
         mInputBinder->update(dt);
     }
 
+    bool BindingsManager::isMouseButtonBound(int action, int button) const
+    {
+        return mInputBinder->getMouseButtonBinding(mInputBinder->getControl(action), ICS::Control::INCREASE) == button;
+    }
+
     bool BindingsManager::isLeftOrRightButton(int action, bool joystick) const
     {
         int mouseBinding
@@ -222,7 +227,7 @@ namespace MWInput
     {
         int playerChannels[] = { A_AutoMove, A_AlwaysRun, A_ToggleWeapon, A_ToggleSpell, A_Rest, A_QuickKey1,
             A_QuickKey2, A_QuickKey3, A_QuickKey4, A_QuickKey5, A_QuickKey6, A_QuickKey7, A_QuickKey8, A_QuickKey9,
-            A_QuickKey10, A_Use, A_Journal };
+            A_QuickKey10, A_Use, A_PhysicalThrust, A_PhysicalGuard, A_PhysicalGrip, A_PhysicalDodge, A_Journal };
 
         for (int pc : playerChannels)
         {
@@ -291,10 +296,17 @@ namespace MWInput
         defaultKeyBindings[A_QuickSave] = SDL_SCANCODE_F5;
         defaultKeyBindings[A_QuickLoad] = SDL_SCANCODE_F9;
         defaultKeyBindings[A_TogglePostProcessorHUD] = SDL_SCANCODE_F2;
+        defaultKeyBindings[A_PhysicalGuard] = SDL_SCANCODE_C;
+        defaultKeyBindings[A_PhysicalGrip] = SDL_SCANCODE_G;
+        defaultKeyBindings[A_PhysicalDodge] = SDL_SCANCODE_LALT;
+        // The inventory on I as well (the right-click guard takes the right
+        // button while a weapon is drawn).
+        defaultKeyBindings[A_Inventory] = SDL_SCANCODE_I;
 
         std::map<int, int> defaultMouseButtonBindings;
         defaultMouseButtonBindings[A_Inventory] = SDL_BUTTON_RIGHT;
         defaultMouseButtonBindings[A_Use] = SDL_BUTTON_LEFT;
+        defaultMouseButtonBindings[A_PhysicalThrust] = SDL_BUTTON_MIDDLE;
 
         std::map<int, ICS::InputControlSystem::MouseWheelClick> defaultMouseWheelBindings;
         defaultMouseWheelBindings[A_ZoomIn] = ICS::InputControlSystem::MouseWheelClick::UP;
@@ -446,6 +458,14 @@ namespace MWInput
                 return "#{OMWEngine:ToggleHUD}";
             case A_Use:
                 return "#{sUse}";
+            case A_PhysicalThrust:
+                return "Physical thrust";
+            case A_PhysicalGuard:
+                return "Physical guard";
+            case A_PhysicalGrip:
+                return "Change grip";
+            case A_PhysicalDodge:
+                return "Dodge";
             case A_Activate:
                 return "#{sActivate}";
             case A_MoveBackward:
@@ -575,8 +595,8 @@ namespace MWInput
     const std::initializer_list<int>& BindingsManager::getActionKeySorting()
     {
         static const std::initializer_list<int> actions{ A_MoveForward, A_MoveBackward, A_MoveLeft, A_MoveRight,
-            A_TogglePOV, A_ZoomIn, A_ZoomOut, A_Run, A_AlwaysRun, A_Sneak, A_Activate, A_Use, A_ToggleWeapon,
-            A_ToggleSpell, A_CycleSpellLeft, A_CycleSpellRight, A_CycleWeaponLeft, A_CycleWeaponRight, A_AutoMove,
+            A_TogglePOV, A_ZoomIn, A_ZoomOut, A_Run, A_AlwaysRun, A_Sneak, A_Activate, A_Use, A_PhysicalThrust, A_PhysicalGuard, A_PhysicalGrip, A_PhysicalDodge,
+            A_ToggleWeapon, A_ToggleSpell, A_CycleSpellLeft, A_CycleSpellRight, A_CycleWeaponLeft, A_CycleWeaponRight, A_AutoMove,
             A_Jump, A_Inventory, A_Journal, A_Rest, A_Console, A_QuickSave, A_QuickLoad, A_ToggleHUD, A_Screenshot,
             A_QuickKeysMenu, A_QuickKey1, A_QuickKey2, A_QuickKey3, A_QuickKey4, A_QuickKey5, A_QuickKey6, A_QuickKey7,
             A_QuickKey8, A_QuickKey9, A_QuickKey10, A_TogglePostProcessorHUD };

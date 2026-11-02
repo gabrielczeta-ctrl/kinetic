@@ -67,6 +67,10 @@ namespace MWInput
         A_ZoomOut = 49,
 
         A_TogglePostProcessorHUD = 50,
+        A_PhysicalThrust = 51,
+        A_PhysicalGuard = 52, // hold: physical block/parry stance
+        A_PhysicalGrip = 53, // tap: cycle a long blade's grip (GRIP-05)
+        A_PhysicalDodge = 54, // tap: a dodge step along the movement keys, a roll when running
 
         A_Last // Marker for the last item
     };

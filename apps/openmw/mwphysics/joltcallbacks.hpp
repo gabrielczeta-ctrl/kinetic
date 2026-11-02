@@ -60,7 +60,7 @@ namespace MWPhysics
             if (inResult.mBodyID2 == mMe)
                 return;
 
-            JPH::BodyLockRead lock(mPhysicsSystem->GetBodyLockInterfaceNoLock(), inResult.mBodyID2);
+            JPH::BodyLockRead lock(mPhysicsSystem->GetBodyLockInterface(), inResult.mBodyID2);
             if (!lock.Succeeded())
                 return;
 

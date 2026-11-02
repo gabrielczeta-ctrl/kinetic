@@ -1,0 +1,5 @@
+MENU: menu.lua
+GLOBAL: global.lua
+PLAYER: player.lua
+CUSTOM: opponent.lua
+CUSTOM: duelist.lua

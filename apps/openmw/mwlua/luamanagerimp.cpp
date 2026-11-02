@@ -1,4 +1,5 @@
 #include "luamanagerimp.hpp"
+#include <ragdollcore/tuning.hpp>
 
 #include <filesystem>
 
@@ -30,6 +31,7 @@
 
 #include "../mwworld/datetimemanager.hpp"
 #include "../mwworld/esmstore.hpp"
+#include "../mwworld/kineticnet.hpp"
 #include "../mwworld/player.hpp"
 #include "../mwworld/ptr.hpp"
 #include "../mwworld/scene.hpp"
@@ -665,8 +667,25 @@ namespace MWLua
 
     void LuaManager::onHit(const MWWorld::Ptr& attacker, const MWWorld::Ptr& victim, const MWWorld::Ptr& weapon,
         const MWWorld::Ptr& ammo, int attackType, float attackStrength, float attackWindUp, float damage, bool isHealth,
-        const osg::Vec3f& hitPos, bool successful, MWMechanics::DamageSourceType sourceType)
+        const osg::Vec3f& hitPos, bool successful, MWMechanics::DamageSourceType sourceType,
+        std::uint64_t physicalHitId)
     {
+        // NET-01 duel: the puppet stands for the remote player, whose own game
+        // pays the blow (through that player's armour).
+        if (!victim.isEmpty() && MWBase::Environment::get().getWorld()->isNetPuppet(victim))
+        {
+            MWWorld::NetHit hit;
+            hit.mDamage = damage;
+            hit.mHealth = isHealth;
+            hit.mSuccessful = successful;
+            hit.mType = static_cast<std::int8_t>(attackType);
+            hit.mStrength = attackStrength;
+            hit.mHitPos = { hitPos.x(), hitPos.y(), hitPos.z() };
+            MWWorld::KineticNet::get().sendHit(hit);
+            Log(Debug::Info) << "KINETIC_NET hit sent damage=" << damage << " health=" << isHealth
+                             << " successful=" << successful;
+            return;
+        }
         mLua.protectedCall([&](LuaUtil::LuaView& view) {
             sol::table damageTable = view.newTable();
             if (isHealth)
@@ -687,6 +706,20 @@ namespace MWLua
             data["damage"] = damageTable;
             data["hitPos"] = hitPos;
             data["successful"] = successful;
+            if (physicalHitId != 0)
+            {
+                data["physicalHitId"] = physicalHitId;
+                // The physical controller owns this transaction's response.
+                data["ignoreStagger"] = true;
+                // ...and its sound, by weapon and surface (OPENMW_RAGDOLL_HIT_SOUNDS).
+                static const auto physicalSounds_tuned = RagdollCore::tuned<bool>([] {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HIT_SOUNDS");
+                    return text && std::atoi(text) != 0;
+                });
+                static const auto& physicalSounds = physicalSounds_tuned.get();
+                if (physicalSounds)
+                    data["muteSound"] = true;
+            }
             switch (sourceType)
             {
                 case MWMechanics::DamageSourceType::Unspecified:
@@ -703,6 +736,31 @@ namespace MWLua
                     break;
             }
 
+            sendLocalEvent(victim, "Hit", data);
+        });
+    }
+
+    void LuaManager::onNetHit(const MWWorld::Ptr& attacker, const MWWorld::Ptr& victim, float damage, bool isHealth,
+        const osg::Vec3f& hitPos, bool successful, int attackType, float attackStrength)
+    {
+        if (victim.isEmpty())
+            return;
+        mLua.protectedCall([&](LuaUtil::LuaView& view) {
+            sol::table damageTable = view.newTable();
+            damageTable[isHealth ? "health" : "fatigue"] = damage;
+            sol::table data = view.newTable();
+            if (!attacker.isEmpty())
+                data["attacker"] = LObject(attacker);
+            data["type"] = attackType;
+            data["strength"] = attackStrength;
+            data["windUp"] = -1;
+            data["damage"] = damageTable;
+            data["hitPos"] = hitPos;
+            data["successful"] = successful;
+            data["sourceType"] = "melee";
+            // The body already took the blow physically (the NetBlow).
+            data["ignoreStagger"] = true;
+            data["kineticNet"] = true;
             sendLocalEvent(victim, "Hit", data);
         });
     }

@@ -2,6 +2,8 @@
 #define MWINPUT_MWINPUTMANAGERIMP_H
 
 #include <memory>
+#include <array>
+#include <vector>
 
 #include <osg/ref_ptr>
 #include <osgViewer/ViewerEventHandlers>
@@ -106,7 +108,18 @@ namespace MWInput
 
         bool controlsDisabled() override { return mControlsDisabled; }
 
+#ifdef OPENMW_RAGDOLL_DEV_API
+        SDL_Window* getRagdollTestWindow() const { return mWindow; }
+        void injectRagdollTestMouseInput(int deltaX, int deltaY, int heldState, int buttonId = 1);
+        void queueObservationEditorInput(int x, int y, int character)
+        { mObservationEditorInput.push_back({ x, y, character }); }
     private:
+        std::vector<std::array<int, 3>> mObservationEditorInput;
+    public:
+#endif
+
+    private:
+        SDL_Window* mWindow;
         bool mControlsDisabled;
 
         void saveBindings() override;

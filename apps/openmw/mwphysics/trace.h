@@ -7,10 +7,11 @@
 #include <Jolt/Physics/Body/BodyID.h>
 #include <Jolt/Physics/Collision/ObjectLayer.h>
 
+#include <cstdint>
+
 namespace JPH
 {
     class PhysicsSystem;
-    class Body;
 }
 
 namespace MWPhysics
@@ -23,7 +24,8 @@ namespace MWPhysics
         osg::Vec3f mPlaneNormal;
         osg::Vec3f mHitPoint;
         JPH::ObjectLayer mHitObjectLayer;
-        const JPH::Body* mHitObject;
+        JPH::BodyID mHitObject;
+        std::uint64_t mHitObjectUserData = 0;
 
         float mFraction;
 

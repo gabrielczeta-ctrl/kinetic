@@ -1,7 +1,26 @@
 #include "npcanimation.hpp"
+#include <ragdollcore/tuning.hpp>
+
+#include <limits>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <osg/Depth>
+#include <osg/Transform>
 #include <osg/MatrixTransform>
+#include <osg/StateSet>
+#include <osg/Uniform>
+#include <osg/BlendFunc>
+#include <osg/PolygonOffset>
+#include <osg/Program>
+#include <osg/Shader>
+#include <osg/TriangleFunctor>
 #include <osg/UserDataContainer>
 
 #include <osgUtil/CullVisitor>
@@ -14,14 +33,19 @@
 #include <components/misc/resourcehelpers.hpp>
 
 #include <components/esm3/loadbody.hpp>
+#include <components/esm3/loadarmo.hpp>
 #include <components/esm3/loadmgef.hpp>
 #include <components/esm3/loadrace.hpp>
+#include <components/esm3/loadskil.hpp>
+#include <components/misc/strings/algorithm.hpp>
 #include <components/resource/resourcesystem.hpp>
 #include <components/resource/scenemanager.hpp>
 #include <components/sceneutil/depth.hpp>
 #include <components/sceneutil/keyframe.hpp>
 #include <components/sceneutil/lightcommon.hpp>
 #include <components/sceneutil/visitor.hpp>
+#include <components/sceneutil/riggeometry.hpp>
+#include <components/sceneutil/morphgeometry.hpp>
 #include <components/settings/values.hpp>
 
 #include <components/vfs/manager.hpp>
@@ -45,9 +69,306 @@
 #include "renderingmanager.hpp"
 #include "rotatecontroller.hpp"
 #include "vismask.hpp"
+#include "woundfx.hpp"
 
 namespace
 {
+    // WOUNDFX-01 FX3: is this armour piece leather-like (a matte, scuffed cut
+    // with a frayed edge) rather than metal (a bright scored line and a dent)?
+    // A word in its name or model first (leather beats a metal word: studded
+    // leather is leather), then the weight class: light armour is
+    // leather-like unless it names a hard material (glass, elven...);
+    // medium and heavy are metal.
+    bool isSoftArmour(const MWWorld::ConstPtr& item)
+    {
+        const ESM::Armor* armor = item.get<ESM::Armor>()->mBase;
+        const std::string_view name = armor->mName;
+        const std::string_view model = armor->mModel.getOriginal();
+        const auto mentions = [&](std::string_view word) {
+            return Misc::StringUtils::ciFind(name, word) != std::string_view::npos
+                || Misc::StringUtils::ciFind(model, word) != std::string_view::npos;
+        };
+        static constexpr std::string_view soft[] = { "leather", "netch", "fur", "hide", "pelt", "bear", "wolf",
+            "chitin", "padded", "quilted", "gambeson", "cloth" };
+        static constexpr std::string_view hard[] = { "glass", "elven", "mithril", "silver", "steel", "iron", "chain",
+            "mail", "plate", "scale", "ebony", "daedric", "dwemer", "dwarven", "orcish", "adamant", "bronze", "metal" };
+        for (const std::string_view word : soft)
+            if (mentions(word))
+                return true;
+        for (const std::string_view word : hard)
+            if (mentions(word))
+                return false;
+        return item.getClass().getEquipmentSkill(item) == ESM::Skill::LightArmor;
+    }
+
+    // WOUNDFX-01 FX4: the bone a region's skin moves with: a skinned part's
+    // frame for its wounds' blood running downhill (a rigid part's is its
+    // parent node).
+    std::string_view regionBone(std::string_view region)
+    {
+        static constexpr std::pair<std::string_view, std::string_view> bones[] = {
+            { "head", "bip01 head" },
+            { "neck", "bip01 neck" },
+            { "chest", "bip01 spine2" },
+            { "abdomen", "bip01 spine1" },
+            { "pelvis", "bip01 pelvis" },
+            { "left_clavicle", "bip01 l clavicle" },
+            { "right_clavicle", "bip01 r clavicle" },
+            { "left_upper_arm", "bip01 l upperarm" },
+            { "right_upper_arm", "bip01 r upperarm" },
+            { "left_forearm", "bip01 l forearm" },
+            { "right_forearm", "bip01 r forearm" },
+            { "left_hand", "bip01 l hand" },
+            { "right_hand", "bip01 r hand" },
+            { "left_thigh", "bip01 l thigh" },
+            { "right_thigh", "bip01 r thigh" },
+            { "left_calf", "bip01 l calf" },
+            { "right_calf", "bip01 r calf" },
+            { "left_foot", "bip01 l foot" },
+            { "right_foot", "bip01 r foot" },
+        };
+        for (const auto& [name, bone] : bones)
+            if (name == region)
+                return bone;
+        return {};
+    }
+
+    // WOUNDFX-01 FX4: a held weapon's rigid drawables, each with its frame
+    // into the bone it hangs on (the weapon node's parent: its origin is the
+    // grip).
+    class WeaponDrawableVisitor : public osg::NodeVisitor
+    {
+    public:
+        struct Found
+        {
+            osg::ref_ptr<osg::Geometry> mGeometry;
+            osg::ref_ptr<osg::Group> mParent;
+            osg::Matrix mToBone;
+        };
+        std::vector<Found> mFound;
+        osg::BoundingBox mBox; // every vertex in the bone's frame
+
+        WeaponDrawableVisitor()
+            : osg::NodeVisitor(TRAVERSE_ALL_CHILDREN)
+        {
+        }
+
+        void apply(osg::Drawable& drawable) override
+        {
+            bool isWound = false;
+            drawable.getUserValue("localizedWound", isWound);
+            osg::Geometry* geometry = drawable.asGeometry();
+            const auto* vertices = geometry ? dynamic_cast<const osg::Vec3Array*>(geometry->getVertexArray()) : nullptr;
+            const osg::NodePath& path = getNodePath();
+            if (isWound || !vertices || vertices->empty() || path.size() < 2)
+                return;
+            osg::Group* parent = path[path.size() - 2]->asGroup();
+            if (!parent)
+                return;
+            const osg::Matrix toBone = osg::computeLocalToWorld(path);
+            for (const osg::Vec3f& vertex : *vertices)
+                mBox.expandBy(vertex * toBone);
+            mFound.push_back({ geometry, parent, toBone });
+        }
+    };
+
+    // Search the actual last-rendered surface, not the ragdoll collision box.
+    // The resulting UV projector is baked per vertex; the overlay then uses
+    // precisely the original mesh's weights and topology during skinning.
+    struct WoundSurface
+    {
+        osg::Vec3f mPoint, mNormal, mHit;
+        float mDistance = 12.0f;
+        bool mFound = false;
+        void operator()(const osg::Vec3& a, const osg::Vec3& b, const osg::Vec3& c, bool = false)
+        {
+            const osg::Vec3 e1 = b - a, e2 = c - a;
+            osg::Vec3 n = e1 ^ e2;
+            const float normalLength = n.normalize();
+            if (normalLength < 1e-7f || n * mNormal < 0.15f)
+                return;
+            // Prefer projection along the physical contact normal. Thin limbs
+            // can sit beside that line inside their collision shape, so use
+            // the closest point on a facing triangle when the line misses.
+            // Both paths retain the same 12-unit Euclidean distance bound.
+            const osg::Vec3 p = mNormal ^ e2;
+            const float det = e1 * p;
+            osg::Vec3 hit;
+            bool onRay = false;
+            if (std::abs(det) >= 1e-7f)
+            {
+                const osg::Vec3 s = mPoint - a;
+                const float u = (s * p) / det;
+                const osg::Vec3 q = s ^ e1;
+                const float v = (mNormal * q) / det;
+                const float t = (e2 * q) / det;
+                onRay = u >= 0 && v >= 0 && u + v <= 1;
+                if (onRay) hit = mPoint + mNormal * t;
+            }
+            if (!onRay)
+            {
+                hit = mPoint - n * ((mPoint - a) * n);
+                const bool inside = ((b - a) ^ (hit - a)) * n >= 0
+                    && ((c - b) ^ (hit - b)) * n >= 0 && ((a - c) ^ (hit - c)) * n >= 0;
+                if (!inside)
+                {
+                    float best = std::numeric_limits<float>::max();
+                    for (const auto& edge : {std::pair{a, b}, std::pair{b, c}, std::pair{c, a}})
+                    {
+                        const osg::Vec3 direction = edge.second - edge.first;
+                        const float square = direction.length2();
+                        const float t = square > 1e-8f
+                            ? std::clamp(((mPoint - edge.first) * direction) / square, 0.0f, 1.0f) : 0.0f;
+                        const osg::Vec3 candidate = edge.first + direction * t;
+                        const float distance = (candidate - mPoint).length2();
+                        if (distance < best) { best = distance; hit = candidate; }
+                    }
+                }
+            }
+            const float distance = (hit - mPoint).length();
+            if (distance >= mDistance)
+                return;
+            mDistance = distance;
+            mHit = hit;
+            mFound = true;
+        }
+    };
+
+    class WoundSurfaceVisitor : public osg::NodeVisitor
+    {
+    public:
+        osg::Vec3f mPoint, mNormal;
+        float mDistance = 12.0f;
+        osg::ref_ptr<osg::Drawable> mDrawable;
+        osg::ref_ptr<osg::Group> mParent;
+        osg::ref_ptr<osg::Geometry> mPosed;
+        osg::Matrix mMatrix;
+        osg::Vec3f mHit;
+        // WOUNDFX-01 FX2: every bare-skin drawable of the region, for a wound
+        // spilling over the struck drawable's edge (the vanilla forearm ends
+        // mid-arm and the wrist piece goes on).
+        struct Candidate
+        {
+            osg::ref_ptr<osg::Drawable> mDrawable;
+            osg::ref_ptr<osg::Group> mParent;
+            osg::ref_ptr<osg::Geometry> mPosed;
+            osg::Matrix mMatrix;
+            int mSurface = 0; // MWRender::WoundFxSet::Surface
+        };
+        bool mCollect = false;
+        int mSurface = 0; // the surface of the part being visited (FX3)
+        std::vector<Candidate> mCandidates;
+        WoundSurfaceVisitor(const osg::Vec3f& point, const osg::Vec3f& normal)
+            : osg::NodeVisitor(TRAVERSE_ALL_CHILDREN), mPoint(point), mNormal(normal) {}
+        void apply(osg::Drawable& drawable) override
+        {
+            bool isWound = false;
+            drawable.getUserValue("localizedWound", isWound);
+            if (isWound)
+                return;
+            auto* rig = dynamic_cast<SceneUtil::RigGeometry*>(&drawable);
+            auto* morph = dynamic_cast<SceneUtil::MorphGeometry*>(&drawable);
+            osg::Geometry* plain = drawable.asGeometry();
+            if (!rig && !morph && !plain)
+                return;
+            osg::ref_ptr<osg::Geometry> posed = rig ? rig->copyDeformedGeometry()
+                : morph ? morph->copyDeformedGeometry() : osg::ref_ptr<osg::Geometry>(plain);
+            const auto* vertices = dynamic_cast<const osg::Vec3Array*>(posed->getVertexArray());
+            const auto& path = getNodePath();
+            if (!vertices || path.empty())
+                return;
+            // Static body-part drawables are shared by multiple actors. Use
+            // this part's traversal path, never another instance's parent.
+            const auto roots = path.front()->getParentalNodePaths();
+            if (roots.empty())
+                return;
+            auto worldPath = roots.front();
+            worldPath.insert(worldPath.end(), path.begin() + 1, path.end());
+            auto* parent = worldPath.size() >= 2 ? worldPath[worldPath.size() - 2]->asGroup() : nullptr;
+            if (!parent)
+                return;
+            const osg::Matrix matrix = osg::computeLocalToWorld(worldPath);
+            if (mCollect)
+                mCandidates.push_back({ &drawable, parent, posed, matrix, mSurface });
+            const osg::Matrix inverse = osg::Matrix::inverse(matrix);
+            osg::TriangleFunctor<WoundSurface> query;
+            query.mPoint = mPoint * inverse;
+            query.mNormal = osg::Matrix::transform3x3(mNormal, inverse);
+            const float scale = query.mNormal.normalize();
+            if (scale <= 0)
+                return;
+            query.mDistance = mDistance * scale;
+            posed->accept(query);
+            if (!query.mFound)
+                return;
+            mDistance = query.mDistance / scale;
+            mHit = query.mHit;
+            mMatrix = matrix;
+            mDrawable = &drawable;
+            mParent = parent;
+            mPosed = posed;
+        }
+    };
+
+    osg::ref_ptr<osg::StateSet> woundState(int kind, float severity)
+    {
+        static const osg::ref_ptr<osg::Program> sharedProgram = [] {
+        osg::ref_ptr<osg::Program> program = new osg::Program;
+        program->addShader(new osg::Shader(osg::Shader::VERTEX, R"glsl(
+#version 120
+uniform mat4 projectionMatrix;
+varying vec4 woundCoord;
+void main() {
+    // OpenMW's projection (reversed depth): the fixed-function matrix put
+    // the marks in front of everything (user 2026-10-01).
+    gl_Position = projectionMatrix * (gl_ModelViewMatrix * gl_Vertex);
+    woundCoord = gl_MultiTexCoord0;
+}
+)glsl"));
+        program->addShader(new osg::Shader(osg::Shader::FRAGMENT, R"glsl(
+#version 120
+varying vec4 woundCoord;
+uniform int woundKind;
+uniform float woundStrength;
+uniform float alpha;
+uniform float actorFade;
+void main() {
+    vec2 p = woundCoord.xy;
+    if (abs(woundCoord.z) > 1.8 || woundCoord.w < 0.15) discard;
+    float edge = 1.0 + 0.07 * sin(p.x * 19.0 + p.y * 11.0) + 0.035 * sin(p.y * 31.0);
+    float r = length(p);
+    float opacity = (1.0 - smoothstep(0.48, edge, r)) * (0.60 + 0.30 * woundStrength);
+    vec3 color;
+    if (woundKind == 1) {
+        color = mix(vec3(0.22, 0.12, 0.21), vec3(0.10, 0.045, 0.12), 1.0 - min(r, 1.0));
+        opacity *= 0.8;
+    } else if (woundKind == 4) {
+        color = vec3(0.28, 0.025, 0.035); // blood stain on cloth, no open flesh
+        opacity *= 0.8;
+    } else {
+        float slit = 1.0 - smoothstep(0.12, 0.48, abs(p.y + 0.035 * sin(p.x * 15.0)));
+        color = mix(vec3(0.42, 0.025, 0.04), vec3(0.08, 0.012, 0.018), slit);
+    }
+    opacity *= alpha * actorFade;
+    if (opacity < 0.015) discard;
+    gl_FragColor = vec4(color, opacity);
+}
+)glsl"));
+        return program;
+        }();
+        osg::ref_ptr<osg::StateSet> state = new osg::StateSet;
+        const auto mode = osg::StateAttribute::ON | osg::StateAttribute::OVERRIDE | osg::StateAttribute::PROTECTED;
+        state->setAttributeAndModes(sharedProgram, mode);
+        state->setAttributeAndModes(new osg::BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA), mode);
+        state->setAttributeAndModes(new SceneUtil::AutoDepth(osg::Depth::LEQUAL, 0, 1, false), mode);
+        const float bias = SceneUtil::AutoDepth::isReversed() ? 1.0f : -1.0f;
+        state->setAttributeAndModes(new osg::PolygonOffset(bias, bias), mode);
+        state->setMode(GL_CULL_FACE, osg::StateAttribute::OFF | osg::StateAttribute::OVERRIDE);
+        state->addUniform(new osg::Uniform("woundKind", kind));
+        state->addUniform(new osg::Uniform("woundStrength", severity));
+        state->setRenderingHint(osg::StateSet::TRANSPARENT_BIN);
+        return state;
+    }
 
     VFS::Path::Normalized getVampireHead(ESM::RefId race, bool female)
     {
@@ -297,16 +618,17 @@ namespace MWRender
         assert(viewMode != VM_HeadOnly);
         if (mViewMode == viewMode)
             return;
-        // FIXME: sheathing state must be consistent if the third person skeleton doesn't have the necessary node, but
-        // third person skeleton is unavailable in first person view. This is a hack to avoid cosmetic issues.
+        // Both views share the complete skeleton and its physical binding.
+        // Rebuilding on a camera toggle needlessly releases support grips and
+        // restarts active attacks. Only the visible head and traversal mask change.
         bool viewChange = mViewMode == VM_FirstPerson || viewMode == VM_FirstPerson;
         mViewMode = viewMode;
-        MWBase::Environment::get().getWorld()->scaleObject(
-            mPtr, mPtr.getCellRef().getScale(), true); // apply race height after view change
-
-        mAmmunition.reset();
-        rebuild();
+        mObjectRoot->setNodeMask(mViewMode == VM_FirstPerson ? Mask_FirstPerson : ~0u);
+        for (const auto part : { ESM::PRT_Head, ESM::PRT_Hair, ESM::PRT_Neck })
+            if (mObjectParts[part])
+                mObjectParts[part]->getNode()->setNodeMask(mViewMode == VM_FirstPerson ? 0u : ~0u);
         setRenderBin();
+        applyNearDissolve();
 
         if (viewChange && Settings::game().mShieldSheathing)
         {
@@ -417,19 +739,44 @@ namespace MWRender
 
     void NpcAnimation::setRenderBin()
     {
-        if (mViewMode == VM_FirstPerson)
-        {
-            [[maybe_unused]] static const bool prototypeAdded = [&] {
-                osg::ref_ptr<osgUtil::RenderBin> depthClearBin(new osgUtil::RenderBin);
-                depthClearBin->setDrawCallback(new DepthClearCallback());
-                osgUtil::RenderBin::addRenderBinPrototype("DepthClear", depthClearBin);
-                return true;
-            }();
-            mObjectRoot->getOrCreateStateSet()->setRenderBinDetails(
-                RenderBin_FirstPerson, "DepthClear", osg::StateSet::OVERRIDE_RENDERBIN_DETAILS);
-        }
-        else if (osg::StateSet* stateset = mObjectRoot->getStateSet())
+        // The first-person body occupies the same world space as the actor.
+        // Clearing depth would draw the legs and torso through nearby scenery.
+        if (osg::StateSet* stateset = mObjectRoot->getStateSet())
             stateset->setRenderBinToInherit();
+    }
+
+    void NpcAnimation::applyNearDissolve()
+    {
+        // KINETIC (10-09, user: "we need some way to also make the character
+        // model not block the player vision ... dissolve the body"): in first
+        // person the player's own arms, hands and weapon dissolve with a
+        // screen-door dither where they come close to the eye, more so near
+        // the middle of the view. OPENMW_RAGDOLL_FP_DISSOLVE = "gone, solid,
+        // centre" (world units, units, extra share of solid toward the
+        // centre); 0 = off. Uniform defaults to off at the scene root.
+        static const auto settings_tuned = RagdollCore::tuned<osg::Vec3f>([] {
+            osg::Vec3f value(10.0f, 22.0f, 0.8f);
+            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_FP_DISSOLVE"))
+            {
+                float a = 0, b = 0, c = 0;
+                const int read = std::sscanf(text, "%f,%f,%f", &a, &b, &c);
+                value = read >= 2 && b > a ? osg::Vec3f(a, b, read == 3 ? c : 0.0f) : osg::Vec3f();
+            }
+            return value;
+        });
+        static const auto& settings = settings_tuned.get();
+        if (!mObjectRoot)
+            return;
+        const osg::Vec3f value = mViewMode == VM_FirstPerson ? settings : osg::Vec3f();
+        osg::StateSet* stateset = mObjectRoot->getOrCreateStateSet();
+        if (osg::Uniform* uniform = stateset->getUniform("nearDissolve"))
+            uniform->set(value);
+        else if (value != osg::Vec3f())
+        {
+            osg::ref_ptr<osg::Uniform> uniform = new osg::Uniform("nearDissolve", value);
+            uniform->setDataVariance(osg::Object::DYNAMIC);
+            stateset->addUniform(uniform);
+        }
     }
 
     void NpcAnimation::rebuild()
@@ -497,25 +844,21 @@ namespace MWRender
             if (VFS::Path::Normalized vampireHead = getVampireHead(mNpc->mRace, isFemale); !vampireHead.empty())
                 mHeadModel = std::move(vampireHead);
 
-        bool is1stPerson = mViewMode == VM_FirstPerson;
+        // Both perspectives use the complete animated skeleton. The arms-only
+        // skeleton has neither a usable lower-body pose nor matching body skins.
         bool isBeast = (race->mData.mFlags & ESM::Race::Beast) != 0;
 
         std::string_view base;
         if (!isWerewolf)
-        {
-            if (!is1stPerson)
-                base = Settings::models().mXbaseanim.get().value();
-            else
-                base = Settings::models().mXbaseanim1st.get().value();
-        }
+            base = Settings::models().mXbaseanim.get().value();
 
         const std::string defaultSkeleton = Misc::ResourceHelpers::correctActorModelPath(
-            VFS::Path::toNormalized(getActorSkeleton(is1stPerson, isFemale, isBeast, isWerewolf)),
+            VFS::Path::toNormalized(getActorSkeleton(false, isFemale, isBeast, isWerewolf)),
             mResourceSystem->getVFS());
 
         std::string smodel = defaultSkeleton;
         bool isCustomModel = false;
-        if (!is1stPerson && !isWerewolf && !mNpc->mModel.empty())
+        if (!isWerewolf && !mNpc->mModel.empty())
         {
             const VFS::Path::Normalized model = Misc::ResourceHelpers::correctMeshPath(mNpc->mModel.getNormalized());
             isCustomModel = !isDefaultActorSkeleton(model);
@@ -535,16 +878,13 @@ namespace MWRender
         if (isCustomModel)
             addAnimSource(smodel, smodel);
 
-        const bool customArgonianSwim = !is1stPerson && !isWerewolf && isBeast && mNpc->mRace.contains("argonian");
+        const bool customArgonianSwim = !isWerewolf && isBeast && mNpc->mRace.contains("argonian");
         if (customArgonianSwim)
             addAnimSource(Settings::models().mXargonianswimkna.get().value(), smodel);
 
-        if (is1stPerson)
-        {
+        if (mViewMode == VM_FirstPerson)
             mObjectRoot->setNodeMask(Mask_FirstPerson);
-            mObjectRoot->addCullCallback(new OverrideFieldOfViewCallback(
-                mFirstPersonFieldOfView, MWBase::Environment::get().getWorld()->getRenderingManager()));
-        }
+        applyNearDissolve();
 
         mWeaponAnimationTime->updateStartTime();
     }
@@ -647,7 +987,6 @@ namespace MWRender
             }
         }
 
-        if (mViewMode != VM_FirstPerson)
         {
             if (mPartPriorities[ESM::PRT_Head] < 1 && !mHeadModel.empty())
                 addOrReplaceIndividualPart(ESM::PRT_Head, -1, 1, mHeadModel);
@@ -678,7 +1017,7 @@ namespace MWRender
         ESM::RefId race = (isWerewolf ? ESM::RefId::stringRefId("werewolf") : mNpc->mRace);
 
         const std::vector<const ESM::BodyPart*>& parts
-            = getBodyParts(race, !mNpc->isMale(), mViewMode == VM_FirstPerson, isWerewolf);
+            = getBodyParts(race, !mNpc->isMale(), false, isWerewolf);
         for (int part = ESM::PRT_Neck; part < ESM::PRT_Count; ++part)
         {
             if (mPartPriorities[part] < 1)
@@ -705,6 +1044,38 @@ namespace MWRender
 
     osg::Vec3f NpcAnimation::runAnimation(float timepassed)
     {
+        // Live tuning: the options page moved a slider (FP_DISSOLVE).
+        if (const std::uint64_t generation = RagdollCore::tuningGeneration(); generation != mDissolveTuning)
+        {
+            mDissolveTuning = generation;
+            applyNearDissolve();
+        }
+        // Wounds queued off the main thread (FX on): placed here.
+        std::vector<PendingWound> pending;
+        std::vector<PendingWeaponBlood> pendingBlood;
+        {
+            std::lock_guard<std::mutex> lock(mPendingWoundsMutex);
+            pending.swap(mPendingWounds);
+            pendingBlood.swap(mPendingWeaponBlood);
+        }
+        for (const PendingWound& wound : pending)
+            placeWound(wound.mRegion, wound.mKind, wound.mPoint, wound.mNormal, wound.mTangent, wound.mSeverity,
+                0.0f, 0.0f);
+        // FX4: blood on the held weapon, queued like the wounds.
+        for (const PendingWeaponBlood& blood : pendingBlood)
+            placeWeaponBlood(blood);
+        // Restore a rebuilt part's marks two frames later, once it is posed.
+        for (int part = 0; part < ESM::PRT_Count; ++part)
+            if (mWoundRestoreFrames[part] > 0 && --mWoundRestoreFrames[part] == 0)
+            {
+                restoreWoundSeeds(static_cast<ESM::PartReferenceType>(part));
+                // FX4: a weapon drawn again gets its blood back.
+                if (part == ESM::PRT_Weapon)
+                    applyWeaponBlood(nullptr);
+            }
+        // FX4: fresh wounds' blood keeps running downhill.
+        if (mWoundFx)
+            mWoundFx->update();
         osg::Vec3f ret = Animation::runAnimation(timepassed);
 
         mHeadAnimationTime->update(timepassed);
@@ -725,11 +1096,83 @@ namespace MWRender
 
         WeaponAnimation::configureControllers(mPtr.getRefData().getPosition().rot[0] + getBodyPitchRadians());
 
+        static const auto partTrace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_FP_PART_TRACE") != nullptr; });
+        static const auto& partTrace = partTrace_tuned.get();
+        if (partTrace && mViewMode == VM_FirstPerson && ++mPartTraceCounter % 30 == 0)
+        {
+            struct RigLister : osg::NodeVisitor
+            {
+                RigLister() : osg::NodeVisitor(TRAVERSE_ALL_CHILDREN) {}
+                void apply(osg::Drawable& drawable) override
+                {
+                    const osg::BoundingBox box = drawable.getBoundingBox();
+                    mText += " [" + drawable.getName() + " " + drawable.className()
+                        + " mask=" + std::to_string(drawable.getNodeMask()) + " box="
+                        + (box.valid() ? std::to_string(box.center().x()) + "," + std::to_string(box.center().y()) + ","
+                                    + std::to_string(box.center().z()) + " r=" + std::to_string(box.radius())
+                                       : std::string("invalid"))
+                        + "]";
+                }
+                std::string mText;
+            };
+            const auto worldOf = [](osg::Node* node) {
+                const osg::MatrixList matrices = node->getWorldMatrices();
+                return matrices.empty() ? osg::Matrix() : matrices.front();
+            };
+            for (const auto& [type, label] : { std::pair{ ESM::PRT_LHand, "LHand" }, { ESM::PRT_RHand, "RHand" },
+                     { ESM::PRT_LWrist, "LWrist" }, { ESM::PRT_RWrist, "RWrist" }, { ESM::PRT_LForearm, "LForearm" },
+                     { ESM::PRT_LUpperarm, "LUpperarm" }, { ESM::PRT_Head, "Head" }, { ESM::PRT_Hair, "Hair" },
+                     { ESM::PRT_Cuirass, "Chest" }, { ESM::PRT_Groin, "Groin" },
+                     { ESM::PRT_LLeg, "LLeg" }, { ESM::PRT_LFoot, "LFoot" }, { ESM::PRT_RFoot, "RFoot" } })
+            {
+                if (!mObjectParts[type])
+                {
+                    Log(Debug::Info) << "RAGDOLL_FP_PART " << label << " absent priority=" << mPartPriorities[type];
+                    continue;
+                }
+                osg::Node* node = mObjectParts[type]->getNode();
+                RigLister lister;
+                node->accept(lister);
+                const osg::Vec3d origin = worldOf(node).getTrans();
+                Log(Debug::Info) << "RAGDOLL_FP_PART " << label << " node=" << node->getName() << " mask="
+                                 << node->getNodeMask() << " parents=" << node->getNumParents() << " world=" << origin.x()
+                                 << "," << origin.y() << "," << origin.z() << lister.mText;
+            }
+            for (const char* bone : { "bip01 l hand", "bip01 r hand", "bip01 l forearm", "bip01 l finger0", "bip01 head" })
+            {
+                const auto found = mNodeMap.find(bone);
+                if (found == mNodeMap.end())
+                {
+                    Log(Debug::Info) << "RAGDOLL_FP_BONE " << bone << " missing";
+                    continue;
+                }
+                const osg::Matrix world = worldOf(found->second.get());
+                const osg::Vec3d p = world.getTrans();
+                const osg::Vec3d s = world.getScale();
+                const double det = osg::Vec3d(world(0, 0), world(0, 1), world(0, 2))
+                    * (osg::Vec3d(world(1, 0), world(1, 1), world(1, 2)) ^ osg::Vec3d(world(2, 0), world(2, 1), world(2, 2)));
+                Log(Debug::Info) << "RAGDOLL_FP_BONE " << bone << " world=" << p.x() << "," << p.y() << "," << p.z()
+                                 << " scale=" << s.x() << "," << s.y() << "," << s.z() << " det=" << det;
+            }
+        }
+
         return ret;
     }
 
     void NpcAnimation::removeIndividualPart(ESM::PartReferenceType type)
     {
+        // Cosmetic attachments never outlive the mesh they were projected on.
+        // Session-only v1 clears that part on equipment/model replacement.
+        for (auto it = mWoundOverlays.begin(); it != mWoundOverlays.end();)
+        {
+            if (it->mPart != type)
+            {
+                ++it;
+                continue;
+            }
+            it->mParent->removeChild(it->mNode);
+            it = mWoundOverlays.erase(it);
+        }
         mPartPriorities[type] = 0;
         mPartslots[type] = -1;
 
@@ -867,7 +1310,649 @@ namespace MWRender
             }
         }
 
+        // An equipment change replaces the part node; the limb under it is
+        // still the damaged one.
+        if (mPartDamageTint[type] > 0.0f)
+            applyPartDamageTint(type);
+        // Posed geometry exists only after the next skinning update.
+        mWoundRestoreFrames[type] = 3;
+
+        // Hide only the attached skins (including helmets), never the head
+        // bones used by the camera and physics. Equipment changes take this path too.
+        if (mViewMode == VM_FirstPerson && (type == ESM::PRT_Head || type == ESM::PRT_Hair || type == ESM::PRT_Neck))
+            node->setNodeMask(0);
+
         return true;
+    }
+
+    bool NpcAnimation::addLocalizedWound(std::string_view region, int kind, const osg::Vec3f& point,
+        const osg::Vec3f& normal, const osg::Vec3f& tangent, float severity)
+    {
+        mLastWoundSurface = -1;
+        if (WoundFxSet::enabled())
+        {
+            if (!point.valid() || !normal.valid() || !tangent.valid() || !std::isfinite(severity) || severity <= 0
+                || kind < 1 || kind > 3)
+                return false;
+            // The surface lookup only reads (as the marks always did here):
+            // no surface, no wound - only the placement waits.
+            mProbeWound = true;
+            mProbedSurface = -1;
+            const bool found = placeWound(region, kind, point, normal, tangent, severity, 0.0f, 0.0f);
+            mProbeWound = false;
+            if (!found)
+                return false;
+            mLastWoundSurface = mProbedSurface;
+            std::lock_guard<std::mutex> lock(mPendingWoundsMutex);
+            if (mPendingWounds.size() < 32)
+                mPendingWounds.push_back({ std::string(region), kind, severity, point, normal, tangent });
+            return true;
+        }
+        return placeWound(region, kind, point, normal, tangent, severity, 0.0f, 0.0f);
+    }
+
+    WoundFxSet& NpcAnimation::woundFx()
+    {
+        if (!mWoundFx)
+            mWoundFx = std::make_unique<WoundFxSet>();
+        // FX4: the actor's blood (a skeleton's dust, a Dwemer's metal).
+        mWoundFx->setBloodType(mNpc ? mNpc->mBloodType : 0);
+        return *mWoundFx;
+    }
+
+    bool NpcAnimation::addWeaponBlood(float alongFrom, float alongTo, float strength, int bloodType)
+    {
+        if (!WoundFxSet::bloodEnabled() || !std::isfinite(alongFrom) || !std::isfinite(alongTo)
+            || !std::isfinite(strength) || !(strength > 0) || bloodType == WoundFxSet::Blood_Dwemer)
+            return false;
+        // Any thread (a hit receipt can come from the Lua thread): queued,
+        // drawn in runAnimation on the main thread.
+        std::lock_guard<std::mutex> lock(mPendingWoundsMutex);
+        if (mPendingWeaponBlood.size() >= 8)
+            return false;
+        mPendingWeaponBlood.push_back({ alongFrom, alongTo, std::min(strength, 1.0f), bloodType });
+        return true;
+    }
+
+    const void* NpcAnimation::currentWeaponItem() const
+    {
+        if (!mPtr.getClass().hasInventoryStore(mPtr))
+            return nullptr;
+        const MWWorld::InventoryStore& inv = mPtr.getClass().getInventoryStore(mPtr);
+        const MWWorld::ConstContainerStoreIterator weapon = inv.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
+        if (weapon == inv.end() || weapon->getType() != ESM::Weapon::sRecordId)
+            return nullptr;
+        return weapon->mRef;
+    }
+
+    void NpcAnimation::placeWeaponBlood(const PendingWeaponBlood& blood)
+    {
+        const void* item = currentWeaponItem();
+        if (!item)
+            return;
+        // Up to WoundFxSet::sMaxBladeMarks per weapon (its oldest gives way),
+        // and a few weapons' worth in all.
+        const auto onItem = [item](const WeaponBlood& mark) { return mark.mItem == item; };
+        while (static_cast<unsigned int>(std::count_if(mWeaponBlood.begin(), mWeaponBlood.end(), onItem))
+            >= WoundFxSet::sMaxBladeMarks)
+            mWeaponBlood.erase(std::find_if(mWeaponBlood.begin(), mWeaponBlood.end(), onItem));
+        while (mWeaponBlood.size() >= 4 * WoundFxSet::sMaxBladeMarks)
+            mWeaponBlood.erase(mWeaponBlood.begin());
+        const float seed = woundFx().newSeed();
+        mWeaponBlood.push_back({ item, blood.mFrom, blood.mTo, blood.mStrength, WoundFxSet::now(), seed,
+            blood.mBloodType });
+        applyWeaponBlood(&mWeaponBlood.back());
+    }
+
+    void NpcAnimation::applyWeaponBlood(const WeaponBlood* only)
+    {
+        if (!WoundFxSet::bloodEnabled() || mWeaponBlood.empty())
+            return;
+        osg::Node* node = getWeaponNode();
+        const void* item = currentWeaponItem();
+        if (!node || !item || (only && only->mItem != item))
+            return;
+        const bool freshNode = mBloodiedWeaponNode.get() != node;
+        if (!only && !freshNode)
+            return; // its marks are on it already
+        // The blade in the bone's frame: its longest axis, from the grip (the
+        // bone's origin, Morrowind's weapon meshes are held there) to the far
+        // end, which is the tip (the pommel side is the shorter).
+        WeaponDrawableVisitor visitor;
+        node->accept(visitor);
+        if (visitor.mFound.empty() || !visitor.mBox.valid())
+            return;
+        const osg::BoundingBox& box = visitor.mBox;
+        const osg::Vec3f extent = box._max - box._min;
+        const int axis = extent.x() >= extent.y() && extent.x() >= extent.z() ? 0 : extent.y() >= extent.z() ? 1 : 2;
+        if (!(extent[axis] > 1.0f))
+            return;
+        osg::Vec3f grip = box.center();
+        osg::Vec3f tip = box.center();
+        grip[axis] = std::clamp(0.0f, box._min[axis], box._max[axis]);
+        tip[axis] = std::abs(box._max[axis]) >= std::abs(box._min[axis]) ? box._max[axis] : box._min[axis];
+        const float bladeLength = std::abs(tip[axis] - grip[axis]);
+        if (!(bladeLength > 1.0f))
+            return;
+        Shader::ShaderManager& shaderManager = mResourceSystem->getSceneManager()->getShaderManager();
+        WoundFxSet& fx = woundFx();
+        std::vector<const WeaponBlood*> marks;
+        for (const WeaponBlood& mark : mWeaponBlood)
+            if (mark.mItem == item && (freshNode || &mark == only))
+                marks.push_back(&mark);
+        std::vector<bool> placed(marks.size(), false);
+        for (const auto& found : visitor.mFound)
+        {
+            // Only the drawables the bloodied range reaches (the blade, not
+            // the pommel).
+            const osg::BoundingBox own = found.mGeometry->getBoundingBox();
+            osg::Matrix toLocal;
+            if (!own.valid() || !toLocal.invert(found.mToBone))
+                continue;
+            float lowest = std::numeric_limits<float>::max();
+            float highest = -std::numeric_limits<float>::max();
+            for (unsigned int corner = 0; corner < 8; ++corner)
+            {
+                const float along
+                    = ((own.corner(corner) * found.mToBone)[axis] - grip[axis]) / (tip[axis] - grip[axis]);
+                lowest = std::min(lowest, along);
+                highest = std::max(highest, along);
+            }
+            // The first mark on a shared (template) geometry swaps in this
+            // actor's copy under the same parent: the next ones go on that.
+            const unsigned int index = found.mParent->getChildIndex(found.mGeometry.get());
+            for (std::size_t i = 0; i < marks.size(); ++i)
+            {
+                const WeaponBlood& mark = *marks[i];
+                if (highest < mark.mFrom - 0.3f || lowest > mark.mTo + 0.3f)
+                    continue;
+                osg::Drawable* target = index < found.mParent->getNumChildren()
+                    ? found.mParent->getChild(index)->asDrawable()
+                    : nullptr;
+                if (target
+                    && fx.addBladeBlood(*target, found.mParent.get(), grip * toLocal, tip * toLocal, mark.mFrom,
+                        mark.mTo, mark.mStrength, mark.mBirth, mark.mSeed, mark.mBloodType, shaderManager))
+                    placed[i] = true;
+            }
+        }
+        for (const bool took : placed)
+            if (took)
+                ++mWeaponBloodPlaced;
+        mBloodiedWeaponNode = node;
+    }
+
+    bool NpcAnimation::addWoundFx(std::string_view region, const osg::Vec3f& point, const osg::Vec3f& normal,
+        const osg::Vec3f& direction, float length, float halfWidth, float severity, int kind)
+    {
+        mLastWoundFxKind = 0;
+        if (!WoundFxSet::enabled() || !(length > 0) || !(halfWidth > 0) || !std::isfinite(length)
+            || !std::isfinite(halfWidth) || kind < WoundFxSet::Kind_Bruise || kind > WoundFxSet::Kind_Chop)
+            return false;
+        return placeWound(region, kind, point, normal, direction, severity, length, halfWidth);
+    }
+
+    std::size_t NpcAnimation::getWoundFxCount() const
+    {
+        return mWoundFx ? mWoundFx->getCount() : 0;
+    }
+
+    bool NpcAnimation::placeWound(std::string_view region, int kind, const osg::Vec3f& point,
+        const osg::Vec3f& normal, const osg::Vec3f& tangent, float severity, float fxLength, float fxHalfWidth)
+    {
+        // Kinds: 1 bruise, 2 slash, 3 stab (the receipt kinds); 4 chop only
+        // from the WOUNDFX look check (a receipt's chop is a heavy slash).
+        if (!point.valid() || !normal.valid() || !tangent.valid() || normal.length2() < 0.5f
+            || !std::isfinite(severity) || severity <= 0 || kind < 1 || kind > 4)
+            return false;
+        using Parts = std::vector<ESM::PartReferenceType>;
+        static const std::pair<std::string_view, Parts> regions[] = {
+            { "head", { ESM::PRT_Head } }, { "neck", { ESM::PRT_Neck } },
+            // The stock torso mesh spans the abdomen and clavicles too.
+            // Physics regions do not map one-to-one to equipment part slots.
+            { "chest", { ESM::PRT_Cuirass } },
+            { "abdomen", { ESM::PRT_Cuirass, ESM::PRT_Groin, ESM::PRT_Skirt } },
+            { "pelvis", { ESM::PRT_Groin, ESM::PRT_Skirt } },
+            { "left_clavicle", { ESM::PRT_LPauldron, ESM::PRT_Cuirass } },
+            { "right_clavicle", { ESM::PRT_RPauldron, ESM::PRT_Cuirass } },
+            { "left_upper_arm", { ESM::PRT_LUpperarm } }, { "right_upper_arm", { ESM::PRT_RUpperarm } },
+            { "left_forearm", { ESM::PRT_LForearm, ESM::PRT_LWrist } },
+            { "right_forearm", { ESM::PRT_RForearm, ESM::PRT_RWrist } },
+            { "left_hand", { ESM::PRT_LHand } }, { "right_hand", { ESM::PRT_RHand } },
+            { "left_thigh", { ESM::PRT_LLeg } }, { "right_thigh", { ESM::PRT_RLeg } },
+            { "left_calf", { ESM::PRT_LKnee, ESM::PRT_LAnkle } },
+            { "right_calf", { ESM::PRT_RKnee, ESM::PRT_RAnkle } },
+            { "left_foot", { ESM::PRT_LFoot } }, { "right_foot", { ESM::PRT_RFoot } },
+        };
+        WoundSurfaceVisitor query(point, normal);
+        ESM::PartReferenceType part = ESM::PRT_Head;
+        // What the struck part's slot holds (WOUNDFX-01 FX3): nothing (bare
+        // skin), clothing (shirts, pants, robes, skirts: anything not armour)
+        // or armour. Below level 3 plate is passed over (no flesh openings on
+        // it); bruises always pass through clothes. A restored wound keeps to
+        // armour or off it: a dent does not come back as a cut on the chest
+        // once the cuirass is off, nor an old cut as a scratch on a cuirass
+        // put on over it.
+        const bool surfaces = WoundFxSet::level() >= 3;
+        const bool reseedArmour = mReseedingWounds && mReseedSurface == WoundFxSet::Surface_Armour;
+        int surface = WoundFxSet::Surface_Skin;
+        bool softArmour = false; // the struck armour is leather-like (FX3)
+        for (const auto& [name, parts] : regions)
+        {
+            if (name != region)
+                continue;
+            for (const auto candidate : parts)
+            {
+                if (!mObjectParts[candidate])
+                    continue;
+                int here = WoundFxSet::Surface_Skin;
+                bool softHere = false;
+                if (mPartslots[candidate] >= 0)
+                {
+                    const auto& inv = mPtr.getClass().getInventoryStore(mPtr);
+                    const auto item = inv.getSlot(mPartslots[candidate]);
+                    if (item != inv.end())
+                    {
+                        const bool armour = item->getType() == ESM::Armor::sRecordId;
+                        if (armour ? !surfaces || (mReseedingWounds && !reseedArmour) : kind == 1)
+                            continue; // no flesh openings on plate, or bruises through clothes
+                        here = armour ? WoundFxSet::Surface_Armour : WoundFxSet::Surface_Cloth;
+                        softHere = armour && isSoftArmour(*item);
+                    }
+                }
+                if (surfaces && reseedArmour && here != WoundFxSet::Surface_Armour)
+                    continue;
+                const float previous = query.mDistance;
+                // Spill-over candidates: bare skin, and at FX3 every surface
+                // (a wound spills only onto its own surface).
+                query.mCollect = surfaces || here == WoundFxSet::Surface_Skin;
+                query.mSurface = here;
+                mObjectParts[candidate]->getNode()->accept(query);
+                if (query.mDistance < previous)
+                {
+                    part = candidate;
+                    surface = here;
+                    softArmour = softHere;
+                }
+            }
+            break;
+        }
+        if (mProbeWound)
+        {
+            const bool found = query.mDrawable && query.mParent && query.mPosed;
+            mProbedSurface = found ? surface : -1;
+            return found;
+        }
+        if (!query.mDrawable || !query.mParent || !query.mPosed)
+        {
+            if (fxLength > 0)
+                Log(Debug::Warning) << "WOUNDFX01 no surface near the point for " << region << " (part "
+                                    << static_cast<int>(part) << ", distance " << query.mDistance << ")";
+            return false;
+        }
+
+        osg::Vec3f n = normal;
+        n.normalize();
+        osg::Vec3f u = tangent - n * (tangent * n);
+        if (u.length2() < 0.001f)
+            u = n ^ osg::Vec3f(1, 0, 0);
+        if (u.length2() < 0.001f)
+            u = n ^ osg::Vec3f(0, 0, 1);
+        u.normalize();
+        const osg::Vec3f v = n ^ u;
+        const osg::Vec3f center = query.mHit * query.mMatrix;
+        // Bounded like the marks below: every projection input, in its part
+        // node's frame, so a rebuilt part gets its wounds back.
+        constexpr std::size_t maximumMarks = 48;
+        const auto rememberSeed = [&] {
+            if (mReseedingWounds || !mObjectParts[part] || !mObjectParts[part]->getNode())
+                return;
+            const auto paths = mObjectParts[part]->getNode()->getParentalNodePaths();
+            if (paths.empty())
+                return;
+            const osg::Matrix toWorld = osg::computeLocalToWorld(paths.front());
+            const osg::Matrix toLocal = osg::Matrix::inverse(toWorld);
+            while (mWoundSeeds.size() >= maximumMarks)
+                mWoundSeeds.erase(mWoundSeeds.begin());
+            mWoundSeeds.push_back({ part, std::string(region), kind, severity, point * toLocal,
+                osg::Matrix::transform3x3(normal, toLocal), osg::Matrix::transform3x3(tangent, toLocal), fxLength,
+                fxHalfWidth, surface });
+        };
+        // WOUNDFX-01 FX1/FX2: every wound on bare skin becomes a wound volume
+        // in the skin shader instead of a mesh-copy mark: slashes, stabs,
+        // chops (a slash of severity 0.8 or more) and bruises. FX3 (level 3):
+        // the same record on clothing is a blood stain, on armour a scratch
+        // or a dent; below it clothing keeps the marks.
+        const int stroke = WoundFxSet::enabled() ? WoundFxSet::drawnKind(kind, severity) : 0;
+        if (fxLength > 0 && stroke == 0)
+        {
+            Log(Debug::Warning) << "WOUNDFX01 kind " << kind << " has no volume at OPENMW_RAGDOLL_WOUND_FX="
+                                << WoundFxSet::level();
+            return false; // a test shape has no mesh-copy fallback
+        }
+        // FX4 (level 4): a Dwemer's skin is metal (blood type 2: sparks, no
+        // blood): a cut, stab or blow on it is a scratch or a dent, as on
+        // armour.
+        const bool metalSkin = WoundFxSet::bloodEnabled() && surface == WoundFxSet::Surface_Skin && mNpc
+            && mNpc->mBloodType == WoundFxSet::Blood_Dwemer;
+        const int drawnKind = WoundFxSet::surfaceKind(stroke, metalSkin ? WoundFxSet::Surface_Armour : surface);
+        if (drawnKind != 0)
+        {
+            // Skinned parts, morphed heads and rigid parts (the vanilla
+            // forearms are a plain Geometry on the bone).
+            if (dynamic_cast<SceneUtil::RigGeometry*>(query.mDrawable.get())
+                || dynamic_cast<SceneUtil::MorphGeometry*>(query.mDrawable.get()) || query.mDrawable->asGeometry())
+            {
+                // Shapes by kind (WOUNDFX-01 section 1), world units: a cut's
+                // length and half gape; a stab's slit about a blade wide; a
+                // chop gaping wide; a bruise's radius round a short smear.
+                // A stain or a scratch takes its stroke's shape.
+                const float strength = std::clamp(severity, 0.0f, 1.0f);
+                float length = 3.5f + 4.5f * strength;
+                float halfWidth = 0.3f + 0.45f * strength;
+                if (stroke == WoundFxSet::Kind_Stab)
+                {
+                    length = 1.4f + 1.2f * strength;
+                    halfWidth = 0.2f + 0.22f * strength;
+                }
+                else if (stroke == WoundFxSet::Kind_Chop)
+                {
+                    length = 4.5f + 4.5f * strength;
+                    halfWidth = 1.7f * (0.3f + 0.45f * strength);
+                }
+                else if (stroke == WoundFxSet::Kind_Bruise)
+                {
+                    halfWidth = 1.0f + 1.0f * strength;
+                    length = 0.6f * halfWidth;
+                }
+                if (fxLength > 0)
+                    length = fxLength;
+                if (fxHalfWidth > 0)
+                    halfWidth = fxHalfWidth;
+                // Armour marks read at fighting distance (ARMOUR_MARKS): a
+                // scratch or a dent drawn larger.
+                if (drawnKind == WoundFxSet::Kind_Scratch)
+                {
+                    length *= WoundFxSet::armourMarkScale();
+                    halfWidth *= WoundFxSet::armourMarkScale();
+                }
+                WoundFxSet& fx = woundFx();
+                Shader::ShaderManager& shaderManager = mResourceSystem->getSceneManager()->getShaderManager();
+                const float seed = fx.newSeed();
+                // FX4: the frame the skin under the wound moves with, for its
+                // blood running downhill: a skinned part's region bone, a
+                // rigid part's (or a head's) parent node.
+                osg::ref_ptr<osg::Node> regionFrame;
+                if (WoundFxSet::bloodEnabled())
+                {
+                    const std::string_view bone = regionBone(region);
+                    const NodeMap& nodes = getNodeMap();
+                    if (const auto found = bone.empty() ? nodes.end() : nodes.find(std::string(bone));
+                        found != nodes.end())
+                        regionFrame = found->second;
+                }
+                const auto runFrame = [&](osg::Drawable* drawable, osg::Group* parent) -> osg::Node* {
+                    if (!WoundFxSet::bloodEnabled())
+                        return nullptr;
+                    if (dynamic_cast<SceneUtil::RigGeometry*>(drawable))
+                        return regionFrame.get();
+                    return parent;
+                };
+                if (fx.addWound(*query.mDrawable, query.mParent.get(), *query.mPosed, query.mMatrix, query.mHit, n,
+                        u, drawnKind, length, halfWidth, strength, seed, shaderManager, stroke, softArmour,
+                        runFrame(query.mDrawable.get(), query.mParent.get())))
+                {
+                    // The same wound on the region's other drawables of its
+                    // surface it reaches (the forearm piece ends mid-arm, the
+                    // wrist piece goes on; a shirt or a cuirass of several
+                    // meshes): no straight seam cuts it off. Same middle, axes
+                    // and seed, each in its own bind space. (FX4: a stain sags
+                    // downhill up to 0.6 of its radius more.)
+                    const float extent = drawnKind == WoundFxSet::Kind_Stain
+                        ? 0.5f * length
+                            + (WoundFxSet::bloodEnabled() ? 2.25f : 1.65f)
+                                * WoundFxSet::stainRadius(stroke, halfWidth, strength)
+                            + 0.3f
+                        : 0.5f * length + 3.6f * halfWidth + 0.3f;
+                    for (const auto& other : query.mCandidates)
+                    {
+                        if (other.mDrawable == query.mDrawable || !other.mPosed || !other.mParent
+                            || other.mSurface != surface)
+                            continue;
+                        const osg::Matrix inverse = osg::Matrix::inverse(other.mMatrix);
+                        osg::TriangleFunctor<WoundSurface> spill;
+                        spill.mPoint = center * inverse;
+                        spill.mNormal = osg::Matrix::transform3x3(n, inverse);
+                        const float scale = spill.mNormal.normalize();
+                        if (!(scale > 0))
+                            continue;
+                        spill.mDistance = extent * scale;
+                        other.mPosed->accept(spill);
+                        if (spill.mFound)
+                            fx.addWound(*other.mDrawable, other.mParent.get(), *other.mPosed, other.mMatrix,
+                                spill.mPoint, n, u, drawnKind, length, halfWidth, strength, seed, shaderManager,
+                                stroke, softArmour, runFrame(other.mDrawable.get(), other.mParent.get()));
+                    }
+                    // A hard blow on armour bleeds out from under it
+                    // (ARMOUR_MARKS): a blood stain welling from the mark and
+                    // sagging down the plate (FX4 runs stains downhill), on
+                    // the struck piece just below the mark. Red blood only.
+                    if (drawnKind == WoundFxSet::Kind_Scratch && WoundFxSet::bloodEnabled() && !metalSkin
+                        && fx.getBloodType() == WoundFxSet::Blood_Red
+                        && strength >= WoundFxSet::armourBleedSeverity())
+                    {
+                        osg::Vec3f down = osg::Vec3f(0, 0, -1) - n * (-n.z());
+                        if (down.length2() < 0.05f)
+                            down = v;
+                        down.normalize();
+                        const osg::Vec3f welling = center + down * (0.35f * length + 1.0f);
+                        const float ooze = 0.6f + 0.4f * std::clamp(
+                            (strength - WoundFxSet::armourBleedSeverity()) / 0.4f, 0.0f, 1.0f);
+                        fx.addWound(*query.mDrawable, query.mParent.get(), *query.mPosed, query.mMatrix,
+                            welling * osg::Matrix::inverse(query.mMatrix), n, down, WoundFxSet::Kind_Stain,
+                            0.5f * length, 0.9f * halfWidth * ooze, strength, fx.newSeed(), shaderManager,
+                            WoundFxSet::Kind_Bruise, false, runFrame(query.mDrawable.get(), query.mParent.get()));
+                    }
+                    mLastWoundFxKind = drawnKind;
+                    rememberSeed();
+                    return true;
+                }
+            }
+            if (fxLength > 0)
+            {
+                Log(Debug::Warning) << "WOUNDFX01 not placed on " << region << ": surface=" << surface << " rig="
+                                    << (dynamic_cast<SceneUtil::RigGeometry*>(query.mDrawable.get()) != nullptr)
+                                    << " drawable=" << query.mDrawable->className();
+                return false; // a test shape has no mesh-copy fallback
+            }
+        }
+        // Armour has no mesh-copy mark (blood on plate); it reaches here only
+        // at FX3 when the scratch did not take.
+        if (surface == WoundFxSet::Surface_Armour || metalSkin)
+            return false;
+        // The mesh-copy marks know no chop: a cut.
+        const int markKind = kind == 4 ? 2 : kind;
+        const float length = markKind == 1 ? 3.0f + 2.0f * severity
+            : markKind == 2 ? 3.0f + 3.0f * severity : 1.0f + 0.6f * severity;
+        const float width = markKind == 1 ? length * 0.8f : markKind == 2 ? 0.75f : 0.6f;
+        const auto* posedVertices = dynamic_cast<const osg::Vec3Array*>(query.mPosed->getVertexArray());
+        const auto* posedNormals = dynamic_cast<const osg::Vec3Array*>(query.mPosed->getNormalArray());
+        auto* rig = dynamic_cast<SceneUtil::RigGeometry*>(query.mDrawable.get());
+        auto* morph = dynamic_cast<SceneUtil::MorphGeometry*>(query.mDrawable.get());
+        osg::Geometry* source = rig ? rig->getSourceGeometry().get()
+            : morph ? morph->getSourceGeometry().get() : query.mDrawable->asGeometry();
+        if (!posedVertices || !source || posedVertices->size() != source->getVertexArray()->getNumElements())
+            return false;
+        osg::ref_ptr<osg::Geometry> overlay = new osg::Geometry(*source, osg::CopyOp::DEEP_COPY_ALL);
+        osg::ref_ptr<osg::Vec4Array> coordinates = new osg::Vec4Array;
+        coordinates->reserve(posedVertices->size());
+        for (std::size_t i = 0; i < posedVertices->size(); ++i)
+        {
+            const osg::Vec3f delta = (*posedVertices)[i] * query.mMatrix - center;
+            osg::Vec3f surfaceNormal = n;
+            if (posedNormals && i < posedNormals->size())
+            {
+                surfaceNormal = osg::Matrix::transform3x3((*posedNormals)[i], query.mMatrix);
+                surfaceNormal.normalize();
+            }
+            coordinates->push_back(osg::Vec4f((delta * u) / length, (delta * v) / width,
+                delta * n, surfaceNormal * n));
+        }
+        overlay->setTexCoordArray(0, coordinates, osg::Array::BIND_PER_VERTEX);
+        overlay->setName("localized wound");
+        overlay->setUserValue("localizedWound", true);
+        overlay->setStateSet(woundState(surface == WoundFxSet::Surface_Cloth ? 4 : markKind, severity));
+        overlay->setUpdateCallback(nullptr);
+        overlay->setCullCallback(nullptr);
+        osg::ref_ptr<osg::Drawable> drawable = overlay;
+        if (rig)
+        {
+            osg::ref_ptr<SceneUtil::RigGeometry> skinned = new SceneUtil::RigGeometry(*rig, osg::CopyOp::SHALLOW_COPY);
+            skinned->setSourceGeometry(overlay);
+            // RigGeometry uses its original shape name to cancel skin-root
+            // transforms. Renaming the clone would change its deformation.
+            skinned->setUserDataContainer(osg::clone(rig->getUserDataContainer(), osg::CopyOp::SHALLOW_COPY));
+            skinned->setUserValue("localizedWound", true);
+            skinned->setStateSet(overlay->getStateSet());
+            skinned->setUpdateCallback(nullptr);
+            skinned->setCullCallback(nullptr);
+            drawable = skinned;
+        }
+        else if (morph)
+        {
+            osg::ref_ptr<SceneUtil::MorphGeometry> face = new SceneUtil::MorphGeometry(*morph, osg::CopyOp::SHALLOW_COPY);
+            face->setSourceGeometry(overlay);
+            face->followMorphWeights(morph);
+            face->setUserDataContainer(osg::clone(morph->getUserDataContainer(), osg::CopyOp::SHALLOW_COPY));
+            face->setUserValue("localizedWound", true);
+            face->setStateSet(overlay->getStateSet());
+            face->setUpdateCallback(nullptr);
+            face->setCullCallback(nullptr);
+            drawable = face;
+        }
+        // One bounded mesh overlay per successful projection. Old cosmetic
+        // marks can expire without changing health or the damage ledger.
+        // Bounded: each mark copies its part's mesh. 12 filled within one
+        // fight once every weapon left marks; 48 lasts a long duel.
+        while (mWoundOverlays.size() >= maximumMarks)
+        {
+            mWoundOverlays.front().mParent->removeChild(mWoundOverlays.front().mNode);
+            mWoundOverlays.erase(mWoundOverlays.begin());
+        }
+        query.mParent->addChild(drawable);
+        mWoundOverlays.push_back({ query.mParent, drawable, part });
+        rememberSeed();
+        return true;
+    }
+
+    void NpcAnimation::restoreWoundSeeds(ESM::PartReferenceType type)
+    {
+        if (mWoundSeeds.empty() || !mObjectParts[type] || !mObjectParts[type]->getNode())
+            return;
+        const auto paths = mObjectParts[type]->getNode()->getParentalNodePaths();
+        if (paths.empty())
+            return;
+        const osg::Matrix toWorld = osg::computeLocalToWorld(paths.front());
+        mReseedingWounds = true;
+        for (const auto& seed : mWoundSeeds)
+        {
+            if (seed.mPart != type)
+                continue;
+            mReseedSurface = seed.mSurface;
+            placeWound(seed.mRegion, seed.mKind, seed.mPoint * toWorld,
+                osg::Matrix::transform3x3(seed.mNormal, toWorld), osg::Matrix::transform3x3(seed.mTangent, toWorld),
+                seed.mSeverity, seed.mLength, seed.mHalfWidth);
+        }
+        mReseedingWounds = false;
+    }
+
+    void NpcAnimation::applyPartDamageTint(ESM::PartReferenceType type)
+    {
+        if (!mObjectParts[type] || !mObjectParts[type]->getNode())
+            return;
+        osg::Node* node = mObjectParts[type]->getNode();
+        const float tint = std::clamp(mPartDamageTint[type], 0.0f, 1.0f);
+        // Always a fresh state set: the one on the node may be in use by the
+        // draw traversal of the previous frame.
+        osg::ref_ptr<osg::StateSet> stateset = node->getStateSet()
+            ? new osg::StateSet(*node->getStateSet(), osg::CopyOp::SHALLOW_COPY)
+            : new osg::StateSet;
+        // Material emission is multiplied by the texture and clamped with the
+        // lighting. On a lit sleeve it can disappear entirely. Blend the final
+        // surface colour instead, without replacing the authored material.
+        const osg::StateAttribute::GLModeValue mode = osg::StateAttribute::ON | osg::StateAttribute::OVERRIDE;
+        stateset->addUniform(new osg::Uniform("anatomicalDamageTint", tint), mode);
+        node->setStateSet(stateset);
+    }
+
+    void NpcAnimation::setAnatomicalDamageTint(std::string_view region, float intensity)
+    {
+        // Own the elements: an initializer_list copied into std::pair would
+        // retain pointers to a temporary backing array after initialization.
+        using Parts = std::vector<ESM::PartReferenceType>;
+        static const std::pair<std::string_view, Parts> sRegionParts[] = {
+            { "head", { ESM::PRT_Head, ESM::PRT_Hair } },
+            { "neck", { ESM::PRT_Neck } },
+            { "chest", { ESM::PRT_Cuirass } },
+            { "abdomen", { ESM::PRT_Groin, ESM::PRT_Skirt } },
+            { "pelvis", { ESM::PRT_Groin, ESM::PRT_Skirt, ESM::PRT_Tail } },
+            { "left_clavicle", { ESM::PRT_LPauldron } },
+            { "right_clavicle", { ESM::PRT_RPauldron } },
+            { "left_upper_arm", { ESM::PRT_LUpperarm } },
+            { "right_upper_arm", { ESM::PRT_RUpperarm } },
+            { "left_forearm", { ESM::PRT_LForearm, ESM::PRT_LWrist } },
+            { "right_forearm", { ESM::PRT_RForearm, ESM::PRT_RWrist } },
+            { "left_hand", { ESM::PRT_LHand } },
+            { "right_hand", { ESM::PRT_RHand } },
+            { "left_thigh", { ESM::PRT_LLeg } },
+            { "right_thigh", { ESM::PRT_RLeg } },
+            { "left_calf", { ESM::PRT_LKnee, ESM::PRT_LAnkle } },
+            { "right_calf", { ESM::PRT_RKnee, ESM::PRT_RAnkle } },
+            { "left_foot", { ESM::PRT_LFoot } },
+            { "right_foot", { ESM::PRT_RFoot } },
+        };
+        if (!std::isfinite(intensity))
+            return;
+        for (const auto& [name, parts] : sRegionParts)
+        {
+            if (name != region)
+                continue;
+            for (const ESM::PartReferenceType part : parts)
+            {
+                // Several regions can share a part (abdomen and pelvis both
+                // show on the groin): the part keeps the strongest tint.
+                const float wanted = std::clamp(intensity, 0.0f, 1.0f);
+                const float value = wanted <= 0.0f ? 0.0f : std::max(mPartDamageTint[part], wanted);
+                if (value == mPartDamageTint[part])
+                    continue;
+                mPartDamageTint[part] = value;
+                applyPartDamageTint(part);
+            }
+            return;
+        }
+    }
+
+    void NpcAnimation::clearAnatomicalDamageTints()
+    {
+        for (const auto& mark : mWoundOverlays)
+            mark.mParent->removeChild(mark.mNode);
+        mWoundOverlays.clear();
+        mWoundSeeds.clear();
+        if (mWoundFx)
+            mWoundFx->clear();
+        // FX4: the weapon's blood goes with the reset too.
+        mWeaponBlood.clear();
+        mBloodiedWeaponNode = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mPendingWoundsMutex);
+            mPendingWeaponBlood.clear();
+        }
+        for (int part = 0; part < ESM::PRT_Count; ++part)
+        {
+            if (mPartDamageTint[part] <= 0.0f)
+                continue;
+            mPartDamageTint[part] = 0.0f;
+            applyPartDamageTint(static_cast<ESM::PartReferenceType>(part));
+        }
     }
 
     void NpcAnimation::addPartGroup(int group, int priority, const std::vector<ESM::PartReference>& parts,
@@ -876,40 +1961,19 @@ namespace MWRender
         const MWWorld::ESMStore& store = *MWBase::Environment::get().getESMStore();
         const MWWorld::Store<ESM::BodyPart>& partStore = store.get<ESM::BodyPart>();
 
-        const char* ext = (mViewMode == VM_FirstPerson) ? ".1st" : "";
         for (const ESM::PartReference& part : parts)
         {
             const ESM::BodyPart* bodypart = nullptr;
             if (!mNpc->isMale() && !part.mFemale.empty())
             {
-                bodypart = partStore.search(ESM::RefId::stringRefId(part.mFemale.getRefIdString() + ext));
-                if (!bodypart && mViewMode == VM_FirstPerson)
-                {
-                    bodypart = partStore.search(part.mFemale);
-                    if (bodypart
-                        && !(bodypart->mData.mPart == ESM::BodyPart::MP_Hand
-                            || bodypart->mData.mPart == ESM::BodyPart::MP_Wrist
-                            || bodypart->mData.mPart == ESM::BodyPart::MP_Forearm
-                            || bodypart->mData.mPart == ESM::BodyPart::MP_Upperarm))
-                        bodypart = nullptr;
-                }
-                else if (!bodypart)
+                bodypart = partStore.search(part.mFemale);
+                if (!bodypart)
                     Log(Debug::Warning) << "Warning: Failed to find body part '" << part.mFemale << "'";
             }
             if (!bodypart && !part.mMale.empty())
             {
-                bodypart = partStore.search(ESM::RefId::stringRefId(part.mMale.getRefIdString() + ext));
-                if (!bodypart && mViewMode == VM_FirstPerson)
-                {
-                    bodypart = partStore.search(part.mMale);
-                    if (bodypart
-                        && !(bodypart->mData.mPart == ESM::BodyPart::MP_Hand
-                            || bodypart->mData.mPart == ESM::BodyPart::MP_Wrist
-                            || bodypart->mData.mPart == ESM::BodyPart::MP_Forearm
-                            || bodypart->mData.mPart == ESM::BodyPart::MP_Upperarm))
-                        bodypart = nullptr;
-                }
-                else if (!bodypart)
+                bodypart = partStore.search(part.mMale);
+                if (!bodypart)
                     Log(Debug::Warning) << "Warning: Failed to find body part '" << part.mMale << "'";
             }
 
@@ -928,24 +1992,9 @@ namespace MWRender
         mFirstPersonNeckController = nullptr;
         WeaponAnimation::deleteControllers();
 
-        if (mViewMode == VM_FirstPerson)
+        if (mViewMode == VM_Normal || mViewMode == VM_FirstPerson)
         {
-            // If there is no active animation, then the bip01 neck node will not be updated each frame, and the
-            // RotateController will accumulate rotations.
-            if (mStates.size() > 0)
-            {
-                NodeMap::iterator found = mNodeMap.find("bip01 neck");
-                if (found != mNodeMap.end())
-                {
-                    osg::MatrixTransform* node = found->second.get();
-                    mFirstPersonNeckController = new RotateController(mObjectRoot.get());
-                    node->addUpdateCallback(mFirstPersonNeckController);
-                    mActiveControllers.emplace_back(node, mFirstPersonNeckController);
-                }
-            }
-        }
-        else if (mViewMode == VM_Normal)
-        {
+            // Looking down must leave the torso and feet under the camera.
             WeaponAnimation::addControllers(mNodeMap, mActiveControllers, mObjectRoot.get());
         }
     }
@@ -1105,6 +2154,65 @@ namespace MWRender
     osg::Node* NpcAnimation::getWeaponNode()
     {
         const PartHolder* const part = mObjectParts[ESM::PRT_Weapon].get();
+        if (part == nullptr)
+            return nullptr;
+        return part->getNode();
+    }
+
+    void NpcAnimation::setWeaponGripTurn(const std::optional<osg::Matrixf>& handFrame)
+    {
+        osg::Node* weapon = getWeaponNode();
+        // Unwrap when the turn ends or the weapon part changed (a new part is
+        // attached to the bone again; the old one left the wrapper empty).
+        if (mWeaponGripNode && (!handFrame || weapon == nullptr || mWeaponGripChild.get() != weapon))
+        {
+            const osg::ref_ptr<osg::MatrixTransform> wrapper = mWeaponGripNode;
+            mWeaponGripNode = nullptr;
+            osg::ref_ptr<osg::Node> child;
+            if (mWeaponGripChild.lock(child) && child.get() == weapon)
+            {
+                while (wrapper->getNumParents() > 0)
+                    wrapper->getParent(0)->replaceChild(wrapper, child);
+            }
+            else
+            {
+                while (wrapper->getNumParents() > 0)
+                    wrapper->getParent(0)->removeChild(wrapper);
+            }
+            mWeaponGripChild = nullptr;
+        }
+        if (!handFrame || weapon == nullptr)
+            return;
+        const osg::Node* hand = getNode("Bip01 R Hand");
+        if (hand == nullptr)
+            return;
+        if (!mWeaponGripNode)
+        {
+            if (weapon->getNumParents() != 1)
+                return;
+            osg::Group* parent = weapon->getParent(0);
+            mWeaponGripNode = new osg::MatrixTransform;
+            mWeaponGripNode->setName("KINETIC grip turn");
+            parent->replaceChild(weapon, mWeaponGripNode);
+            mWeaponGripNode->addChild(weapon);
+            mWeaponGripChild = weapon;
+        }
+        if (mWeaponGripNode->getNumParents() != 1)
+            return;
+        // The turn is in the hand's frame; the wrapper sits in the frame of the
+        // weapon's own parent (the weapon bone, which may be offset from it).
+        const auto parentPaths = mWeaponGripNode->getParent(0)->getParentalNodePaths(getObjectRoot());
+        const auto handPaths = hand->getParentalNodePaths(getObjectRoot());
+        if (parentPaths.size() != 1 || handPaths.size() != 1)
+            return;
+        const osg::Matrixf parentToHand
+            = osg::computeLocalToWorld(parentPaths.front()) * osg::Matrixf::inverse(osg::computeLocalToWorld(handPaths.front()));
+        mWeaponGripNode->setMatrix(parentToHand * *handFrame * osg::Matrixf::inverse(parentToHand));
+    }
+
+    osg::Node* NpcAnimation::getShieldNode()
+    {
+        const PartHolder* const part = mObjectParts[ESM::PRT_Shield].get();
         if (part == nullptr)
             return nullptr;
         return part->getNode();

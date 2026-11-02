@@ -13,7 +13,7 @@ namespace MWPhysics
 {
     static bool canStepDown(const ActorTracer& stepper)
     {
-        if (!stepper.mHitObject)
+        if (stepper.mHitObject.IsInvalid())
             return false;
         static const float sMaxSlopeCos = std::cos(osg::DegreesToRadians(Constants::sMaxSlope));
         if (stepper.mPlaneNormal.z() <= sMaxSlopeCos)
@@ -41,7 +41,7 @@ namespace MWPhysics
             collisionMask, onGround);
 
         float upDistance = 0;
-        if (!mUpStepper.mHitObject)
+        if (mUpStepper.mHitObject.IsInvalid())
             upDistance = Constants::sStepSizeUp;
         else if (mUpStepper.mFraction * Constants::sStepSizeUp > sCollisionMargin)
             upDistance = mUpStepper.mFraction * Constants::sStepSizeUp - sCollisionMargin;
@@ -91,7 +91,7 @@ namespace MWPhysics
             }
 
             mTracer.doTrace(mColObj, tracerPos, tracerDest, mColWorld, collisionMask);
-            if (mTracer.mHitObject)
+            if (!mTracer.mHitObject.IsInvalid())
             {
                 // map against what we hit, minus the safety margin
                 moveDistance *= mTracer.mFraction;
@@ -165,7 +165,7 @@ namespace MWPhysics
         if ((position - newpos).length2() < sCollisionMargin * sCollisionMargin)
             return false;
 
-        if (mTracer.mHitObject)
+        if (!mTracer.mHitObject.IsInvalid())
         {
             auto planeNormal = mTracer.mPlaneNormal;
             if (onGround && !isWalkableSlope(planeNormal) && planeNormal.z() != 0)

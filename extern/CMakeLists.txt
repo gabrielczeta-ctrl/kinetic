@@ -3,22 +3,28 @@
 set_directory_properties(PROPERTIES EXCLUDE_FROM_ALL on)
 set(CMAKE_CXX_CLANG_TIDY "")
 
-if(NOT OPENMW_USE_SYSTEM_JOLT)
+if(OPENMW_USE_SYSTEM_JOLT)
+    message(FATAL_ERROR "OPENMW_USE_SYSTEM_JOLT is not supported; this fork requires its pinned Jolt source archive")
+else()
     if(MSVC)
         # Keep Jolt runtime selection aligned with OpenMW (/MD on CI/MSVC).
         # Jolt defaults this to ON, which causes /MT vs /MD linker mismatches.
         set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
     endif()
 
-    set(JPH_DEBUG_RENDERER ON CACHE BOOL "")
-    set(JPH_PROFILE_ENABLED OFF CACHE BOOL "")
-    add_definitions(-DJPH_DEBUG_RENDERER=1)
+    # Use Jolt's actual build switches so its ABI-affecting definitions are
+    # exported by the Jolt target to every consumer. The old JPH_* cache
+    # variables were no-ops and directory-wide add_definitions was brittle.
+    set(DEBUG_RENDERER_IN_DEBUG_AND_RELEASE ON CACHE BOOL "" FORCE)
+    set(DEBUG_RENDERER_IN_DISTRIBUTION ON CACHE BOOL "" FORCE)
+    set(PROFILER_IN_DEBUG_AND_RELEASE OFF CACHE BOOL "" FORCE)
+    set(PROFILER_IN_DISTRIBUTION OFF CACHE BOOL "" FORCE)
 
     # Turn RTTI on for Jolt
     set(CPP_RTTI_ENABLED ON)
 
     # When turning this option on, the library will be compiled using doubles for positions. This allows for much bigger worlds.
-    set(DOUBLE_PRECISION ON)
+    set(DOUBLE_PRECISION ON CACHE BOOL "" FORCE)
 
     # When turning this option on, the library will be compiled in such a way to attempt to keep the simulation deterministic across platforms
     set(CROSS_PLATFORM_DETERMINISTIC OFF)
@@ -41,6 +47,13 @@ if(NOT OPENMW_USE_SYSTEM_JOLT)
         SOURCE_SUBDIR Build
     )
     FetchContent_MakeAvailable(joltphysics)
+    set(JOLT_SOURCE_DIR "${joltphysics_SOURCE_DIR}")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/jolt-contact-impulse.cmake")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/jolt-motor-load.cmake")
+
+    include("${CMAKE_CURRENT_SOURCE_DIR}/jolt-contact-selection.cmake")
+
+    include("${CMAKE_CURRENT_SOURCE_DIR}/jolt-contact-geometry.cmake")
 
     set(JOLT_INCLUDE_DIRS ${joltphysics_SOURCE_DIR} PARENT_SCOPE)
     set(JOLT_LIBRARIES Jolt PARENT_SCOPE)

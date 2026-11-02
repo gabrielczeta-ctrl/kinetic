@@ -837,6 +837,16 @@ namespace MWRender
         return -1.f;
     }
 
+    std::optional<Animation::RagdollAnimationSource> Animation::getRagdollAnimationSource(std::string_view group) const
+    {
+        if (!mAccumRoot)
+            return std::nullopt;
+        for (auto it = mAnimSources.rbegin(); it != mAnimSources.rend(); ++it)
+            if ((*it)->getTextKeys().hasGroupStart(group))
+                return RagdollAnimationSource{ (*it)->mKeyframes.get(), mAccumRoot->getName(), mAccumulate };
+        return std::nullopt;
+    }
+
     float Animation::getTextKeyTime(std::string_view textKey) const
     {
         for (AnimSourceList::const_reverse_iterator iter(mAnimSources.rbegin()); iter != mAnimSources.rend(); ++iter)
@@ -1199,6 +1209,12 @@ namespace MWRender
         AnimStateMap::iterator state(mStates.find(groupname));
         if (state != mStates.end())
             state->second.mSpeedMult = speedmult;
+    }
+
+    void Animation::setLocomotionSpeedScale(float scale)
+    {
+        if (std::isfinite(scale) && scale > 0.0f)
+            mLocomotionSpeedScale = scale;
     }
 
     bool Animation::isPlaying(std::string_view groupname) const

@@ -86,8 +86,27 @@ end
 
 local testConfig = loadTestConfig()
 
+-- The filter is a Lua pattern, or several joined by ' || ' (any may match).
+local function filterMatches(name)
+    if testConfig.filter == nil then
+        return true
+    end
+    local rest = testConfig.filter
+    while true do
+        local cut = rest:find(' || ', 1, true)
+        local pattern = cut and rest:sub(1, cut - 1) or rest
+        if name:find(pattern) ~= nil then
+            return true
+        end
+        if not cut then
+            return false
+        end
+        rest = rest:sub(cut + 4)
+    end
+end
+
 local function testNameMatchesFilter(name)
-    return testConfig.filter == nil or name:find(testConfig.filter) ~= nil
+    return (testConfig.names == nil or testConfig.names[name] == true) and filterMatches(name)
 end
 
 local function runTests(tests)

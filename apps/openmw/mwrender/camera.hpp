@@ -1,6 +1,7 @@
 #ifndef GAME_MWRENDER_CAMERA_H
 #define GAME_MWRENDER_CAMERA_H
 
+#include <cmath>
 #include <optional>
 #include <string>
 
@@ -69,6 +70,15 @@ namespace MWRender
         float getExtraYaw() const { return mExtraYaw; }
         float getExtraRoll() const { return mExtraRoll; }
         void setExtraPitch(float angle) { mExtraPitch = angle; }
+        // A short nod of the view on a hard impact (ragdoll combat, alpha 0.4
+        // item 8); decays by itself.
+        void addKick(float angle) { mKick = std::max(mKick, angle); }
+        // ... and a tilt of the view away from a blow's side (signed, rad).
+        void addRollKick(float angle)
+        {
+            if (std::abs(angle) > std::abs(mRollKick))
+                mRollKick = angle;
+        }
         void setExtraYaw(float angle) { mExtraYaw = angle; }
         void setExtraRoll(float angle) { mExtraRoll = angle; }
 
@@ -138,6 +148,8 @@ namespace MWRender
         float mHeight;
         float mPitch, mYaw, mRoll;
         float mExtraPitch = 0, mExtraYaw = 0, mExtraRoll = 0;
+        float mKick = 0;
+        float mRollKick = 0;
         bool mLockPitch = false, mLockYaw = false;
         osg::Vec3d mPosition;
         osg::Matrixf mViewMatrix;

@@ -1,0 +1,3 @@
+GLOBAL: kinetic_duel_global.lua
+PLAYER: kinetic_duel_player.lua
+CUSTOM: kinetic_duel_puppet.lua

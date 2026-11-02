@@ -1,0 +1,619 @@
+<meta charset="utf-8">
+<title>Mouse vs Blade</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@400;500;600&display=swap">
+<style>
+:root {
+  --ground: #F1F3F0; --panel: #FFFFFF; --ink: #1C2226; --muted: #66717A; --line: #D7DCD9; --soft: #E9ECE8;
+  --cmd: #2463A6; --phys: #C4561B; --sim: #8452B5; --mouse: #39464E;
+  --guard: #A3ABB0; --wind: #2A8787; --cut: #C23B3B; --recover: #7D9A33;
+  --warn: #C98400; --crit: #C0262D; --ok: #2F8A4F;
+  --sans: "IBM Plex Sans Condensed", "Arial Narrow", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --ground: #121618; --panel: #1A1F22; --ink: #E3E7E9; --muted: #8E989F; --line: #2D3439; --soft: #22282C;
+    --cmd: #5E9DE2; --phys: #F08C4E; --sim: #B48CE3; --mouse: #C3CCD1;
+    --guard: #5E676C; --wind: #3FB1AE; --cut: #E25858; --recover: #A1C25A;
+    --warn: #E8A72A; --crit: #F05A5F; --ok: #55BE7C;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ground: #121618; --panel: #1A1F22; --ink: #E3E7E9; --muted: #8E989F; --line: #2D3439; --soft: #22282C;
+  --cmd: #5E9DE2; --phys: #F08C4E; --sim: #B48CE3; --mouse: #C3CCD1;
+  --guard: #5E676C; --wind: #3FB1AE; --cut: #E25858; --recover: #A1C25A;
+  --warn: #E8A72A; --crit: #F05A5F; --ok: #55BE7C;
+}
+* { box-sizing: border-box; }
+body { background: var(--ground); color: var(--ink); font: 14px/1.45 var(--sans); padding-inline: 16px; padding-block: 12px 32px; }
+.wrap { max-width: 1320px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; }
+h1 { font-size: 22px; font-weight: 600; margin: 0; letter-spacing: 0.01em; }
+h1 .c { color: var(--cmd); } h1 .p { color: var(--phys); }
+.src { color: var(--muted); font-family: var(--mono); font-size: 12px; word-break: break-all; }
+.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; }
+.bar label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; display: flex; align-items: center; gap: 6px; }
+button, select, input[type=number] { font: 13px var(--sans); color: var(--ink); background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 4px 9px; }
+input[type=number] { width: 64px; font-family: var(--mono); }
+button:hover { border-color: var(--muted); }
+button:focus-visible, select:focus-visible, input:focus-visible, canvas:focus-visible { outline: 2px solid var(--cmd); outline-offset: 2px; }
+button.on { background: var(--ink); color: var(--panel); }
+.file { position: relative; overflow: hidden; }
+.file input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.tick { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 300px); gap: 12px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.panel h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0; display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap; }
+.panel h2 .seg { display: flex; gap: 2px; }
+.panel h2 .seg button { padding: 1px 7px; font-size: 11px; text-transform: none; letter-spacing: 0; }
+canvas { display: block; width: 100%; }
+.sq { aspect-ratio: 1 / 1; max-width: 100%; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
+.legend i.dash { background: repeating-linear-gradient(90deg, currentColor 0 4px, transparent 4px 7px) !important; height: 2px; }
+table.read { border-collapse: collapse; width: 100%; font-size: 13px; }
+table.read td { padding: 2px 0; border-bottom: 1px solid var(--soft); vertical-align: top; }
+table.read td:first-child { color: var(--muted); padding-right: 10px; white-space: nowrap; }
+table.read td:last-child { font-family: var(--mono); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+.pill { display: inline-block; padding: 0 7px; border-radius: 9px; font-family: var(--sans); font-size: 12px; font-weight: 600; color: #fff; }
+.events { max-height: 340px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.ev { display: grid; grid-template-columns: 62px 1fr; gap: 6px; padding: 4px 6px; border-radius: 4px; cursor: pointer; border-left: 3px solid var(--line); background: var(--ground); font-size: 13px; text-align: left; }
+.ev:hover, .ev.cur { background: var(--soft); }
+.ev .t { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.ev small { display: block; color: var(--muted); font-size: 12px; }
+.ev.k-arm { border-left-color: var(--phys); } .ev.k-cmd { border-left-color: var(--cmd); }
+.ev.k-elbow { border-left-color: var(--crit); } .ev.k-wrist { border-left-color: var(--warn); } .ev.k-mark { border-left-color: var(--ink); }
+.note { color: var(--muted); font-size: 13px; max-width: 70ch; }
+.drop { outline: 2px dashed var(--cmd); outline-offset: -6px; }
+.empty { padding: 40px 16px; text-align: center; color: var(--muted); }
+@media (max-width: 1000px) { .grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .side { grid-column: 1 / -1; } }
+@media (max-width: 640px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap" id="app">
+  <header>
+    <h1>Mouse vs <span class="c">commanded</span> vs <span class="p">physical</span> blade</h1>
+    <span class="src" id="src">no recording loaded</span>
+  </header>
+
+  <div class="bar">
+    <span class="file"><button type="button">Open recording (.json)</button><input type="file" id="file" accept=".json,application/json" aria-label="Open a converted recording"></span>
+    <button type="button" id="play" aria-label="Play or pause">▶ Play</button>
+    <label for="speed">Speed <select id="speed"><option value="0.1">0.1×</option><option value="0.25" selected>0.25×</option><option value="0.5">0.5×</option><option value="1">1×</option></select></label>
+    <label for="win">Window <select id="win"><option value="2">2 s</option><option value="5">5 s</option><option value="10" selected>10 s</option><option value="30">30 s</option><option value="120">2 min</option></select></label>
+    <label for="trail">Trail <select id="trail"><option value="0.3">0.3 s</option><option value="0.6" selected>0.6 s</option><option value="1.5">1.5 s</option><option value="3">3 s</option></select></label>
+    <span class="tick" id="clock">step –</span>
+    <span class="note" style="font-size:12px">← → one step · Shift ten · Space play · N / P next / previous event</span>
+  </div>
+
+  <div class="panel">
+    <h2>Session <span id="sessinfo" class="tick" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+    <canvas id="mini" height="44" aria-label="Whole session overview; click to jump" tabindex="0"></canvas>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Stance circle · what hand control read from the mouse</h2>
+      <canvas id="stance" class="sq" aria-label="Stance circle"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--mouse)"></i>raw mouse since the press</span>
+        <span id="lg-rec"><i style="background:var(--ink)"></i>stance point (recorded)</span>
+        <span style="color:var(--sim)"><i class="dash" style="background:var(--sim)"></i><span style="color:var(--muted)">stance replayed from the mouse</span></span>
+        <span>inner ring 300 = guards · outer 1,800 = full wind-up</span>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Arm and blade · body frame <span class="seg" role="group" aria-label="View"><button type="button" data-view="front" class="on">front</button><button type="button" data-view="side">side</button><button type="button" data-view="top">top</button></span></h2>
+      <canvas id="arm" class="sq" aria-label="Arm and blade"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--phys)"></i>physical blade + tip trail</span>
+        <span style="color:var(--cmd)"><i class="dash" style="background:var(--cmd)"></i><span style="color:var(--muted)">commanded</span></span>
+        <span><i style="background:var(--ink)"></i>shoulder · elbow · hand</span>
+        <span><i style="background:var(--mouse);opacity:.6"></i>mouse stroke (front view)</span>
+      </div>
+    </div>
+    <div class="panel side">
+      <h2>At the cursor</h2>
+      <table class="read" id="read"></table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Timeline <span class="note" style="text-transform:none;letter-spacing:0;font-weight:400">click to move the cursor · wheel to zoom</span></h2>
+    <canvas id="time" height="420" aria-label="Timeline" tabindex="0"></canvas>
+  </div>
+
+  <div class="grid">
+    <div class="panel" style="grid-column: span 2">
+      <h2>Events <span class="seg" role="group" aria-label="Filter events" id="filters"></span></h2>
+      <div class="events" id="events"></div>
+    </div>
+    <div class="panel side">
+      <h2>Flags</h2>
+      <table class="read">
+        <tr><td><label for="t-flip">Blade flip, deg per step</label></td><td><input type="number" id="t-flip" value="25"></td></tr>
+        <tr><td><label for="t-cmd">Command jump, deg per step</label></td><td><input type="number" id="t-cmd" value="12"></td></tr>
+        <tr><td><label for="t-elbow">Elbow turn in 0.1 s, deg</label></td><td><input type="number" id="t-elbow" value="100"></td></tr>
+        <tr><td><label for="t-wrist">Wrist past limit, deg</label></td><td><input type="number" id="t-wrist" value="25"></td></tr>
+      </table>
+      <p class="note">A blade flip with a smooth command is the arm (physics, the elbow branch); a flip whose command jumped too is hand control's logic. Bookmarks (B in game) show with their notes.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+const EMBED = /*DATA*/null;
+const STAGES = ['guard', 'wind-up', 'cut', 'recover'];
+const STAGE_VAR = ['--guard', '--wind', '--cut', '--recover'];
+// attackLines() sorted by drag angle (passiveragdollentry.inl)
+const LINES = ['forehand', 'up-right', 'chop', 'up-left', 'backhand', 'down-left', 'thrust', 'down-right'];
+let D = null, N = 0, cur = 0, winS = 10, trailS = 0.6, view = 'front', playing = false, speed = 0.25;
+let derived = null, events = [], filter = { arm: true, cmd: true, elbow: true, wrist: true, mark: true };
+const $ = id => document.getElementById(id);
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// ---------- vector helpers ----------
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const mul = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const len = a => Math.sqrt(dot(a, a));
+const norm = a => { const l = len(a); return l > 1e-6 ? mul(a, 1 / l) : null; };
+const angDeg = (a, b) => (a && b) ? Math.acos(Math.max(-1, Math.min(1, dot(a, b)))) * 180 / Math.PI : null;
+
+function stageAt(i) {
+  const h = D.cols.hsc[i];
+  if (h && h.on) return h.stage;
+  return D.has_hsc ? 0 : D.cols.sim[i][2];
+}
+function stanceAt(i) {
+  const h = D.cols.hsc[i];
+  return h ? [h.sx, h.sy] : null;
+}
+
+// ---------- derived series and events ----------
+function derive() {
+  const c = D.cols, n = N;
+  const mSpeed = new Float32Array(n), tipP = new Float32Array(n), tipC = new Float32Array(n);
+  const turnP = new Float32Array(n).fill(NaN), turnC = new Float32Array(n).fill(NaN);
+  const elbowTurn = new Float32Array(n).fill(NaN), elbowPole = new Float32Array(n).fill(NaN);
+  const dirMiss = new Float32Array(n).fill(NaN);
+  const bend = new Array(n).fill(null);
+  for (let i = 0; i < n; i++) {
+    const a = Math.max(0, i - 1);
+    let mx = 0, my = 0, k = 0;
+    for (let j = Math.max(0, i - 2); j <= i; j++) { mx += c.mx[j]; my += c.my[j]; k++; }
+    mSpeed[i] = Math.hypot(mx, my) / k * 60;
+    if (c.tp[i] && c.tp[a] && i > 0) tipP[i] = len(sub(c.tp[i], c.tp[a])) * 60;
+    if (c.tc[i] && c.tc[a] && i > 0) tipC[i] = len(sub(c.tc[i], c.tc[a])) * 60;
+    if (i > 0) { const t = angDeg(c.bp[a], c.bp[i]); if (t !== null) turnP[i] = t; const u = angDeg(c.bc[a], c.bc[i]); if (u !== null) turnC[i] = u; }
+    if (c.sp[i] && c.ep[i] && c.hp[i]) {
+      const axis = norm(sub(c.hp[i], c.sp[i]));
+      if (axis) {
+        const mid = mul(add(c.hp[i], c.sp[i]), 0.5);
+        const off = sub(c.ep[i], mid);
+        const perp = sub(off, mul(axis, dot(off, axis)));
+        if (len(perp) > 1.5) bend[i] = norm(perp);
+      }
+      if (bend[i] && c.pole[i]) elbowPole[i] = angDeg(bend[i], norm(c.pole[i]));
+    }
+    if (i >= 6 && bend[i] && bend[i - 6]) elbowTurn[i] = angDeg(bend[i], bend[i - 6]);
+    // The mouse's stroke against the tip's motion on the screen plane (right, up).
+    if (i >= 3 && c.tp[i] && c.tp[i - 3] && mSpeed[i] > 600) {
+      let sx = 0, sy = 0;
+      for (let j = i - 2; j <= i; j++) { sx += c.mx[j]; sy += c.my[j]; }
+      const d = sub(c.tp[i], c.tp[i - 3]);
+      if (Math.hypot(d[0], d[2]) * 20 > 60) {
+        const m = Math.hypot(sx, sy), t = Math.hypot(d[0], d[2]);
+        dirMiss[i] = Math.acos(Math.max(-1, Math.min(1, (sx * d[0] + sy * d[2]) / (m * t)))) * 180 / Math.PI;
+      }
+    }
+  }
+  derived = { mSpeed, tipP, tipC, turnP, turnC, elbowTurn, elbowPole, dirMiss, bend };
+  findEvents();
+}
+function findEvents() {
+  const c = D.cols, d = derived, n = N;
+  const T = { flip: +$('t-flip').value, cmd: +$('t-cmd').value, elbow: +$('t-elbow').value, wrist: +$('t-wrist').value };
+  events = [];
+  const last = {};
+  const push = (i, kind, title, detail) => {
+    if (last[kind] !== undefined && i - last[kind] < 20) return;
+    last[kind] = i; events.push({ i, kind, title, detail });
+  };
+  for (let i = 1; i < n; i++) {
+    // only while hand control, the weapon drive or the tip controller owns the arm
+    // (the guard's animation command is not what the mouse asked)
+    if (!D.weapons[c.wpn[i]] || !(c.drv ? c.drv[i] : 1)) continue;
+    if (d.turnP[i] > T.flip) {
+      let cmdMax = 0, handJump = 0;
+      for (let j = Math.max(1, i - 3); j <= Math.min(n - 1, i + 1); j++) {
+        if (d.turnC[j] > cmdMax) cmdMax = d.turnC[j];
+        if (c.hc[j] && c.hc[j - 1]) handJump = Math.max(handJump, len(sub(c.hc[j], c.hc[j - 1])));
+      }
+      if (cmdMax > T.cmd || handJump > 8)
+        push(i, 'cmd', 'Command jumped', `blade ${d.turnP[i].toFixed(0)}° in a step; command turned ${cmdMax.toFixed(0)}°, hand goal moved ${handJump.toFixed(1)}`);
+      else
+        push(i, 'arm', 'Arm flipped, command smooth', `blade ${d.turnP[i].toFixed(0)}° in a step; command only ${cmdMax.toFixed(0)}°`);
+    } else if (d.turnC[i] > T.cmd * 1.5) {
+      push(i, 'cmd', 'Command jumped', `command turned ${d.turnC[i].toFixed(0)}° in a step; blade ${(d.turnP[i] || 0).toFixed(0)}°`);
+    }
+    if (d.elbowTurn[i] > T.elbow) push(i, 'elbow', 'Elbow switched side', `bend turned ${d.elbowTurn[i].toFixed(0)}° in 0.1 s` + (isNaN(d.elbowPole[i]) ? '' : `; ${d.elbowPole[i].toFixed(0)}° from the asked bend`));
+    if (c.wr[i] > T.wrist && !(c.wr[i - 1] > T.wrist)) push(i, 'wrist', 'Right wrist past its limit', `${c.wr[i].toFixed(0)}° past`);
+    if (c.wl[i] > T.wrist && !(c.wl[i - 1] > T.wrist)) push(i, 'wrist', 'Left wrist past its limit', `${c.wl[i].toFixed(0)}° past`);
+  }
+  for (const b of D.bookmarks) {
+    const i = indexOfTick(b.tick);
+    events.push({ i, kind: 'mark', title: 'Bookmark ' + b.id, detail: b.note || '(no note)' });
+  }
+  events.sort((a, b) => a.i - b.i);
+  renderEvents();
+}
+function indexOfTick(t) {
+  let lo = 0, hi = N - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (D.cols.t[m] < t) lo = m + 1; else hi = m; }
+  return lo;
+}
+
+// ---------- canvas plumbing ----------
+function fit(cv, h) {
+  const r = window.devicePixelRatio || 1, w = cv.clientWidth;
+  const hh = h || cv.clientHeight;
+  if (cv.width !== Math.round(w * r) || cv.height !== Math.round(hh * r)) { cv.width = Math.round(w * r); cv.height = Math.round(hh * r); }
+  const g = cv.getContext('2d'); g.setTransform(r, 0, 0, r, 0, 0); g.clearRect(0, 0, w, hh);
+  return [g, w, hh];
+}
+function arrow(g, x0, y0, x1, y1, head) {
+  g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+  const a = Math.atan2(y1 - y0, x1 - x0);
+  g.beginPath(); g.moveTo(x1, y1);
+  g.lineTo(x1 - head * Math.cos(a - 0.45), y1 - head * Math.sin(a - 0.45));
+  g.lineTo(x1 - head * Math.cos(a + 0.45), y1 - head * Math.sin(a + 0.45));
+  g.closePath(); g.fill();
+}
+
+// ---------- stance circle ----------
+function drawStance() {
+  const [g, w, h] = fit($('stance'));
+  const c = D.cols, K = D.knobs, R = K.radius, RC = K.radius + K.commit;
+  const view = 2600, s = Math.min(w, h) / 2 / view, cx = w / 2, cy = h / 2;
+  const P = (x, y) => [cx + x * s, cy - y * s];
+  g.font = '11px ' + css('--sans');
+  g.strokeStyle = css('--line'); g.lineWidth = 1;
+  g.beginPath(); g.moveTo(cx - view * s, cy); g.lineTo(cx + view * s, cy); g.moveTo(cx, cy - view * s); g.lineTo(cx, cy + view * s); g.stroke();
+  g.fillStyle = css('--soft'); g.beginPath(); g.arc(cx, cy, RC * s, 0, 7); g.fill();
+  g.strokeStyle = css('--muted'); g.setLineDash([4, 4]); g.beginPath(); g.arc(cx, cy, RC * s, 0, 7); g.stroke(); g.setLineDash([]);
+  g.fillStyle = css('--panel'); g.beginPath(); g.arc(cx, cy, R * s, 0, 7); g.fill();
+  g.strokeStyle = css('--wind'); g.lineWidth = 1.5; g.beginPath(); g.arc(cx, cy, R * s, 0, 7); g.stroke();
+  g.fillStyle = css('--muted');
+  g.fillText('up', cx + 4, cy - view * s + 12); g.fillText('right', cx + view * s - 30, cy - 4);
+  g.fillText('1,800', cx + RC * s * 0.71 + 3, cy - RC * s * 0.71 - 3); g.fillText('300', cx + R * s * 0.71 + 2, cy - R * s * 0.71 - 2);
+  // the press this step belongs to: raw mouse summed since it began
+  let p0 = cur; while (p0 > 0 && c.lmb[p0 - 1]) p0--;
+  const t0 = Math.max(0, cur - Math.round(trailS * 60 * 3));
+  if (c.lmb[cur]) {
+    let x = 0, y = 0; g.strokeStyle = css('--mouse'); g.globalAlpha = 0.55; g.lineWidth = 1; g.beginPath(); g.moveTo(...P(0, 0));
+    for (let i = p0; i <= cur; i++) { x += c.mx[i]; y += c.my[i]; g.lineTo(...P(x, y)); }
+    g.stroke(); g.globalAlpha = 1;
+    g.fillStyle = css('--mouse'); g.beginPath(); g.arc(...P(x, y), 2.5, 0, 7); g.fill();
+    if (Math.hypot(x, y) > view) { g.fillText('mouse ' + Math.round(Math.hypot(x, y)) + ' counts out', 8, h - 8); }
+  }
+  // replayed stance (dashed) and recorded stance (solid, coloured by stage)
+  const trail = (get, colorOf, dash) => {
+    g.setLineDash(dash); g.lineWidth = 2;
+    for (let i = t0 + 1; i <= cur; i++) {
+      const a = get(i - 1), b = get(i); if (!a || !b) continue;
+      g.globalAlpha = 0.25 + 0.75 * (i - t0) / (cur - t0 + 1);
+      g.strokeStyle = colorOf(i); g.beginPath(); g.moveTo(...P(a[0], a[1])); g.lineTo(...P(b[0], b[1])); g.stroke();
+    }
+    g.globalAlpha = 1; g.setLineDash([]);
+  };
+  trail(i => c.sim[i], () => css('--sim'), [5, 4]);
+  if (D.has_hsc) trail(stanceAt, i => css(STAGE_VAR[stageAt(i)] || '--ink'), []);
+  const sp = D.has_hsc ? stanceAt(cur) : c.sim[cur];
+  if (sp) {
+    g.fillStyle = css(STAGE_VAR[stageAt(cur)] || '--ink'); g.beginPath(); g.arc(...P(sp[0], sp[1]), 6, 0, 7); g.fill();
+    g.strokeStyle = css('--panel'); g.lineWidth = 2; g.stroke();
+    const h0 = c.hsc[cur];
+    if (h0 && (h0.vx || h0.vy)) {   // stroke velocity, counts/s (0.15 s ahead)
+      g.strokeStyle = g.fillStyle = css('--ink'); g.lineWidth = 1.5;
+      const [x0, y0] = P(sp[0], sp[1]), [x1, y1] = P(sp[0] + h0.vx * 0.15, sp[1] + h0.vy * 0.15);
+      arrow(g, x0, y0, x1, y1, 7);
+    }
+  }
+  // line angle tick on the outer ring
+  const h1 = c.hsc[cur];
+  if (h1 && h1.on && h1.stage > 0) {
+    g.strokeStyle = css('--ink'); g.lineWidth = 3;
+    const a = h1.ang; g.beginPath(); g.moveTo(...P(Math.cos(a) * RC * 1.04, Math.sin(a) * RC * 1.04)); g.lineTo(...P(Math.cos(a) * RC * 1.14, Math.sin(a) * RC * 1.14)); g.stroke();
+  }
+}
+
+// ---------- arm view ----------
+function drawArm() {
+  const [g, w, h] = fit($('arm'));
+  const c = D.cols, span = 115, s = Math.min(w, h) / 2 / span, cx = w / 2, cy = h / 2 + (view === 'top' ? 0 : -h * 0.05);
+  const proj = p => {
+    if (!p) return null;
+    if (view === 'front') return [cx + p[0] * s, cy - p[2] * s];
+    if (view === 'side') return [cx + p[1] * s, cy - p[2] * s];
+    return [cx + p[0] * s, cy - p[1] * s];
+  };
+  g.font = '11px ' + css('--sans');
+  g.strokeStyle = css('--line'); g.lineWidth = 1;
+  for (let k = -100; k <= 100; k += 25) {
+    g.globalAlpha = k === 0 ? 1 : 0.45;
+    g.beginPath(); g.moveTo(cx + k * s, 0); g.lineTo(cx + k * s, h); g.moveTo(0, cy - k * s); g.lineTo(w, cy - k * s); g.stroke();
+  }
+  g.globalAlpha = 1; g.fillStyle = css('--muted');
+  const ax = { front: ['right →', 'up ↑'], side: ['forward →', 'up ↑'], top: ['right →', 'forward ↑'] }[view];
+  g.fillText(ax[0], w - 58, cy - 5); g.fillText(ax[1], cx + 5, 12); g.fillText('25 units / grid', 8, h - 8);
+  // torso
+  g.fillStyle = css('--guard'); g.beginPath(); g.arc(...proj([0, 0, 0]), 9, 0, 7); g.fill();
+  // tip trails
+  const t0 = Math.max(0, cur - Math.round(trailS * 60));
+  const trail = (arr, col, dash) => {
+    g.setLineDash(dash); g.lineWidth = 2; g.strokeStyle = col;
+    for (let i = t0 + 1; i <= cur; i++) {
+      const a = proj(arr[i - 1]), b = proj(arr[i]); if (!a || !b) continue;
+      g.globalAlpha = 0.15 + 0.85 * (i - t0) / (cur - t0 + 1);
+      g.beginPath(); g.moveTo(...a); g.lineTo(...b); g.stroke();
+    }
+    g.globalAlpha = 1; g.setLineDash([]);
+  };
+  trail(c.tc, css('--cmd'), [5, 4]);
+  trail(c.tp, css('--phys'), []);
+  // commanded hand and blade
+  const hc = c.hc[cur], bc = c.bc[cur], hp = c.hp[cur], tp = c.tp[cur];
+  const blen = hp && tp ? len(sub(tp, hp)) : 60;
+  if (hc) {
+    g.strokeStyle = css('--cmd'); g.lineWidth = 2.5;
+    if (bc) { g.setLineDash([6, 4]); g.beginPath(); g.moveTo(...proj(hc)); g.lineTo(...proj(add(hc, mul(bc, blen)))); g.stroke(); g.setLineDash([]); }
+    g.beginPath(); g.arc(...proj(hc), 6, 0, 7); g.stroke();
+  }
+  // physical arm and blade
+  const sp = c.sp[cur], ep = c.ep[cur];
+  if (sp && ep && hp) {
+    g.strokeStyle = css('--ink'); g.lineWidth = 3; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(...proj(sp)); g.lineTo(...proj(ep)); g.lineTo(...proj(hp)); g.stroke();
+    g.fillStyle = css('--ink'); for (const p of [sp, ep, hp]) { g.beginPath(); g.arc(...proj(p), 3.5, 0, 7); g.fill(); }
+    const pole = c.pole[cur];
+    if (pole) {   // the bend hand control asked for, from the elbow
+      g.strokeStyle = g.fillStyle = css('--cmd'); g.lineWidth = 1.5;
+      const a = proj(ep), b = proj(add(ep, mul(norm(pole) || pole, 14))); arrow(g, ...a, ...b, 5);
+    }
+  }
+  if (c.lh[cur]) { g.strokeStyle = css('--muted'); g.lineWidth = 1.5; g.beginPath(); g.arc(...proj(c.lh[cur]), 4, 0, 7); g.stroke(); }
+  if (hp && tp) {
+    g.strokeStyle = css('--phys'); g.lineWidth = 4; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(...proj(hp)); g.lineTo(...proj(tp)); g.stroke();
+    g.fillStyle = css('--phys'); g.beginPath(); g.arc(...proj(tp), 4, 0, 7); g.fill();
+    // the mouse stroke over the last 3 steps, drawn at the tip (front view = screen)
+    if (view === 'front') {
+      let mx = 0, my = 0; for (let j = Math.max(0, cur - 2); j <= cur; j++) { mx += c.mx[j]; my += c.my[j]; }
+      const m = Math.hypot(mx, my);
+      if (m > 20) {
+        const L = Math.min(45, 10 + m / 12), [x0, y0] = proj(tp);
+        g.strokeStyle = g.fillStyle = css('--mouse'); g.globalAlpha = 0.6; g.lineWidth = 2;
+        arrow(g, x0, y0, x0 + mx / m * L, y0 - my / m * L, 7); g.globalAlpha = 1;
+      }
+    }
+  }
+}
+
+// ---------- timeline ----------
+const ROWS = [
+  { key: 'band', h: 34, label: '' },
+  { key: 'mouse', h: 74, label: 'mouse speed, counts/s' },
+  { key: 'tip', h: 74, label: 'tip speed, units/s' },
+  { key: 'turn', h: 70, label: 'blade turn per step, °' },
+  { key: 'joint', h: 70, label: 'wrist past limit · elbow from asked bend, °' },
+  { key: 'dir', h: 56, label: 'mouse vs tip direction, °' },
+];
+function windowRange() {
+  const half = Math.round(winS * 60 / 2);
+  let a = cur - half, b = cur + half;
+  if (a < 0) { b -= a; a = 0; } if (b > N - 1) { a -= b - (N - 1); b = N - 1; }
+  return [Math.max(0, a), b];
+}
+function drawTime() {
+  const cv = $('time'); const total = ROWS.reduce((s, r) => s + r.h + 6, 18);
+  cv.style.height = total + 'px';
+  const [g, w, h] = fit(cv, total);
+  const [a, b] = windowRange(), left = 6, right = w - 6;
+  const X = i => left + (i - a) / Math.max(1, b - a) * (right - left);
+  const c = D.cols, d = derived;
+  g.font = '11px ' + css('--sans');
+  let y = 0;
+  const series = (arr, top, rh, max, col, opts = {}) => {
+    g.strokeStyle = col; g.lineWidth = opts.w || 1.5; g.setLineDash(opts.dash || []);
+    g.beginPath(); let pen = false;
+    for (let i = a; i <= b; i++) {
+      const v = arr[i]; if (v === null || v === undefined || isNaN(v) || v < 0) { pen = false; continue; }
+      const yy = top + rh - Math.min(1, v / max) * (rh - 4);
+      if (pen) g.lineTo(X(i), yy); else { g.moveTo(X(i), yy); pen = true; }
+    }
+    g.stroke(); g.setLineDash([]);
+  };
+  const hline = (top, rh, v, max, col, label) => {
+    const yy = top + rh - v / max * (rh - 4);
+    g.strokeStyle = col; g.setLineDash([3, 3]); g.lineWidth = 1; g.beginPath(); g.moveTo(left, yy); g.lineTo(right, yy); g.stroke(); g.setLineDash([]);
+    g.fillStyle = col; g.fillText(label, right - g.measureText(label).width - 2, yy - 2);
+  };
+  for (const r of ROWS) {
+    const top = y, rh = r.h;
+    g.fillStyle = css('--ground'); g.fillRect(left, top, right - left, rh);
+    if (r.key === 'band') {
+      for (let i = a; i <= b; i++) {
+        const x0 = X(i), x1 = X(i + 1) + 0.5;
+        g.fillStyle = css(STAGE_VAR[stageAt(i)] || '--guard'); g.globalAlpha = stageAt(i) ? 0.9 : 0.25; g.fillRect(x0, top, x1 - x0, 16);
+        if (c.lmb[i]) { g.globalAlpha = 1; g.fillStyle = css('--ink'); g.fillRect(x0, top + 19, x1 - x0, 5); }
+        const hh = c.hsc[i]; if (hh && hh.snap) { g.fillStyle = css('--warn'); g.fillRect(x0, top + 26, x1 - x0, 3); }
+        if (hh && hh.chain) { g.fillStyle = css('--sim'); g.fillRect(x0, top + 30, x1 - x0, 3); }
+        if (hh && hh.reseat > 0) { g.fillStyle = css('--crit'); g.fillRect(x0, top + 16, x1 - x0, 3); }
+      }
+      g.globalAlpha = 1;
+      g.fillStyle = css('--ink'); g.fillText('stage', left + 4, top + 12);
+    } else {
+      g.fillStyle = css('--muted'); g.fillText(r.label, left + 4, top + 11);
+      if (r.key === 'mouse') { const m = 8000; hline(top, rh, D.knobs.cut_speed, m, css('--cut'), 'cut ' + D.knobs.cut_speed); hline(top, rh, D.knobs.snap_speed, m, css('--warn'), 'snap ' + D.knobs.snap_speed); series(d.mSpeed, top, rh, m, css('--mouse')); }
+      if (r.key === 'tip') { const m = 1600; series(d.tipC, top, rh, m, css('--cmd'), { dash: [4, 3] }); series(d.tipP, top, rh, m, css('--phys')); }
+      if (r.key === 'turn') { const m = 60; hline(top, rh, +$('t-flip').value, m, css('--crit'), 'flip'); series(d.turnC, top, rh, m, css('--cmd'), { dash: [4, 3] }); series(d.turnP, top, rh, m, css('--phys')); }
+      if (r.key === 'joint') { const m = 180; series(d.elbowPole, top, rh, m, css('--crit'), { w: 1 }); series(c.wr, top, rh, m, css('--warn')); series(c.wl, top, rh, m, css('--muted'), { dash: [2, 2] }); hline(top, rh, 90, m, css('--crit'), 'elbow on the other side'); }
+      if (r.key === 'dir') { const m = 180; hline(top, rh, 90, m, css('--muted'), '90'); series(d.dirMiss, top, rh, m, css('--mouse'), { w: 1 }); }
+    }
+    y += rh + 6;
+  }
+  // event and bookmark ticks
+  for (const e of events) {
+    if (e.i < a || e.i > b || !filter[e.kind]) continue;
+    const x = X(e.i);
+    g.strokeStyle = css({ arm: '--phys', cmd: '--cmd', elbow: '--crit', wrist: '--warn', mark: '--ink' }[e.kind]);
+    g.lineWidth = e.kind === 'mark' ? 2 : 1; g.globalAlpha = 0.6;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, y - 6); g.stroke(); g.globalAlpha = 1;
+    if (e.kind === 'mark') { g.fillStyle = css('--ink'); g.beginPath(); g.moveTo(x - 5, 0); g.lineTo(x + 5, 0); g.lineTo(x, 8); g.fill(); }
+  }
+  // cursor
+  g.strokeStyle = css('--ink'); g.lineWidth = 1; g.beginPath(); g.moveTo(X(cur), 0); g.lineTo(X(cur), y - 6); g.stroke();
+  g.fillStyle = css('--muted');
+  const secs = i => ((c.t[i] - c.t[0]) / 60).toFixed(1) + ' s';
+  g.fillText(secs(a), left, y + 8); const s2 = secs(b); g.fillText(s2, right - g.measureText(s2).width, y + 8);
+  // legend for the strips
+  const lg = [['--mouse', 'mouse'], ['--cmd', 'commanded'], ['--phys', 'physical'], ['--warn', 'right wrist / snap'], ['--crit', 'elbow'], ['--sim', 'chain']];
+  let lx = left + 80; for (const [v, t] of lg) { g.fillStyle = css(v); g.fillRect(lx, y + 2, 10, 4); g.fillStyle = css('--muted'); g.fillText(t, lx + 13, y + 8); lx += g.measureText(t).width + 30; }
+  cv._map = { a, b, left, right };
+}
+function drawMini() {
+  const [g, w, h] = fit($('mini'), 44);
+  const c = D.cols, X = i => i / Math.max(1, N - 1) * w;
+  const px = Math.max(1, Math.ceil(N / w));
+  for (let i = 0; i < N; i += px) {
+    let st = 0, held = 0; for (let j = i; j < Math.min(N, i + px); j++) { st = Math.max(st, stageAt(j)); held |= c.lmb[j]; }
+    if (st) { g.fillStyle = css(STAGE_VAR[st]); g.fillRect(X(i), 4, Math.max(1, w / N * px), 18); }
+    if (held) { g.fillStyle = css('--ink'); g.fillRect(X(i), 24, Math.max(1, w / N * px), 4); }
+  }
+  for (const e of events) {
+    if (!filter[e.kind]) continue;
+    g.fillStyle = css({ arm: '--phys', cmd: '--cmd', elbow: '--crit', wrist: '--warn', mark: '--ink' }[e.kind]);
+    g.fillRect(X(e.i) - 0.5, e.kind === 'mark' ? 0 : 31, e.kind === 'mark' ? 2 : 1.5, e.kind === 'mark' ? 44 : 12);
+  }
+  const [a, b] = windowRange();
+  g.strokeStyle = css('--cmd'); g.lineWidth = 1.5; g.strokeRect(X(a), 1, Math.max(2, X(b) - X(a)), h - 2);
+}
+
+// ---------- readout and events ----------
+function fmt(v, d = 0) { return v === null || v === undefined || (typeof v === 'number' && isNaN(v)) ? '–' : (typeof v === 'number' ? v.toFixed(d) : String(v)); }
+function renderRead() {
+  const c = D.cols, h = c.hsc[cur], d = derived, st = stageAt(cur);
+  const rows = [
+    ['step', `${c.t[cur]} · ${((c.t[cur] - c.t[0]) / 60).toFixed(2)} s`],
+    ['weapon', D.weapons[c.wpn[cur]] || 'none'],
+    ['stage', `<span class="pill" style="background:var(${STAGE_VAR[st]})">${STAGES[st]}</span>` + (D.has_hsc ? '' : ' <small>(replayed)</small>')],
+    ['button', c.lmb[cur] ? 'held' : 'up'],
+    ['mouse this step', `${c.mx[cur]}, ${c.my[cur]}`],
+    ['mouse speed', fmt(d.mSpeed[cur]) + ' c/s'],
+  ];
+  if (h) rows.push(
+    ['stance point', `${fmt(h.sx)}, ${fmt(h.sy)} · r ${fmt(Math.hypot(h.sx, h.sy))}`],
+    ['line · angle', `${h.line >= 0 ? (LINES[h.line] || h.line) : '–'} · ${fmt(h.ang * 180 / Math.PI)}°`],
+    ['wind · cut', `${fmt(h.wind, 2)} · ${fmt(h.cut, 2)}`],
+    ['route shown', `${fmt(h.u, 2)} (s ${fmt(h.s, 2)})`],
+    ['flags', [h.snap && 'snap', h.chain && 'chain', h.auto && 'click', h.wait && 'waits', h.overflow > 0 && ('run-on ' + fmt(h.overflow))].filter(Boolean).join(' · ') || '–'],
+    ['drive', `${fmt(h.drive_phase, 2)} · plane miss ${fmt(h.plane_miss, 1)}`],
+    ['owners trunk · L · R', (h.own || []).join(' · ')],
+  );
+  if (h && h.ramp !== undefined) rows.push(   // build 48: what the arm has to work with
+    ['drive yield · ramp · on', `${fmt(h.yield, 2)} · ${fmt(h.ramp, 2)} · ${h.drive_on ? 'on' : 'OFF'}`],
+    ['fatigue · tired · wound', `${fmt(h.fatigue, 2)} · ${fmt(h.tired, 2)} · ${fmt(h.wound, 2)}`],
+    ['re-seat', h.reseat > 0 ? `<span class="pill" style="background:var(--warn)">open ${fmt(h.reseat, 2)}</span> #${h.reseats}` : `${fmt(h.implausible, 2)} s off · ${h.reseats} so far`],
+    ['R arm motors, deg off', (h.motors_r || []).map(m => m ? fmt(m[4]) : '–').join(' · ')],
+    ['R arm torque', (h.motors_r || []).map(m => m ? (m[0] / 1e6).toFixed(2) + 'M' : '–').join(' · ')],
+    ['wrist limits', h.wrist_lim ? h.wrist_lim.map(v => fmt(v)).join(' / ') : '–'],
+  );
+  if (!h) rows.push(['stance (replayed)', `${c.sim[cur][0]}, ${c.sim[cur][1]}`]);
+  const hp = c.hp[cur], hc = c.hc[cur];
+  rows.push(
+    ['hand off its goal', hp && hc ? fmt(len(sub(hp, hc)), 1) + ' units' : '–'],
+    ['blade off command', fmt(angDeg(c.bp[cur], c.bc[cur])) + '°'],
+    ['hand turned off command', h && h.wrist_err >= 0 ? fmt(h.wrist_err) + '° (blade and roll)' : '–'],
+    ['blade turn phys · cmd', `${fmt(d.turnP[cur])}° · ${fmt(d.turnC[cur])}°`],
+    ['tip speed phys · cmd', `${fmt(d.tipP[cur])} · ${fmt(d.tipC[cur])}`],
+    ['wrist past R · L', `${fmt(c.wr[cur])}° · ${fmt(c.wl[cur])}°`],
+    ['elbow from asked bend', fmt(d.elbowPole[cur]) + '°'],
+    ['two-hand grip', c.sup[cur] || '–'],
+  );
+  $('read').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  $('clock').textContent = `step ${c.t[cur]} · ${((c.t[cur] - c.t[0]) / 60).toFixed(2)} s`;
+  const evs = $('events').children; for (const el of evs) el.classList.toggle('cur', Math.abs(+el.dataset.i - cur) < 3);
+}
+function renderEvents() {
+  const kinds = { arm: 'arm flips', cmd: 'command jumps', elbow: 'elbow', wrist: 'wrist', mark: 'bookmarks' };
+  const count = k => events.filter(e => e.kind === k).length;
+  $('filters').innerHTML = Object.entries(kinds).map(([k, t]) => `<button type="button" data-k="${k}" class="${filter[k] ? 'on' : ''}">${t} ${count(k)}</button>`).join('');
+  const list = events.filter(e => filter[e.kind]);
+  $('events').innerHTML = list.length ? list.map(e => `<button type="button" class="ev k-${e.kind}" data-i="${e.i}"><span class="t">${((D.cols.t[e.i] - D.cols.t[0]) / 60).toFixed(2)} s</span><span>${e.title}<small>${escapeHtml(e.detail)}</small></span></button>`).join('')
+    : '<p class="note">No events with these filters.</p>';
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch])); }
+
+function draw() { if (!D) return; drawStance(); drawArm(); drawTime(); drawMini(); renderRead(); }
+function seek(i) { cur = Math.max(0, Math.min(N - 1, i)); draw(); }
+
+// ---------- loading ----------
+function load(data) {
+  D = data; N = D.cols.t.length; cur = 0;
+  $('src').textContent = D.source + (D.has_hsc ? '' : ' · no hand-control fields (recorded before build 46): stance replayed from the mouse');
+  $('lg-rec').hidden = !D.has_hsc;
+  const presses = D.cols.lmb.reduce((s, v, i) => s + (v && !D.cols.lmb[i - 1] ? 1 : 0), 0);
+  $('sessinfo').textContent = `${(N / 60).toFixed(0)} s · ${presses} presses · ${D.weapons.filter(Boolean).join(', ')}`;
+  derive();
+  const first = events.find(e => e.kind === 'mark') || events[0];
+  seek(first ? first.i : 0);
+}
+$('file').addEventListener('change', e => { const f = e.target.files[0]; if (f) f.text().then(t => load(JSON.parse(t))).catch(err => { $('src').textContent = 'Could not read that file: ' + err.message + ' (open the .json from tools/body/mouse_view.py)'; }); });
+document.addEventListener('dragover', e => { e.preventDefault(); $('app').classList.add('drop'); });
+document.addEventListener('dragleave', e => { if (!e.relatedTarget) $('app').classList.remove('drop'); });
+document.addEventListener('drop', e => { e.preventDefault(); $('app').classList.remove('drop'); const f = e.dataTransfer.files[0]; if (f) f.text().then(t => load(JSON.parse(t))); });
+
+// ---------- controls ----------
+$('time').addEventListener('click', e => { const m = $('time')._map; if (!m) return; const r = $('time').getBoundingClientRect(); seek(Math.round(m.a + (e.clientX - r.left - m.left) / (m.right - m.left) * (m.b - m.a))); });
+$('time').addEventListener('wheel', e => { e.preventDefault(); const opts = [...$('win').options].map(o => +o.value); let k = opts.indexOf(winS); k = Math.max(0, Math.min(opts.length - 1, k + (e.deltaY > 0 ? 1 : -1))); winS = opts[k]; $('win').value = String(winS); draw(); }, { passive: false });
+const miniSeek = e => { const r = $('mini').getBoundingClientRect(); seek(Math.round((e.clientX - r.left) / r.width * (N - 1))); };
+$('mini').addEventListener('mousedown', e => { miniSeek(e); const mv = ev => miniSeek(ev); window.addEventListener('mousemove', mv); window.addEventListener('mouseup', () => window.removeEventListener('mousemove', mv), { once: true }); });
+$('events').addEventListener('click', e => { const b = e.target.closest('.ev'); if (b) seek(+b.dataset.i); });
+$('filters').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; filter[b.dataset.k] = !filter[b.dataset.k]; renderEvents(); draw(); });
+document.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => { view = b.dataset.view; document.querySelectorAll('[data-view]').forEach(x => x.classList.toggle('on', x === b)); draw(); }));
+$('win').addEventListener('change', e => { winS = +e.target.value; draw(); });
+$('trail').addEventListener('change', e => { trailS = +e.target.value; draw(); });
+$('speed').addEventListener('change', e => { speed = +e.target.value; });
+['t-flip', 't-cmd', 't-elbow', 't-wrist'].forEach(id => $(id).addEventListener('change', () => { if (D) { findEvents(); draw(); } }));
+let lastT = 0, acc = 0;
+function tickPlay(t) {
+  if (!playing) return;
+  if (lastT) { acc += (t - lastT) / 1000 * 60 * speed; const k = Math.floor(acc); if (k) { acc -= k; if (cur + k >= N - 1) { playing = false; setPlay(); } seek(cur + k); } }
+  lastT = t; requestAnimationFrame(tickPlay);
+}
+function setPlay() { $('play').textContent = playing ? '❚❚ Pause' : '▶ Play'; $('play').classList.toggle('on', playing); }
+$('play').addEventListener('click', () => { if (!D) return; playing = !playing; lastT = 0; acc = 0; setPlay(); if (playing) requestAnimationFrame(tickPlay); });
+document.addEventListener('keydown', e => {
+  if (!D || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'ArrowRight') { seek(cur + (e.shiftKey ? 10 : 1)); e.preventDefault(); }
+  else if (e.key === 'ArrowLeft') { seek(cur - (e.shiftKey ? 10 : 1)); e.preventDefault(); }
+  else if (e.key === ' ') { $('play').click(); e.preventDefault(); }
+  else if (e.key === 'n' || e.key === 'p') {
+    const list = events.filter(x => filter[x.kind]);
+    const nx = e.key === 'n' ? list.find(x => x.i > cur + 2) : [...list].reverse().find(x => x.i < cur - 2);
+    if (nx) seek(nx.i);
+  }
+});
+window.addEventListener('resize', draw);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+if (EMBED) load(EMBED);
+else $('src').innerHTML = 'Drop a recording converted with <code>python tools/body/mouse_view.py RECORDING_DIR --out FILE.json</code>, or open one above.';
+</script>

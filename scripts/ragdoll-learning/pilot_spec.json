@@ -1,0 +1,309 @@
+{
+  "schema_version": 2,
+  "specification_id": "PLAY-01-reference-conditioned-motor-residual-v8",
+  "tracker_task": "PLAY-01",
+  "scope": "Staged implementation contract for motion content, reference generation, integration smoke, resumable training and walking qualification; this file is not an implemented runner or result.",
+  "decision": "Build usable motion references and a command-conditioned reference generator alongside captured-body tracking, then evaluate learned feedback with a measured training allocation. A short integration run cannot decide learning feasibility.",
+  "hypothesis": "With motion coverage and a recorded training allocation, reference-conditioned motor residuals can improve held-out command following without worsening physical violations or motion smoothness. Exact vanilla pose matching is not the product goal.",
+  "training_enabled": false,
+  "enable_condition": "A future runner must verify stage-specific content, readiness phases and budget manifests against current-source artifacts. Integration may perform bounded updates after pre-update controls to measure throughput and resume behavior; every readiness requirement must pass before allocated training. Editing training_enabled alone cannot bypass those checks. Resume within the same allocation; any additional allocation requires a new recorded budget decision.",
+  "execution_stages": {
+    "content_and_worker": "Start motion-library acquisition/authoring, coverage inventory and reference-generator implementation alongside the captured-body worker. A coherent idle/forward subset may unblock integration smoke while broader content remains in progress.",
+    "integration_smoke": "Use the existing 1M-step/1200-second caps for action/replay/release controls, finite optimizer updates, checkpoint-resume checks and throughput. Report learning curves as observations only; improvement is not required to proceed to a properly allocated training run.",
+    "forward_training": "Requires a scoped idle/forward/start/stop reference review, intact controls and a resolved training_run_manifest. A bounded startup-horizon curriculum may establish progressively longer survival before a longer allocation, but its final gate must use the complete 600-step protocol and require positive signed along-command speed. Separately frozen production-teacher bootstrap and pose-only ablation stages may test whether physically demonstrated joint-pose targets provide useful forward initialization and whether that target is representable; neither can allocate PPO by itself. Execute only the recorded allocation with periodic full-length selection evaluations and resumable checkpoints. This stage can proceed alongside directional content work and cannot close PLAY-01.",
+    "directional_training": "Requires reviewed reference-generator output over the full command-coverage matrix, training/evaluation command protocols and a new frozen run manifest. Reuse forward weights only with explicit transfer provenance and refreshed normalization/controls; a forward smoke success does not enable this stage by itself.",
+    "qualification": "Freeze one selected policy and motion-generator version before untouched qualification. Require the registered captured-body/floor/native/user gates. A forward result or improved reward cannot qualify missing command coverage.",
+    "handoff_completion": "The implementation agent delivers content coverage and previews, the worker, resumable staged runner, integration observations and a measured larger-run proposal with a reproducible launch command. If an adequate compute allocation is already authorized, execute it; otherwise leave that concrete proposal ready for the budget decision. Do not end with only a pilot verdict."
+  },
+  "fixture": {
+    "body_id": "context-symP",
+    "context_path": "files/data/ragdoll/calibration/context-symP.creation.txt",
+    "profile_path": "files/data/ragdoll/humanoid-v1.yaml",
+    "physics_engine": "Jolt",
+    "physics_hz": 60,
+    "policy_hz": 60,
+    "primary_floor": "tiled",
+    "manifold_reduction": false,
+    "collision_steps": 1,
+    "gravity_and_materials": "Unchanged captured-body calibration contract.",
+    "motor_and_solver_limits": "Unchanged registered profile and matched production solver configuration; record their resolved values and hashes.",
+    "body_order": "Resolve names and parents from the hashed profile; reject missing, duplicate, or reordered reference mappings.",
+    "initialization": "Fixed captured standing state and a 60-step zero-residual warmup. Policy inference and stochastic residuals begin only after warmup so excluded transitions cannot alter the credited initial state. No reference-state teleportation or unimplemented per-link velocity initialization.",
+    "reference_frame": "Heading-local coordinates established from measured pelvis facing, Z up; resolve the game's forward convention explicitly from metadata. Never assume +Y is player forward."
+  },
+  "reference_dataset": {
+    "expected_format": "reference_motion_v1",
+    "preparation_tool": "scripts/ragdoll-learning/reference_motion.py",
+    "preparation_scope": "Diagnostic motion conversion and error measurement, not a physical acceptance producer.",
+    "integration_clip_roles": ["idle", "walk_forward"],
+    "reference_origin": "Vanilla is optional. Accept a measured, legally available authored or mocap reference only after retargeting and feasibility review. Preserve actual provenance; do not relabel other motion as vanilla.",
+    "product_objective": "Natural-looking, responsive physical motion with independent requested travel and facing. Original animation does not define acceptable balance, timing, trajectory, or joint motion.",
+    "required_run_bindings": [
+      "source_commit",
+      "engine_binary_sha256",
+      "source_asset_manifest_sha256",
+      "source_origin_and_usage_rights",
+      "conversion_and_retargeting_configuration_sha256",
+      "profile_sha256",
+      "creation_context_sha256",
+      "reference_json_sha256",
+      "clip_names_and_frame_windows",
+      "source_and_resampled_hz",
+      "body_names_and_parent_indices",
+      "forward_axis_mapping",
+      "measured_reference_forward_speed",
+      "reference_start_phase_and_loop_seam_review",
+      "reference_quality_and_missing_motion_coverage",
+      "frozen_per_joint_style_confidence_mask"
+    ],
+    "conditional_bindings": "Native-derived references additionally bind replay and CSV hashes plus actual capture/decoder identity. Authored or mocap references bind their actual source assets and tools; do not require or fabricate an OpenMW replay for external content. All sources bind the target rig and transformed output.",
+    "missing_bindings": "Missing applicable provenance blocks that source; never fill it with guessed identity. Generated or transformed motion must retain its source lineage and generation settings.",
+    "physical_contacts": "Reference-motion CSV contains no physical contact truth. Do not infer support from foot height or label physical contact supervision as available.",
+    "reference_state": "Resampled parent-local joint rotations and angular velocities, root-relative hand/foot positions, and normalized phase; raw authored poses remain preserved.",
+    "feasibility_check": "Check joint-frame conversion, coherent fixed-length retargeted geometry, finite normalized rotations, seam position/velocity jumps, joint limits, root travel versus planted-foot motion, and compatibility with existing actuation. Reject unusable channels rather than reproducing their errors. This review does not require the zero-residual tracker to already walk stably or reproduce an exact dynamically feasible trajectory; learning balance and departing from imperfect style references remain the experiment. Record a frozen per-joint style confidence in [0,1], with zero for excluded channels. Report missing diagonal, turning, start/stop and transition coverage. Animation-only contact checks are diagnostics and cannot establish physical support.",
+    "if_no_reference_is_usable": "Stop this reference-conditioned pilot before training and record the reference gap. A motion-prior-free or alternative-data pilot requires a new explicit specification; do not silently substitute a survival-only reward.",
+    "command_protocol": {
+      "episode_physics_steps": 600,
+      "warmup_steps": 60,
+      "start_blend_steps": 60,
+      "walk_steps": 360,
+      "stop_blend_steps": 120,
+      "nominal_forward_speed": "Bind once to the measured reference speed, in world units per second, before any rollout or optimization.",
+      "phase_adaptation": "Deterministic bounded clock shared by zero-residual and learned variants: during walking, target rate = clamp(max(measured along-command COM speed,0)/bound_reference_speed,0.5,1.5); rate = 0.8*previous_rate + 0.2*target_rate at 60 Hz, initialized to 1.0. This avoids treating fixed clip timing as physical truth. Do not add contact-based phase jumps without validated reference contact annotations.",
+      "start_stop_blend": "Smoothstep interpolation of idle and walking joint references, with the adapted walking phase. Start phase and phase-adapter parameters are fixed across the pilot.",
+      "heading": "This protocol scopes integration and forward training only. Directional training requires the motion_reference_system coverage and a frozen command protocol before its first update; this forward protocol cannot stand in for it."
+    }
+  },
+  "motion_reference_system": {
+    "critical_path": "Motion content and reference generation are required PLAY-01 implementation work, not optional polish after learning. Full directional training and natural-motion acceptance depend on both.",
+    "content_manifest": "For each required command family record source assets, usage rights, author/acquisition owner, missing content, transforms/retargeting, usable speed range, phase/transition annotations and review evidence. Source or author missing motion rather than expecting the tracker to invent an absent style library.",
+    "required_command_coverage": ["idle", "forward", "backward", "strafe_left", "strafe_right", "forward_left", "forward_right", "backward_left", "backward_right", "turn_in_place_left", "turn_in_place_right", "moving_turn_left", "moving_turn_right", "start", "stop", "reversal", "changes_between_travel_directions"],
+    "coverage_definition": "Coverage means reviewed output over explicit speeds, travel/facing combinations and transitions. Blending, mirroring, retargeting or authored synthesis may cover multiple cells; one separate clip per direction is not required. Rotating the entire forward pose also rotates facing and does not establish strafe/backpedal coverage.",
+    "inputs": ["requested_horizontal_travel_velocity", "desired_facing_or_yaw_rate", "previous_reference_phase_and_transition_state", "previous_completed_measured_body_state"],
+    "outputs": ["coherent_parent_local_joint_rotations", "consistent_reference_angular_velocities", "root_relative_end_effectors", "reference_root_travel_and_heading", "phase_and_transition_state", "style_confidence_and_coverage_identity"],
+    "implementation": "Choose and record a deterministic selection/blending/transition design, including phase alignment, speed handling, reversal and out-of-coverage behavior. Derive velocities from the actual composed reference and validate continuity. The same generator feeds zero-residual and learned comparisons; journal its resolved outputs and state for replay.",
+    "review": "Inspect generated motion before physical tracking across the coverage matrix for coherent geometry, plausible weight transfer, continuity and independent travel/facing. Reference contact annotations, if supplied, describe motion intent and remain distinct from measured physics contacts. The preview does not prove dynamic balance.",
+    "stage_evidence": "Keep content-ready, generator-reviewed, trained and physically/visually-qualified coverage separate, with artifact links. Missing cells block claims for those commands; forward-only progress remains separately reportable.",
+    "out_of_coverage": "Return an explicit unsupported coverage record during evaluation; never silently relabel a forward fallback as valid directional reference. Any eventual gameplay fallback requires its own recorded behavior and tests."
+  },
+  "readiness_requirements": [
+    {
+      "id": "current_fixture_identity",
+      "requirement": "Source commit, binary, context, profile, reference, environment and resolved joint manifest hashes exist and agree with the exact run."
+    },
+    {
+      "id": "zero_action_identity",
+      "requirement": "A zero residual reproduces byte-identical full physical telemetry, adapted phase and final motor commands of the deterministic reference-motor path on the current captured body. Also retain the separate current production walker baseline; do not require the new reference tracker to equal that different controller."
+    },
+    {
+      "id": "nonzero_action_authority",
+      "requirement": "Exercise every scalar action axis with paired bounded pulses. Record a corresponding change in the final delivered motor target after all planner/world-space overrides. At least one unsaturated representative joint from each action group must produce a measured physical response; rejected/clamped axes cannot be silently reported as controllable."
+    },
+    {
+      "id": "exact_action_replay",
+      "requirement": "Journal resolved reference, applied residual and final motor target for every physics step. Replaying the journal without policy inference and repeating it must reproduce full physical telemetry bytes, with deterministic source/binary/environment identity."
+    },
+    {
+      "id": "motor_off_authority",
+      "requirement": "An ordinary motor-disable command must suppress all learned and deterministic actuation. The policy cannot re-enable motors, root support, balance torques, translation forces or swing-foot forces."
+    },
+    {
+      "id": "malformed_action_rejection",
+      "requirement": "Reject nonfinite, out-of-range, wrong-dimension, parentless-root, passive-joint and stale-step actions before the affected physics solve."
+    },
+    {
+      "id": "physical_authority",
+      "requirement": "The experimental path calls only existing bounded joint motors. No body teleport, root force/torque, external virtual support, fabricated contacts, friction change or solver/torque-limit increase is allowed."
+    },
+    {
+      "id": "measured_throughput",
+      "requirement": "Measure complete-episode and complete-update throughput including process I/O, reference evaluation, inference, telemetry and optimizer work. Record physical steps, policy decisions, optimizer updates, utilization and storage rate separately. Project candidate training allocations from measured throughput; do not infer an adequate sample budget from the smoke cap. Stop before exceeding the active allocation or its evaluation reservation."
+    },
+    {
+      "id": "checkpoint_resume_identity",
+      "requirement": "Compare an uninterrupted control with save/restart/resume using identical seeds and inputs. Preserve policy/critic, optimizer, normalization, RNG, sampling/curriculum and reference-generator state plus cumulative counters. Resume only at a declared reproducible boundary unless full mid-episode physics state can also be restored; never silently restart a run's budget."
+    },
+    {
+      "id": "stage_motion_coverage",
+      "requirement": "Bind reviewed content and reference-generator output for the selected stage. Idle/forward is sufficient for integration and scoped forward training; directional training requires the full command-coverage matrix and resolved training/evaluation protocols."
+    },
+    {
+      "id": "finite_optimizer_updates",
+      "requirement": "Within integration's cap, verify finite losses/gradients/actions and recorded parameter updates using actual captured-body transitions. Report completed updates and sampling exposure without requiring a walking improvement."
+    }
+  ],
+  "readiness_phases": {
+    "before_first_optimizer_update": ["current_fixture_identity", "zero_action_identity", "nonzero_action_authority", "exact_action_replay", "motor_off_authority", "malformed_action_rejection", "physical_authority", "stage_motion_coverage"],
+    "integration_exit": ["measured_throughput", "checkpoint_resume_identity", "finite_optimizer_updates"],
+    "before_allocated_training": "All readiness requirements plus the resolved stage-specific training_run_manifest. Do not circularly require optimizer-throughput or trained-checkpoint controls before integration can execute its first bounded update."
+  },
+  "observations": {
+    "timing": "Only the previous completed physical frame, current input command, and prerecorded reference lookahead; never future measured state or future random disturbances.",
+    "joint_rotation_representation": "First two columns of each parent-local rotation matrix, with a recorded deterministic flattening order.",
+    "normalization": {
+      "length": "Mean captured hip-knee plus knee-foot chain length, computed once from the creation descriptor.",
+      "linear_velocity": 60.0,
+      "angular_velocity": 5.0,
+      "height": "Pelvis height above the actual floor divided by the recorded length scale."
+    },
+    "blocks_in_order": [
+      "Each body: measured position relative to pelvis in the heading frame, divided by length scale.",
+      "Each nonroot constrained body: measured parent-local joint rotation in 6D form.",
+      "Each body: measured linear and angular velocity in the heading frame, divided by the respective scales.",
+      "Measured pelvis up vector and normalized pelvis height.",
+      "Left and right foot support flags from real completed-frame contact telemetry.",
+      "Reference phase encoded as sin(2*pi*phase), cos(2*pi*phase).",
+      "Requested horizontal velocity and desired facing direction, expressed in the heading frame.",
+      "Reference snapshots at offsets 0 and 6 physics steps: parent-local joint rotation in 6D form and local angular velocity for every nonroot constrained body.",
+      "For both reference snapshots: root-relative left/right hand and foot positions in the reference heading frame.",
+      "Previous applied normalized residual action, in the frozen action-manifest order."
+    ],
+    "dimension": "Derive from the hashed body/joint manifest, then freeze and validate the exact count in the run manifest. Do not reuse the historical 57-value worker handshake.",
+    "initial_frame": "Before a completed observation exists, apply zero residual and omit the transition from optimization; count its physics step."
+  },
+  "actions": {
+    "joint_selection": "All nonroot constrained bodies with enabled motors in the captured profile, ordered by profile body index. The current humanoid has 19 constrained bodies: 15 swing-twist and four hinges, yielding 49 scalar actions; verify rather than assume this count.",
+    "swing_twist": {
+      "dimensions": 3,
+      "maximum_rotation_vector_norm_radians": 0.5,
+      "mapping": "Tanh-bound each scalar, radially project the three-vector to the unit ball, then scale by 0.5 radians in the actual parent-local joint frame. This permits visible departures from the style reference while existing joint and torque limits remain authoritative."
+    },
+    "hinge": {
+      "dimensions": 1,
+      "maximum_offset_radians": 0.5,
+      "mapping": "Tanh-bound scalar times 0.5 radians about the hinge axis derived by the captured body's constraint geometry."
+    },
+    "target_composition": "q_command_parent_local = normalize(rotation_vector_quaternion(applied_residual_parent_axes) * q_reference_parent_local). DirectMotorTracking applies offsets in the parent's body axes. Transform action vectors from the manifest's joint-axis basis into those parent axes before dispatch; never silently use the reversed, child-axis multiplication order.",
+    "filter": {"previous_weight": 0.8, "proposed_weight": 0.2},
+    "angular_velocity_target": "The finite difference of consecutive final composed joint targets at 60 Hz, including start/stop blending and filtered residual. Convert parent-local values to the axes expected by the existing motor API. No independent velocity action.",
+    "delivery": "Final articulated motor-target seam in the isolated experiment. No later swing IK, world hip/foot target, reference angular-velocity override or support-controller target may overwrite the composed target.",
+    "limits": "Preserve existing joint, motor, friction and solver limits. Record requested and delivered targets, projection, saturation and applied torque. Never increase a limit to deliver a residual.",
+    "authority_limit": "This remains a bounded residual family. If reaching the fixed residual boundary prevents a physically needed step, report an insufficient-action-space result; do not call that evidence against learned locomotion or widen the bound during the pilot.",
+    "excluded": ["root_translation", "root_rotation_actuator", "root_force", "root_torque", "contact_flags", "motor_enable", "motor_strength", "physics_rate", "solver_configuration", "reference_phase_action", "reference_playback_rate_action"]
+  },
+  "objective": {
+    "purpose": "Training signal only. Reward cannot override a physical failure or close PLAY-01.",
+    "error_definitions": {
+      "pose": "Confidence-weighted mean squared shortest-arc parent-local joint rotation error in radians squared; use only pre-reviewed reference channels.",
+      "velocity": "Confidence-weighted mean squared parent-local joint angular-velocity error, divided by 5 rad/s before squaring.",
+      "end_effectors": "Confidence-weighted mean squared root-relative hand/foot position error, divided by captured length scale before squaring.",
+      "com_height": "Squared reference-relative COM height error divided by captured length scale squared; no root force is generated by this objective.",
+      "command_velocity": "Squared horizontal COM velocity error divided by 60 world-units/s squared. During start and stop, multiply the requested command by the generator's active smoothstep walk weight so the physical objective and reviewed reference transition share one ramp.",
+      "support_slip": "Sum of squared horizontal foot displacement divided by 1.5 world units squared, only for feet with real support in both adjacent completed frames.",
+      "action_size": "Mean squared applied normalized action.",
+      "action_change": "Mean squared change in applied normalized action.",
+      "joint_acceleration": "Mean squared measured joint angular acceleration divided by 100 rad/s^2 squared; evaluate per-episode RMS and maximum separately from reward."
+    },
+    "reward_formula": "0.25*exp(-2*pose) + 0.05*exp(-velocity) + 0.10*exp(-40*end_effectors) + 0.05*exp(-10*com_height) + 0.55*exp(-2.5*command_velocity) - 0.25*min(10,support_slip) - 0.01*action_size - 0.02*action_change - 0.02*min(10,joint_acceleration) - 0.50*any_motor_saturated - 2*no_real_support - 4*any_solver_or_free_velocity_cap",
+    "reference_is_soft": "Reference errors are secondary reward terms, never acceptance failures. Propagate style confidence through exactly the active idle/family pose blend at each step, and multiply each style term by that active mean confidence; inactive clips cannot restore an excluded channel. An entirely excluded term has coefficient zero rather than error zero. Physical balance, command response, foot slip and excessive motion remain independent outcomes. Missing or excluded reference channels contribute no style reward and are not silently renormalized into higher weights.",
+    "terminal_failure": "End optimization rollout on the first Falling/Fallen or non-foot ground contact and count that terminal step. Its reward is -3 minus only the discounted future 0.55 command-reward opportunity through the scheduled command stop; this bounded opportunity charge is not a repeated terminal-penalty tail. Preserve first-failure and completion timing. Evaluation always simulates the entire 600-step protocol without hiding post-fall frames.",
+    "contact_style_reward": "Absent because authored motion CSV provides no physical contact labels."
+  },
+  "optimizer": {
+    "algorithm": "PPO clipped objective",
+    "actor_hidden_sizes": [64, 64],
+    "critic_hidden_sizes": [64, 64],
+    "activation": "tanh",
+    "actor_output_initialization": "zero weights and biases",
+    "initial_gaussian_std": 0.1,
+    "log_std_bounds": [-4.0, -0.5],
+    "discount": 0.99,
+    "gae_lambda": 0.95,
+    "ratio_clip": 0.2,
+    "adam_learning_rate": 0.0003,
+    "epochs_per_update": 4,
+    "minibatch_size": 256,
+    "value_loss_weight": 0.5,
+    "gradient_norm_limit": 0.5,
+    "torch_threads": 1,
+    "maximum_persistent_cpu_workers": 3,
+    "seed": 2026091401,
+    "hyperparameter_sweep": false
+  },
+  "startup_horizon_curriculum": {
+    "purpose": "A bounded diagnostic curriculum may shorten only stochastic training rollouts so the policy receives usable pre-fall forward experience. It is not a gain search, teacher teleport, walking qualification or replacement for the complete evaluation protocol.",
+    "stage_contract": "Freeze a strictly increasing list of training horizons ending at the full 600-step episode. Each stage declares minimum and maximum usable optimizer transitions, a deterministic probe interval and probe count. Advance only when every unperturbed probe completes its current horizon; the full-horizon stage must additionally have positive mean achieved speed along the requested command. Stop at a failed stage maximum or the allocation cap; never auto-extend.",
+    "accounting": "The shortened horizon changes only training physics and its observable lost-command-opportunity reward window. Every stage probe is diagnostic/evaluation physics, and each probe triggers the separately recorded full 600-step selection set. Reserve the worst-case probe plus full selection cost before starting a batch.",
+    "resume": "Checkpoint the exact stage index, stage-start usable counter, last-probe usable counter, probe history and completion flag with optimizer, RNG and cumulative counters. Graceful console interruption or the deterministic test stop switch stops only after a completed update/probe/evaluation boundary; exact resume must verify and restore this state before simulation.",
+    "interpretation": "Short-horizon completion demonstrates survival only through that horizon. Repeatable positive forward motion and improved survival for this experiment require passing the final complete-horizon positive-speed gate. Full selection outcomes remain diagnostic and do not close PLAY-01."
+  },
+  "production_teacher_bootstrap": {
+    "purpose": "A bounded diagnostic may collect the physically verified production walker on already-opened development selection/control cases, invert only its driven joint-pose targets into the unchanged 49-action residual basis and behavior-clone one fresh policy. This tests the leading useful-forward-experience hypothesis; it is not a new controller architecture, gain search, convergence claim or walking qualification.",
+    "telemetry_contract": "The worker may expose the parent-local rotations of the complete model-space pose passed to driveToPoseUsingMotors as read-only diagnostic telemetry. It must not alter controller choice, force pairs, support loads, world-space motor targets, released axes, motor limits, solver settings or physics. Bind this telemetry to the exact source and executable identities.",
+    "representability": "For each controlled joint compute target_local * inverse(reference_local), convert to a parent-local rotation vector, project hinge joints onto the frozen builder-derived parent-local hinge axis, divide by the frozen 0.5-radian residual scale and apply the existing per-joint unit bound. Invert the frozen 0.8 previous plus 0.2 proposal action filter and record clipping and delivery error. Production support loads, force pairs, released-axis behavior and world-space targets remain outside the residual action and must be reported as excluded teacher components.",
+    "collection": "Use only the frozen opened selection cases plus the repeated unperturbed development control. Preserve each full 600-step production trajectory and measure survival and signed achieved speed before fitting. A production controller that has already entered a terminal state may stop issuing motor poses while the diagnostic trajectory continues; exclude those pose-less frames from supervised data, record their case/step identities, and require the manifest-declared minimum valid post-warmup pose coverage before fitting. Do not inspect qualification holdouts. Stop before cloning if the teacher fails either its frozen physical or pose-coverage gate.",
+    "optimization": "Initialize a fresh zero-residual policy and fit only its actor mean to the bounded filter proposals with the single manifest-declared seed, Adam learning rate, minibatch size and epoch count. Keep normalization fixed identity. Record valid teacher-pose sample count, parallel collection wall time and usable teacher samples per second. This supervised sample count is not a usable PPO-transition target and must not be added to PPO allocation counters.",
+    "comparison": "Evaluate both the fresh zero-residual actor and cloned actor over the complete 600-step opened selection/control set. Useful bootstrap evidence requires positive mean signed along-command speed and fewer full-length falls than the fresh actor. Report absolute outcomes, cloning loss, target clipping and filter error. The unlearned tracker is not required to walk, and failure of the joint-pose-only clone does not disprove residual learning.",
+    "continuation": "Stop after the one frozen clone and comparison. Never launch PPO, tune cloning settings or extend the experiment automatically. Any PPO continuation requires a new measured allocation manifest, an explicit policy-only transfer checkpoint binding and separate compute authorization."
+  },
+  "production_pose_ablation": {
+    "purpose": "After a cloned production pose target fails its full-length handoff gate, causally test whether the pose component itself can retain useful forward motion before changing the action seam or allocating more optimization.",
+    "variants": ["unchanged full production walker", "open-loop production driven-pose oracle replayed through the unchanged clipped 49-action direct seam", "zero-residual direct reference tracker"],
+    "replay_contract": "Collect full production trajectories first. At each frame compose the reviewed generator pose with the bounded inverse of the exact driven parent-local production pose, then replay that pose/action sequence through direct tracking on the identical case and impulse. The direct replay receives no production support loads, load torques, force pairs, released axes, world-space motor targets, upright assistance or hidden root actuation. Pose-less post-terminal production frames use zero residual and remain explicitly counted.",
+    "comparison": "Use only the full 600-step opened selection set plus repeated unperturbed control at 45 units/s. Preserve full trajectories for all three variants and report signed speed, falls, command RMSE, joint acceleration, support slip, violations, clipping and timing. Useful pose-only evidence requires positive signed speed and fewer falls than zero residual; the unlearned tracker is not required to walk.",
+    "limits": "No optimization, checkpoint promotion or qualification holdout access. Freeze total physics, cumulative wall and storage caps in a source/executable/spec/library/generator/case-bound manifest and stop after one comparison.",
+    "decision": "If pose-only replay retains useful positive motion, a later separately authorized learner may target that representable oracle. If it does not, require an explicit action-space or residual-around-production architecture decision before further training allocation."
+  },
+  "production_residual_experiment": {
+    "authorization_scope": "The user requested preparation of an overnight experiment following the recommendation to learn small corrections around production walking. This enables implementation and bounded integration, while the generated overnight allocation remains pending its concrete compute-budget approval.",
+    "controller": "production-residual; worker code 3, scenario ProductionResidual",
+    "actions": "Reuse the captured 49-scalar joint layout at a separate maximum 0.1-radian parent-local offset, with the existing 0.8/0.2 action filter. Compose on the current production driven pose. Production load torques, support forces, world targets and released axes retain their ordinary authority; measure final channel authority and do not silently claim overwritten axes as effective. The historical direct 0.5-radian action contract remains distinct.",
+    "zero_identity": "Zero correction must reproduce every physical observation byte of unchanged production on identical commands. Scenario configuration hashes remain distinct because the explicit controller enum is different.",
+    "objective": "Reuse the reviewed command/style reward and first-terminal training handling; full 600-step evaluations remain intact. A fresh zero-mean actor begins from the production walker; historical direct-controller checkpoints are incompatible.",
+    "readiness": "Freeze the effective channel map before allocation. Prove zero identity, bounded nonzero final-target and physical authority, action replay, malformed rejection, motor-off and reviewed forward coverage. Measure finite PPO updates, usable transitions, terminal timing and checkpoint resume within 1M physics steps and 1200 seconds; no improvement threshold is required for integration.",
+    "allocation": "Prepare an explicit eight-hour maximum with sample target derived from new measured usable-transition throughput, separate physics cap and reserves, full evaluations at fixed milestones, intact baseline checkpoint and bounded checkpoint storage. Preserve holdouts and qualify separately.",
+    "failure_recovery": "Save immutable checkpoint generations and atomically publish their state pointer. Preserve an in-flight reservation until a completed update is durable. Abruptly interrupted work is unknown actual physics, conservatively charged as reserved recovery work, reported separately and never turned into optimizer samples. Restore policy/optimizer/RNG from the last complete generation.",
+    "interpretation": "The previous clipped open-loop pose oracle failure does not prove an adaptive policy cannot learn. This experiment tests a different baseline and cannot reuse the previous 60M allocation or its time estimate."
+  },
+  "case_generation": {
+    "generator": "A future runner must implement PCG64 and save all resolved cases before the first optimization update.",
+    "training_seed": 2026091402,
+    "selection_seed": 2026091403,
+    "holdout_seed": 2026091404,
+    "selection_cases": 16,
+    "holdout_cases": 32,
+    "perturbation": "The corrected startup diagnostic trains only unperturbed episodes until a fixed selection checkpoint first survives through disturbance step 180. A later explicitly allocated stage may restore alternating unperturbed and perturbed training episodes. Selection and unopened holdout identities retain one ordinary external torso impulse during walking: horizontal angle uniform [0,2*pi), magnitude uniform [50,400] kg*world-unit/s, step uniformly selected from 180 through 420 inclusive. Disturbance is an environment input, never a policy action.",
+    "unperturbed_control": "Evaluate the same additional unperturbed control with every set and label it as a repeated control, not a novel holdout case.",
+    "disjointness": "Seeds and resolved perturbed-case hashes must be pairwise disjoint; reject duplicates across sampled sets. The deliberately repeated unperturbed control is excluded from holdout sample counts. Integration uses training/selection controls only and leaves holdout unopened. Each training run freezes new disjoint case manifests and one checkpoint before holdout. Any inspected holdout becomes development data for later runs and cannot be reused for qualification.",
+    "historical_holdouts": "Do not reuse the observed 2026-09-05 cases or Weekend D seed 777 as untouched evidence."
+  },
+  "comparison": {
+    "baselines": ["Current production walker on identical commands and disturbances", "Deterministic direct-reference motor tracker with zero residual", "Selected reference-conditioned residual policy"],
+    "selection": "On the fixed selection set, compare complete physical-violation counts first, then commanded-velocity RMSE, then joint-acceleration RMS, then stance slip. Use reference-pose RMSE only as the final style tie-breaker. Select once before holdout; archive all checkpoints and selection data. Reward total alone cannot select a controller that worsens a required physical gate.",
+    "physical_violations": ["falling_or_fallen", "nonfoot_support", "solver_or_free_velocity_cap", "stance_slide_above_1.5", "walking_speed_error_above_20_percent_of_nonzero_request", "motor_limit_exceeded", "root_or_other_nonjoint_actuation"],
+    "learning_signal_rule": "For an allocated training run, a diagnostic positive signal is at least 10 percent lower aggregate commanded-velocity RMSE than the zero-residual tracker, positive signed achieved along-command speed during the steady walk interval, no increase in any listed physical-violation count, no more than 5 percent increase in joint-acceleration RMS, and intact controls. This is not an integration-smoke exit gate or a sufficient condition for directional coverage. Report reference error and absolute outcomes even if neither controller walks; physical departures from imperfect style references are allowed.",
+    "promotion": "A 32-case diagnostic cannot close PLAY-01. Require reviewed motion-library/generator coverage and trained command coverage before a separately registered 300-plus fresh disjoint captured-body qualification, box/mesh/tiled/wander verification, exact named native replay, ordinary direction/start/stop/turn tests at native 30/60/120 render FPS with 60 Hz physics, and user feel acceptance."
+  },
+  "budget": {
+    "applies_to_stage": "integration_smoke_only",
+    "maximum_total_physics_steps": 1000000,
+    "maximum_wall_seconds": 1200,
+    "counted_work": ["readiness_physics", "warmup", "smoke_optimizer_updates", "selection_controls", "all_baselines", "checkpoint_resume_controls", "exact_replays"],
+    "wall_clock_start": "Before the first pilot worker is spawned; includes preparation inside the runner, process I/O, inference, learning updates and artifact writes.",
+    "reserved_evaluation_physics_steps": 96000,
+    "reserve_rule": "Reserve at least 96000 steps, increased to the actual resolved control/replay case cost if necessary. Do not start a smoke batch unless it and all remaining controls/artifact work fit under both caps using measured throughput. Leave qualification holdouts unopened.",
+    "interpretation": "Engineering integration allocation only. Absence of learning by this cap is inconclusive. After intact controls, measure and propose a larger allocation through training_run_manifest; do not apply this small cap to every future training run.",
+    "automatic_extension": false
+  },
+  "training_run_manifest": {
+    "required_before_training_stage_launch": true,
+    "required_fields": ["run_id", "stage_and_command_scope", "specification_and_source_hashes", "body_profile_and_motion_generator_hashes", "content_coverage_manifest_sha256", "forward_reference_review", "parent_checkpoint_and_transfer_policy", "compute_allocation_and_authorization_reference", "measured_steps_and_updates_per_second", "measurement_protocol_and_overhead", "target_usable_optimizer_transitions", "maximum_total_physics_steps", "maximum_cumulative_wall_seconds", "maximum_storage_bytes", "worker_count", "resolved_rollout_batch_and_optimizer_settings", "checkpoint_interval_and_retention", "selection_evaluation_schedule", "reserved_evaluation_steps_wall_and_storage", "curriculum_and_case_manifest_hashes", "fresh_holdout_manifest_sha256", "budget_rationale", "stop_and_continuation_rules"],
+    "sizing": "Produce a concrete recommended training allocation and projected runtime/storage using measured complete-update usable-transition throughput, the measured ratio of training physics steps to usable optimizer transitions, explicit warmup/reset/evaluation/checkpoint overhead and sample-budget rationale. State the sample target separately from the total physics-step cap. Distinguish an engineering allocation from evidence that it is sufficient for convergence. If resources cannot support a meaningful trial, report that limitation rather than claiming the smoke cap is sufficient. No larger allocation is granted by this specification alone.",
+    "runner_contract": "Training episodes stop on their first terminal failure and replace their physics worker before reuse; evaluation and diagnostic trajectories remain full length. A declared startup-horizon curriculum may shorten training only under the frozen startup_horizon_curriculum contract. Record total simulated, training simulated, post-warmup usable optimizer, warmup, unusable, evaluation and diagnostic physics counters plus reset count/time. Curriculum and target progress use usable optimizer transitions. Support explicit total-step, cumulative-wall and storage caps, checkpoint/resume and a reproducible launch command. Count all workers, evaluation, aborted/retried batches and resumed segments against the same run. Pause between invocations does not reset cumulative execution time; record both execution time and calendar elapsed time.",
+    "checkpoint_contract": "Require an explicit fresh, transfer or exact-resume launch mode. Fresh and transfer reject existing run state; transfer requires a declared hashed parent and imports policy only while initializing optimizer/RNG/fixed normalization/counters; exact-resume requires the run's hashed latest checkpoint and restores optimizer, RNG, normalization and every cumulative counter. Hash and verify applicable source, executable, context, profile, library, generator, specification, case/curriculum and run identities before simulation. Never fall back to fresh. Keep exact replay journals for controls, selected evaluations and failure windows under an explicit retention policy; hash per-batch sampled-case records without requiring unbounded full training traces.",
+    "continuation": "At the allocation limit, save a resumable checkpoint and learning/physical curves with completed steps/updates, controls, resource consumption and unresolved coverage. Emit a specific continue, revise, or qualify proposal with its next budget and command. Flat early learning is not an automatic architecture rejection; any plateau rule, minimum exposure and observation window must be fixed before that run. Never extend a cap silently or choose a new run using an untouched holdout.",
+    "default_total_steps": null,
+    "default_wall_seconds": null
+  },
+  "stop_conditions": [
+    "Any missing or failed requirement for the current readiness phase: do not start the dependent operation. Integrity failures stop the run; independent preparation may continue.",
+    "Any negative-control or provenance violation during a run.",
+    "The active stage's recorded step, cumulative wall-time or storage cap is reached; checkpoint and emit the next-stage proposal.",
+    "Remaining evaluation cannot fit the measured budget.",
+    "Numerical failure, worker failure, malformed state/action or unrecorded source/fixture change.",
+    "A missing command-coverage prerequisite blocks the affected training/qualification stage, not independent content or worker implementation.",
+    "Integration smoke with intact controls but no learning signal is inconclusive; continue implementation through the measured training proposal. Training-stage stopping follows its frozen exposure and continuation rules."
+  ],
+  "required_artifacts": ["run-manifest.json", "content-coverage.json", "reference-generator-review-and-preview", "resolved-joint-manifest.json", "resolved-cases.json", "readiness-raw.json", "throughput-and-budget-proposal.json", "resolved-control-and-evaluation-target-journals", "events.jsonl", "weights-and-resume-state-hashes", "physical-metrics.json", "motion-errors.json", "learning-curves.json", "SUMMARY.txt"],
+  "tracker_reporting": "No automated verdict is authorized by this specification. Register the actual producer and emit its hashed raw artifact with --tracker-task PLAY-01 before using any new automated tracker result."
+}

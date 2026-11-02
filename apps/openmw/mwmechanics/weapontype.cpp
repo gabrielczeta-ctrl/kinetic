@@ -61,6 +61,24 @@ namespace MWMechanics
             && weaponTypeId != ESM::WeaponType::HandToHand && weaponTypeId != ESM::WeaponType::Spell;
     }
 
+    WeaponAttackCandidates weaponAttackCandidates(const ESM::Weapon* weapon)
+    {
+        if (weapon == nullptr)
+            return { true, false, true }; // unarmed: hooks and straights
+        const ESM::RefId& type = weapon->mData.mType;
+        if (type == ESM::WeaponType::ShortBladeOneHand)
+            return { true, false, true };
+        if (type == ESM::WeaponType::AxeOneHand || type == ESM::WeaponType::AxeTwoHand)
+            return { true, true, false };
+        if (type == ESM::WeaponType::BluntOneHand || type == ESM::WeaponType::BluntTwoClose
+            || type == ESM::WeaponType::BluntTwoWide)
+            return { false, true, true };
+        if (type == ESM::WeaponType::SpearTwoWide)
+            return { false, false, true };
+        // Long blades and anything unrecognised keep the authored three.
+        return {};
+    }
+
     bool isWeaponOrToolType(ESM::RefId weaponTypeId)
     {
         return isWeaponType(weaponTypeId) || weaponTypeId == ESM::WeaponType::PickProbe;

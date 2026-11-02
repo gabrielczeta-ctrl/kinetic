@@ -62,6 +62,7 @@ namespace MWSound
         void setLastPosition(const osg::Vec3f& lastpos) { mParams.mLastPos = lastpos; }
         void setVelocity(const osg::Vec3f& vel) { mParams.mVel = vel; }
         void setVolume(float volume) { mParams.mVolume = volume; }
+        void setPitch(float pitch) { mParams.mPitch = pitch; }
         void setBaseVolume(float volume) { mParams.mBaseVolume = volume; }
         void setFadeout(float duration) { setFade(duration, 0.0, Play_StopAtFadeEnd); }
 

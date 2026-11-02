@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #include <components/debug/debuglog.hpp>
+#include <components/fallback/fallback.hpp>
 #include <components/lua/l10n.hpp>
 #include <components/lua/luastate.hpp>
 #include <components/lua/serialization.hpp>
@@ -125,7 +126,22 @@ namespace MWLua
             api["getGMST"] = [lua, gmstStore](const std::string& setting) -> sol::object {
                 const ESM::GameSetting* gmst = gmstStore->search(setting);
                 if (gmst == nullptr)
+                {
+                    // Bundled UI/camera scripts also use this API for INI
+                    // fallbacks. Match names case-insensitively, like GMSTs.
+                    const auto findFallback = [&](const auto& values) -> sol::object {
+                        for (const auto& [name, value] : values)
+                            if (Misc::StringUtils::ciEqual(name, setting))
+                                return sol::make_object(lua, value);
+                        return sol::nil;
+                    };
+                    for (const sol::object& value : { findFallback(Fallback::Map::getIntFallbackMap()),
+                             findFallback(Fallback::Map::getFloatFallbackMap()),
+                             findFallback(Fallback::Map::getNonNumericFallbackMap()) })
+                        if (value != sol::nil)
+                            return value;
                     return sol::nil;
+                }
                 const ESM::Variant& value = gmst->mValue;
                 switch (value.getType())
                 {

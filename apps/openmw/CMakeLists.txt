@@ -23,7 +23,7 @@ add_openmw_dir (mwrender
     joltdebugdraw globalmap characterpreview camera localmap water terrainstorage ripplesimulation
     renderbin actoranimation landmanager navmesh actorspaths recastmesh fogmanager objectpaging groundcover
     postprocessor pingpongcull luminancecalculator pingpongcanvas transparentpass opaqueblit waterawaretransparentbin precipitationocclusion ripples
-    actorutil distortion animationpriority bonegroup blendmask animblendcontroller
+    actorutil distortion animationpriority bonegroup blendmask animblendcontroller woundfx
     )
 
 add_openmw_dir (mwinput
@@ -63,6 +63,7 @@ add_openmw_dir (mwlua
     context menuscripts globalscripts localscripts playerscripts luabindings objectbindings cellbindings coremwscriptbindings
     mwscriptbindings camerabindings vfsbindings uibindings soundbindings inputbindings nearbybindings dialoguebindings
     postprocessingbindings stats recordstore debugbindings corebindings worldbindings worker landbindings magicbindings factionbindings
+    ragdolltestbindings kineticbindings kineticnetbindings
     classbindings itemdata inputprocessor animationbindings birthsignbindings racebindings markupbindings weatherbindings regionbindings
     types/types types/door types/item types/actor types/container types/lockable types/weapon types/npc types/bodypart
     types/creature types/player types/activator types/book types/lockpick types/probe types/apparatus
@@ -83,7 +84,7 @@ add_openmw_dir (mwworld
     store esmstore fallback actionrepair actionsoulgem livecellref actiondoor
     contentloader esmloader actiontrap cellreflist cellref weather projectilemanager
     cellpreloader datetimemanager groundcoverstore magiceffects cell ptrregistry
-    positioncellgrid
+    positioncellgrid kineticnet
     )
 
 add_openmw_dir (mwphysics
@@ -118,10 +119,30 @@ add_openmw_dir (mwbase
 
 # Main executable
 
-add_library(openmw-lib STATIC
+option(OPENMW_LINK_NATIVE_OBJECTS "Link native objects directly to avoid the intermediate OpenMW archive" OFF)
+set(openmw_native_library_type STATIC)
+if (OPENMW_LINK_NATIVE_OBJECTS)
+    set(openmw_native_library_type OBJECT)
+endif()
+
+add_library(openmw-lib ${openmw_native_library_type}
     ${OPENMW_FILES}
     ${OPENMW_SOURCES}
 )
+
+if (OPENMW_LINK_NATIVE_OBJECTS AND CMAKE_GENERATOR MATCHES "Visual Studio")
+    # VS represents CMake object libraries as static-library projects even
+    # though consumers already receive their individual object files.
+    set_property(TARGET openmw-lib PROPERTY VS_GLOBAL_ForceImportAfterCppTargets
+        "${CMAKE_CURRENT_SOURCE_DIR}/native-objects.targets")
+endif()
+
+if (OPENMW_RAGDOLL_DEV_API)
+    target_compile_definitions(openmw-lib PRIVATE OPENMW_RAGDOLL_DEV_API)
+    if (OPENMW_RAGDOLL_TEST_LUA)
+        target_compile_definitions(openmw-lib PRIVATE OPENMW_RAGDOLL_TEST_LUA)
+    endif()
+endif()
 
 if (MSVC)
     # these TUs take a lot of memory for codegen
@@ -227,6 +248,11 @@ endif()
 
 if (NOT UNIX)
     target_link_libraries(openmw-lib ${SDL2MAIN_LIBRARY})
+endif()
+
+# The duel link's UDP sockets (mwworld/kineticnet).
+if (WIN32)
+    target_link_libraries(openmw-lib ws2_32)
 endif()
 
 # Fix for not visible pthreads functions for linker with glibc 2.15

@@ -54,7 +54,8 @@ varying vec2 glossMapUV;
 uniform mat4 texMat@glossMapUV;
 #endif
 
-#define PER_PIXEL_LIGHTING (@normalMap || @specularMap || @forcePPL)
+// WOUNDFX-01 FX1: wounded drawables are always lit per pixel.
+#define PER_PIXEL_LIGHTING (@normalMap || @specularMap || @forcePPL || @woundVolumes)
 
 #if !PER_PIXEL_LIGHTING
 centroid varying vec3 shadedLighting;
@@ -87,6 +88,11 @@ uniform vec2 screenRes;
 
 centroid varying vec4 passColor;
 
+#if @woundVolumes
+// WOUNDFX-01 FX1: the unskinned (bind pose) position, texture unit 6.
+varying vec3 woundBindPos;
+#endif
+
 void main(void)
 {
     Material material = getMaterial();
@@ -104,6 +110,10 @@ void main(void)
     passViewPos = viewPos.xyz;
     passNormal = gl_Normal.xyz;
     normalToViewMatrix = gl_NormalMatrix;
+
+#if @woundVolumes
+    woundBindPos = gl_MultiTexCoord6.xyz;
+#endif
 
 #if @normalMap || @diffuseParallax
     passTangent = gl_MultiTexCoord7.xyzw;

@@ -251,6 +251,11 @@ namespace MWRender
         return mWeapon ? mWeapon->getNode().get() : nullptr;
     }
 
+    osg::Node* CreatureWeaponAnimation::getShieldNode()
+    {
+        return mShield ? mShield->getNode().get() : nullptr;
+    }
+
     Resource::ResourceSystem* CreatureWeaponAnimation::getResourceSystem()
     {
         return mResourceSystem;

@@ -1,4 +1,6 @@
 #include "inputmanagerimp.hpp"
+#include "../manualdiagnostics.hpp"
+#include <MyGUI_InputManager.h>
 
 #include <osgViewer/ViewerEventHandlers>
 
@@ -9,6 +11,7 @@
 
 #include "../mwbase/environment.hpp"
 #include "../mwbase/windowmanager.hpp"
+#include "../mwbase/world.hpp"
 #include "../mwbase/world.hpp"
 
 #include "../mwworld/esmstore.hpp"
@@ -28,7 +31,8 @@ namespace MWInput
         osg::ref_ptr<osgViewer::ScreenCaptureHandler> screenCaptureHandler, const std::filesystem::path& userFile,
         bool userFileExists, const std::filesystem::path& userControllerBindingsFile,
         const std::filesystem::path& controllerBindingsFile, bool grab)
-        : mControlsDisabled(false)
+        : mWindow(window)
+        , mControlsDisabled(false)
         , mInputWrapper(std::make_unique<SDLUtil::InputWrapper>(window, viewer, grab))
         , mBindingsManager(std::make_unique<BindingsManager>(userFile, userFileExists))
         , mControlSwitch(std::make_unique<ControlSwitch>())
@@ -55,8 +59,62 @@ namespace MWInput
 
     InputManager::~InputManager() {}
 
+#ifdef OPENMW_RAGDOLL_DEV_API
+    void InputManager::injectRagdollTestMouseInput(int deltaX, int deltaY, int heldState, int buttonId)
+    {
+        ManualDiagnostics::SyntheticInputScope diagnosticScope;
+        int width = 0;
+        int height = 0;
+        SDL_GetWindowSize(mWindow, &width, &height);
+        if (heldState >= 0)
+        {
+            SDL_MouseButtonEvent button{};
+            button.type = heldState ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+            button.windowID = SDL_GetWindowID(mWindow);
+            button.button = static_cast<Uint8>(buttonId);
+            button.state = heldState ? SDL_PRESSED : SDL_RELEASED;
+            button.clicks = 1;
+            button.x = width / 2;
+            button.y = height / 2;
+            if (heldState)
+                mMouseManager->mousePressed(button, button.button);
+            else
+                mMouseManager->mouseReleased(button, button.button);
+        }
+        SDLUtil::MouseMotionEvent motion{};
+        motion.type = SDL_MOUSEMOTION;
+        motion.windowID = SDL_GetWindowID(mWindow);
+        motion.x = width / 2;
+        motion.y = height / 2;
+        motion.xrel = deltaX;
+        motion.yrel = deltaY;
+        mMouseManager->mouseMoved(motion);
+    }
+#endif
+
     void InputManager::update(float dt, bool disableControls, bool disableEvents)
     {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        // Deliver fixture GUI input during the ordinary input phase. UI callbacks
+        // may queue Lua actions here, unlike inside Lua's delayed-action executor.
+        for (const auto& event : mObservationEditorInput)
+        {
+            if (!MWBase::Environment::get().getWindowManager()->isGuiMode()) continue;
+            auto& input = MyGUI::InputManager::getInstance();
+            if (event[2] >= 0)
+            {
+                input.injectKeyPress(MyGUI::KeyCode::None, event[2]);
+                input.injectKeyRelease(MyGUI::KeyCode::None);
+            }
+            else
+            {
+                input.injectMouseMove(event[0], event[1], 0);
+                input.injectMousePress(event[0], event[1], MyGUI::MouseButton::Left);
+                input.injectMouseRelease(event[0], event[1], MyGUI::MouseButton::Left);
+            }
+        }
+        mObservationEditorInput.clear();
+#endif
         mControlsDisabled = disableControls;
 
         mInputWrapper->setMouseVisible(MWBase::Environment::get().getWindowManager()->getCursorVisible());
@@ -64,6 +122,7 @@ namespace MWInput
 
         if (disableControls)
         {
+            mMouseManager->cancelRagdollUse();
             mMouseManager->updateCursorMode();
             return;
         }

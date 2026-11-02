@@ -99,6 +99,7 @@ namespace MWWorld
         std::string mCurrentWorldSpace;
 
         std::unique_ptr<MWWorld::Player> mPlayer;
+        std::optional<MWMechanics::RagdollAttackInput> mPlayerRagdollAttackInput;
         std::unique_ptr<MWPhysics::PhysicsSystem> mPhysics;
         std::unique_ptr<DetourNavigator::Navigator> mNavigator;
         std::unique_ptr<MWRender::RenderingManager> mRendering;
@@ -189,6 +190,12 @@ namespace MWWorld
     public:
         WorldModel& getWorldModel() { return mWorldModel; }
         Scene& getWorldScene() { return *mWorldScene; }
+#ifdef OPENMW_RAGDOLL_DEV_API
+        MWPhysics::PhysicsSystem& getPhysicsSystem() { return *mPhysics; }
+        osg::Vec3f getCameraTrackedPosition() const;
+        bool setActorPoweredRagdoll(const MWWorld::Ptr& actor, bool enabled);
+        bool requestActorPoweredRagdollRecovery(const MWWorld::Ptr& actor);
+#endif
 
         // FIXME
         void addContainerScripts(const Ptr& reference, CellStore* cell) override;
@@ -464,6 +471,20 @@ namespace MWWorld
 
         MWRender::Camera* getCamera() override;
         bool vanityRotateCamera(const float* rot) override;
+        bool driveActorRagdollSwing(float aimRight, float aimUp, bool held, bool thrust = false) override;
+        bool setActorRagdollGuard(bool held) override;
+        bool shoveActorRagdoll() override;
+        bool cycleActorRagdollGrip() override;
+        bool dodgeActorRagdoll() override;
+        bool requestActorRagdollDodge(const MWWorld::ConstPtr& actor, const osg::Vec3f& direction) override;
+        bool driveActorRagdollGuardZone(float aimRight, float aimUp, bool reset) override;
+        bool isPlayerRagdollWeaponAttached() const override;
+        bool hasActorRagdollWeaponAttached(const MWWorld::ConstPtr& actor) const override;
+        bool usesPlayerRagdollAttackAnimation() const override;
+        bool queuePlayerRagdollAttackInput(bool held) override;
+        void cancelPlayerRagdollAttackInput() override;
+        std::optional<MWMechanics::RagdollAttackInput> consumeActorRagdollAttackInput(const MWWorld::Ptr& actor) override;
+        void updateActorRagdollAttack(const MWWorld::Ptr& actor, const MWMechanics::RagdollAttackState& state) override;
 
         void applyDeferredPreviewRotationToPlayer(float dt) override;
         void disableDeferredPreviewRotation() override;
@@ -506,12 +527,27 @@ namespace MWWorld
         ///< get all items in active cells owned by this Npc
 
         bool getLOS(const MWWorld::ConstPtr& actor, const MWWorld::ConstPtr& targetActor) override;
+        bool isPoweredRagdoll(const MWWorld::ConstPtr& actor) const override;
         ///< get Line of Sight (morrowind stupid implementation)
 
         float getDistToNearestRayHit(
             const osg::Vec3f& from, const osg::Vec3f& dir, float maxDist, bool includeWater = false) override;
 
         void enableActorCollision(const MWWorld::Ptr& actor, bool enable) override;
+        bool beginPhysicalHitReceipt(const MWWorld::Ptr& actor, std::uint64_t id) override;
+        // NET-01 duel: the remote player's puppet, and the link's exchange
+        // (once a rendered frame, also while paused so the link stays alive).
+        bool isNetPuppet(const MWWorld::ConstPtr& actor) const override;
+        bool setNetPuppet(const MWWorld::Ptr& actor) override;
+        void clearNetPuppet() override;
+        void updateKineticNet(float duration);
+        void finishPhysicalHitReceipt(const MWWorld::Ptr& actor, std::uint64_t id, float health, float fatigue) override;
+        void recordActorKillingBlow(const MWWorld::Ptr& actor, const osg::Vec3f& worldPoint,
+            const osg::Vec3f& direction, float healthDamage) override;
+        void sampleActorRagdollMotion(const MWWorld::Ptr& actor, float duration) override;
+        osg::Vec2f getActorRagdollStumble(const MWWorld::Ptr& actor) override;
+        bool getActorRagdollCameraPosition(const MWWorld::ConstPtr& actor, osg::Vec3f& position) const override;
+        bool isActorPoweredRagdoll(const MWWorld::ConstPtr& actor) const override;
 
         int canRest() const override;
         ///< check if the player is allowed to rest
@@ -616,6 +652,8 @@ namespace MWWorld
             std::string_view effectId = {}, bool loop = false) override;
 
         void removeEffect(std::string_view effectId) override;
+
+        void spawnSparks(const osg::Vec3f& worldPos, const osg::Vec3f& normal, float strength) override;
 
         /// @see MWWorld::WeatherManager::isInStorm
         bool isInStorm() const override;

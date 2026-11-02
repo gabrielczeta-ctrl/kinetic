@@ -1875,6 +1875,11 @@ namespace MWMechanics
         return mActors.isAttackingOrSpell(ptr);
     }
 
+    bool MechanicsManager::isAttackAnimationActive(const MWWorld::Ptr& ptr) const
+    {
+        return mActors.isAttackAnimationActive(ptr);
+    }
+
     void MechanicsManager::setWerewolf(const MWWorld::Ptr& actor, bool werewolf)
     {
         MWMechanics::NpcStats& npcStats = actor.getClass().getNpcStats(actor);
