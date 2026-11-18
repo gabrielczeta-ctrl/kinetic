@@ -67,8 +67,9 @@ Play
 ----
 
 Download the release zip from
-[Releases](https://github.com/gabrielczeta-ctrl/kinetic/releases) (or
-Nexus Mods), unpack it anywhere and run `KINETIC.cmd`. You need
+[Releases](https://github.com/gabrielczeta-ctrl/kinetic/releases) or from
+[Nexus Mods](https://www.nexusmods.com/morrowind/mods/60974), unpack it anywhere and
+run `KINETIC.cmd`. You need
 your own Morrowind (the "Data Files" folder; GOTY recommended). You don't need
 an OpenMW install, and KINETIC doesn't touch an existing one. The package
 README explains the controls, the options page (Options > Scripts > KINETIC),
@@ -108,7 +109,7 @@ We are looking for a way to support dismemberment, and for ways to bring
 more of the game under the same physics: the other creatures, rolls, better
 fists. If you make mods, animations, models or engine code and want to
 work on any of it together, you are welcome: open an issue here or write
-on the mod's page.
+on the [Nexus Mods page](https://www.nexusmods.com/morrowind/mods/60974).
 
 How it works
 ------------

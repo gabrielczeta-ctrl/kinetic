@@ -114,6 +114,8 @@ odds.
 
 ## Install
 
+Also on Nexus Mods: https://www.nexusmods.com/morrowind/mods/60974
+
 1. Unpack the zip anywhere.
 2. Run `KINETIC.cmd`; the first time it asks for your Morrowind "Data Files"
    folder (Morrowind GOTY recommended; Tribunal and Bloodmoon are used when
@@ -143,7 +145,8 @@ KINETIC do not load back in 0.51.
 We are looking for a way to support dismemberment, and for ways to bring
 more of the game under the same physics: the other creatures, rolls, better
 fists. Other creators are invited to collaborate: open an issue on the
-repository or write on the mod's page.
+repository or write on the
+[Nexus Mods page](https://www.nexusmods.com/morrowind/mods/60974).
 
 ## Licence and source
 
