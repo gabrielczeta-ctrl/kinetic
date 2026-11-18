@@ -4,7 +4,9 @@
 #include <ragdollcore/tuning.hpp>
 #include <MyGUI_UString.h>
 
+#include <algorithm>
 #include <format>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 

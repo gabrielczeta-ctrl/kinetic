@@ -332,37 +332,6 @@ namespace RagdollCore
             std::mutex mMutex;
         };
 
-        void configureScenarioPhysics(JPH::PhysicsSystem& physics, std::uint32_t velocitySteps)
-        {
-            JPH::PhysicsSettings settings = physics.GetPhysicsSettings();
-            if (velocitySteps != 0)
-                settings.mNumVelocitySteps = velocitySteps;
-            constexpr float unitScale = UnitModel::UnitsPerMeter;
-            constexpr float unitScaleSquared = unitScale * unitScale;
-            settings.mSpeculativeContactDistance *= unitScale;
-            settings.mPenetrationSlop *= unitScale;
-            settings.mManifoldTolerance *= unitScale;
-            settings.mMaxPenetrationDistance *= unitScale;
-            settings.mBodyPairCacheMaxDeltaPositionSq *= unitScaleSquared;
-            settings.mContactPointPreserveLambdaMaxDistSq *= unitScaleSquared;
-            settings.mMinVelocityForRestitution *= unitScale;
-            settings.mPointVelocitySleepThreshold *= unitScale;
-            // Contact probes (2026-09-11, strafe-native-input): env-gated,
-            // unset is byte-identical. Used to find why a box foot straddling
-            // a coplanar mesh edge sinks ~1.6 units and loads asymmetrically.
-            // Manifold reduction OFF by default since 2026-09-11 (matches the game); OPENMW_RAGDOLL_PHYS_MANIFOLD=1 restores it.
-            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PHYS_MANIFOLD"); !(text && std::atoi(text) != 0))
-                settings.mUseManifoldReduction = false;
-            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PHYS_ACTIVE_EDGES"); text && std::atoi(text) == 0)
-                settings.mCheckActiveEdges = false;
-            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PHYS_SLOP"))
-            {
-                const float slop = std::strtof(text, nullptr);
-                if (std::isfinite(slop) && slop >= 0.0f)
-                    settings.mPenetrationSlop = slop;
-            }
-            physics.SetPhysicsSettings(settings);
-        }
 
         class TelemetryEncoder
         {
@@ -661,6 +630,38 @@ namespace RagdollCore
             std::size_t mKnee = 0;
             std::size_t mFoot = 0;
         };
+    }
+
+    void configureScenarioPhysics(JPH::PhysicsSystem& physics, std::uint32_t velocitySteps)
+    {
+        JPH::PhysicsSettings settings = physics.GetPhysicsSettings();
+        if (velocitySteps != 0)
+            settings.mNumVelocitySteps = velocitySteps;
+        constexpr float unitScale = UnitModel::UnitsPerMeter;
+        constexpr float unitScaleSquared = unitScale * unitScale;
+        settings.mSpeculativeContactDistance *= unitScale;
+        settings.mPenetrationSlop *= unitScale;
+        settings.mManifoldTolerance *= unitScale;
+        settings.mMaxPenetrationDistance *= unitScale;
+        settings.mBodyPairCacheMaxDeltaPositionSq *= unitScaleSquared;
+        settings.mContactPointPreserveLambdaMaxDistSq *= unitScaleSquared;
+        settings.mMinVelocityForRestitution *= unitScale;
+        settings.mPointVelocitySleepThreshold *= unitScale;
+        // Contact probes (2026-09-11, strafe-native-input): env-gated,
+        // unset is byte-identical. Used to find why a box foot straddling
+        // a coplanar mesh edge sinks ~1.6 units and loads asymmetrically.
+        // Manifold reduction OFF by default since 2026-09-11 (matches the game); OPENMW_RAGDOLL_PHYS_MANIFOLD=1 restores it.
+        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PHYS_MANIFOLD"); !(text && std::atoi(text) != 0))
+            settings.mUseManifoldReduction = false;
+        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PHYS_ACTIVE_EDGES"); text && std::atoi(text) == 0)
+            settings.mCheckActiveEdges = false;
+        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PHYS_SLOP"))
+        {
+            const float slop = std::strtof(text, nullptr);
+            if (std::isfinite(slop) && slop >= 0.0f)
+                settings.mPenetrationSlop = slop;
+        }
+        physics.SetPhysicsSettings(settings);
     }
 
     SkeletonDescriptor makeScenarioHumanoidSkeleton()

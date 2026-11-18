@@ -6,6 +6,10 @@
 -- LOW_SECONDS, goes back to its starting spot once the player is not
 -- looking at it (or is far away). Exteriors only: an interior's starting
 -- spot may be in another cell.
+-- An NPC with its weapon or spell out near the player is fighting, not
+-- stranded (11-03 bookmarks 9-11, "the enemy disappeared??": a guard who
+-- chased the player 300 units down the hill from his post was sent home,
+-- 2,600-2,900 units away, twice in one fight).
 local types = require('openmw.types')
 local util = require('openmw.util')
 local world = require('openmw.world')
@@ -44,9 +48,11 @@ local function check(dt)
             local swimming = cell.hasWater and cell.waterLevel ~= nil and actor.position.z < cell.waterLevel - 50
             local low = home and (home.z - actor.position.z) >= LOW_DROP
                 and (util.vector2(home.x, home.y) - util.vector2(actor.position.x, actor.position.y)):length() < 4000
+            local fighting = types.Actor.getStance(actor) ~= types.Actor.STANCE.Nothing
+                and (actor.position - player.position):length() < UNSEEN_DISTANCE
             local state = stranded[key] or { swim = 0, low = 0 }
-            state.swim = swimming and state.swim + dt or 0
-            state.low = low and state.low + dt or 0
+            state.swim = swimming and not fighting and state.swim + dt or 0
+            state.low = low and not fighting and state.low + dt or 0
             stranded[key] = state
             if home and (state.swim >= SWIM_SECONDS or state.low >= LOW_SECONDS) and not seenByPlayer(player, actor) then
                 print(string.format('KINETIC_STRANDED npc=%s swim=%.0f low=%.0f home=%s', tostring(actor.recordId),

@@ -57,6 +57,18 @@ namespace RagdollCore
     };
 
     std::optional<WeaponShapeProfile> weaponShapeProfile(std::string_view record);
+
+    // Which way the long axis runs from the grip to the tip: +1 or -1 along
+    // the hand frame's axis, from the mesh centre's place along it
+    // (`centreAlong`) and the half length. A grip well off the centre decides
+    // (the longer side is the blade); within `centredShare` of the half length
+    // (a spear or staff held at its middle) the side is Morrowind's weapon
+    // convention, +axis: every weapon in the 11-06 playthrough's log has its
+    // centre on the + side except the steel spear (-1.3 of 68.8) and the steel
+    // staff of divine judgement (-7.2 of 61.0), and the spear then held its
+    // butt forward (user 11-06: "the spear is pointing downwards").
+    // K2_TIP_SIDE; a share of 0 = the centre's sign alone.
+    float weaponTipSign(float centreAlong, float halfLength, float centredShare);
 }
 
 #endif

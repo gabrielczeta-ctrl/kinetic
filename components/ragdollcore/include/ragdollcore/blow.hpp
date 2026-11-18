@@ -69,6 +69,10 @@ namespace RagdollCore
         // weapon body's own mass.
         float mApproachSpeed = 0.0f;
         float mCarriedMass = 0.0f;
+        // A push that throws the whole body (a push kick, K2_PUSH_KICK's
+        // carry): every part takes this speed along mAttackerToVictim, on top
+        // of the struck part's own push. u/s; 0 = none.
+        float mBodyCarry = 0.0f;
         // The RPG side: damage paid and the reaction impulse priced from it
         // (combat.cpp: damage x reaction per damage x weapon class push,
         // then the region's reaction scale). Band units.

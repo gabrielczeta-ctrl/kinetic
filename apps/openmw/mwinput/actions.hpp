@@ -71,6 +71,7 @@ namespace MWInput
         A_PhysicalGuard = 52, // hold: physical block/parry stance
         A_PhysicalGrip = 53, // tap: cycle a long blade's grip (GRIP-05)
         A_PhysicalDodge = 54, // tap: a dodge step along the movement keys, a roll when running
+        A_PhysicalKick = 55, // tap: the kick (KICK-01; the middle button is the parry, K2_MIDDLE_PARRY)
 
         A_Last // Marker for the last item
     };

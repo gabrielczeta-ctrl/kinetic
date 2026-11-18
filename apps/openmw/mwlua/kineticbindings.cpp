@@ -27,7 +27,8 @@ namespace MWLua
         std::filesystem::path sDefaultPath;
 
         // The switches the options page may write. Anything else is refused.
-        constexpr std::array<std::string_view, 9> sAllowed{
+        constexpr std::array<std::string_view, 10> sAllowed{
+            "OPENMW_RAGDOLL_KNOCKDOWN",
             "OPENMW_RAGDOLL_RMB_GUARD",
             "OPENMW_RAGDOLL_FALL_PROTECT",
             "OPENMW_RAGDOLL_PGC",
@@ -130,6 +131,14 @@ namespace MWLua
                 { "OPENMW_RAGDOLL_GUARD_COVER", "Clashes", "Guard cover radius",
                     "Units around the defender's weapon, shield or hands a hit counts as guarded (0 = off).",
                     { { "units", 0.0f, 0.0f, 40.0f, 1.0f } } },
+                // User 11-07: "a couple of clashes should open up their guard".
+                { "OPENMW_RAGDOLL_K2_ARM_STRAIN", "Clashes", "Arm strain",
+                    "Every clash a fighter parries tires its weapon arm (x the blow's strength); full strain "
+                    "drops the guard until the arm is back to half. Strain per clash (0 = off), seconds held, "
+                    "recovery per second, strength lost at full strain, your share (0 = NPCs only).",
+                    { { "per clash", 0.5f, 0.0f, 1.5f, 0.05f }, { "hold s", 1.5f, 0.0f, 5.0f, 0.1f },
+                        { "recover/s", 0.2f, 0.0f, 1.0f, 0.05f }, { "weaken", 0.6f, 0.0f, 0.9f, 0.05f },
+                        { "you", 0.0f, 0.0f, 1.0f, 0.1f } } },
                 { "OPENMW_RAGDOLL_DUEL_COMPOSED", "NPC fighters", "Patience",
                     "NPC patience before attacking (x), back-off chance at skill 0 and at skill 100.",
                     { { "patience", 1.0f, 0.2f, 3.0f, 0.05f }, { "back-off unskilled", 0.0f, 0.0f, 1.0f, 0.05f },
@@ -137,6 +146,35 @@ namespace MWLua
                 { "OPENMW_RAGDOLL_NPC_STEADY", "NPC fighters", "Steady hands",
                     "Seconds an NPC's weapon settles before it may strike (0 = off).",
                     { { "seconds", 0.0f, 0.0f, 1.0f, 0.05f } } },
+                // Duel aggression (user 11-07): K2_AI_PRESS, _STEP_OUT, _BACK_CUT, _STAGGER_CUT.
+                { "OPENMW_RAGDOLL_K2_AI_PRESS", "NPC fighters", "Chain attacks",
+                    "Its attack over with you still in reach, an NPC attacks again: chance at skill 0, at 100, "
+                    "attacks in a row (1 = off).",
+                    { { "chance unskilled", 0.2f, 0.0f, 1.0f, 0.05f }, { "chance skilled", 0.7f, 0.0f, 1.0f, 0.05f },
+                        { "attacks", 3.0f, 1.0f, 6.0f, 1.0f } } },
+                { "OPENMW_RAGDOLL_K2_AI_STEP_OUT", "NPC fighters", "Step out",
+                    "Seconds an NPC backs off after its last strike (0 = 0.6, the old step-out).",
+                    { { "seconds", 0.3f, 0.0f, 1.5f, 0.05f } } },
+                { "OPENMW_RAGDOLL_K2_AI_BACK_CUT", "NPC fighters", "Cut while backing off",
+                    "Backing away from your charge, an NPC strikes as you come in: chance at skill 0, at 100.",
+                    { { "chance unskilled", 0.3f, 0.0f, 1.0f, 0.05f }, { "chance skilled", 0.9f, 0.0f, 1.0f, 0.05f } } },
+                { "OPENMW_RAGDOLL_K2_AI_STAGGER_CUT", "NPC fighters", "Swing back when staggered",
+                    "A staggered NPC with you in reach swings back: chance at skill 0, at 100, seconds after the blow.",
+                    { { "chance unskilled", 0.1f, 0.0f, 1.0f, 0.05f }, { "chance skilled", 0.6f, 0.0f, 1.0f, 0.05f },
+                        { "delay s", 0.15f, 0.0f, 1.0f, 0.05f } } },
+                { "OPENMW_RAGDOLL_NPC_BODIES", "NPC bodies", "Physical NPCs",
+                    "Most NPCs with physical bodies at once (yours not counted), nearest first, and how near "
+                    "(units) they get one; they lose it past 1.75x that. More costs frame rate.",
+                    { { "NPCs", 10.0f, 0.0f, 40.0f, 1.0f }, { "radius", 2000.0f, 500.0f, 6000.0f, 100.0f } } },
+                // Experiments (user 11-07): compare the run's two answers live.
+                { "OPENMW_RAGDOLL_K2_GAIT_CAP", "Running (experiment)", "Speed cap",
+                    "On foot a body runs no faster than this (units/s), its animation slowed to match; "
+                    "0 = Morrowind's speed. 'you' 1 caps you too, 0 NPCs only.",
+                    { { "speed", 290.0f, 0.0f, 700.0f, 10.0f }, { "you", 0.0f, 0.0f, 1.0f, 1.0f } } },
+                { "OPENMW_RAGDOLL_K2_ROOT_FIELD", "Running (experiment)", "Whole-body drive",
+                    "From 'from' units/s (full at 'full') the body is moved as a whole instead of pulled by "
+                    "the hips. 'from' 0 = off.",
+                    { { "from", 0.0f, 0.0f, 600.0f, 10.0f }, { "full", 0.0f, 0.0f, 800.0f, 10.0f } } },
             };
             return list;
         }
@@ -276,6 +314,12 @@ namespace MWLua
             {
                 sol::table hud(lua, sol::create);
                 hud["stage"] = state->mHscStage;
+                hud["fists"] = state->mFistHudActive;
+                hud["fistDrag"] = state->mFistHudDrag;
+                hud["leftCharge"] = state->mFistHudCharge[0];
+                hud["rightCharge"] = state->mFistHudCharge[1];
+                hud["leftPunch"] = state->mFistHudKind[0];
+                hud["rightPunch"] = state->mFistHudKind[1];
                 hud["x"] = state->mHscStanceX;
                 hud["y"] = state->mHscStanceY;
                 hud["angle"] = state->mHscAngle;
@@ -287,6 +331,12 @@ namespace MWLua
                         trajectory[i + 1] = state->mHscTrajectory[i];
                     hud["trajectory"] = trajectory;
                 }
+                if (state->mHscMark)
+                {
+                    hud["mark"] = *state->mHscMark;
+                    hud["markHit"] = state->mHscMarkHit;
+                    hud["markGap"] = state->mHscMarkGap;
+                }
                 result["hud"] = hud;
             }
             result["guard"] = state->mGuardActive;
@@ -295,6 +345,28 @@ namespace MWLua
             balance["x"] = state->mBalanceRight;
             balance["y"] = state->mBalanceForward;
             balance["tip"] = state->mBalanceTip;
+            balance["risk"] = state->mBalanceRisk;
+            balance["shiftX"] = state->mWeightRight;
+            balance["shiftY"] = state->mWeightForward;
+            balance["edge"] = state->mWeightEdge;
+            if (state->mBalanceSigil.mKnown)
+            {
+                const auto& s = state->mBalanceSigil;
+                sol::table sigil(lua, sol::create);
+                sigil["leftX"] = s.mLeftRight;
+                sigil["leftY"] = s.mLeftForward;
+                sigil["rightX"] = s.mRightRight;
+                sigil["rightY"] = s.mRightForward;
+                sigil["comX"] = s.mComRight;
+                sigil["comY"] = s.mComForward;
+                sigil["tipX"] = s.mTipRight;
+                sigil["tipY"] = s.mTipForward;
+                sigil["leftLoad"] = s.mLeftLoad;
+                sigil["rightLoad"] = s.mRightLoad;
+                sigil["edge"] = s.mEdge;
+                sigil["daze"] = state->mBalanceDaze;
+                balance["sigil"] = sigil;
+            }
             result["balance"] = balance;
             result["ready"] = state->mAttackReady;
             return result;
@@ -407,6 +479,12 @@ namespace MWLua
         // walking free of a snag on the vanilla capsule, is not).
         api["isPowered"] = [](const LObject& actor) {
             return MWBase::Environment::get().getWorld()->isPoweredRagdoll(actor.ptr());
+        };
+        // OPENMW_RAGDOLL_PLAYER_BLOOD (switchregistry.cpp): a blow on the
+        // player bleeds like one on anyone else.
+        api["playerBleeds"] = []() {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PLAYER_BLOOD");
+            return text != nullptr && std::atoi(text) != 0;
         };
     }
 

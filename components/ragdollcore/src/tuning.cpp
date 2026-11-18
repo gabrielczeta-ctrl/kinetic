@@ -1,5 +1,7 @@
 #include <ragdollcore/tuning.hpp>
 
+#include <ragdollcore/switchregistry.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -61,7 +63,14 @@ namespace RagdollCore
             if (found != snapshot->mValues.end())
                 return found->second.empty() ? nullptr : found->second.c_str();
         }
-        return std::getenv(name);
+        if (const char* text = std::getenv(name))
+            return text;
+        // A registered switch nothing sets reads the game's value (KINETIC-2:
+        // the code's default is the game). The registry's literals end in a
+        // null.
+        if (const SwitchSpec* spec = findSwitch(name); spec && !spec->mDefault.empty())
+            return spec->mDefault.data();
+        return nullptr;
     }
 
     namespace

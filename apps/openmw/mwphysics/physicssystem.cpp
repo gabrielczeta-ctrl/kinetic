@@ -1,4 +1,5 @@
 #include "physicssystem.hpp"
+#include <ragdollcore/runtimeprofile.hpp>
 #include <ragdollcore/tuning.hpp>
 #include "../manualdiagnostics.hpp"
 #include "../fpsfixture.hpp"
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <initializer_list>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -84,12 +86,16 @@
 
 #include <ragdollcore/anatomy.hpp>
 #include <ragdollcore/anatomicalhinge.hpp>
+#include <ragdollcore/armstrain.hpp>
 #include <ragdollcore/armtarget.hpp>
+#include <ragdollcore/cutwheel.hpp>
+#include <ragdollcore/npcshove.hpp>
 #include <ragdollcore/balanceauthority.hpp>
 #include <ragdollcore/blow.hpp>
 #include <ragdollcore/duelread.hpp>
 #include <ragdollcore/bodylease.hpp>
 #include <ragdollcore/contactoutcome.hpp>
+#include <ragdollcore/lodge.hpp>
 #include <ragdollcore/reactioncontroller.hpp>
 #include <ragdollcore/builder.hpp>
 #include <ragdollcore/balancecontacts.hpp>
@@ -106,11 +112,17 @@
 #include <ragdollcore/behavior.hpp> // the region helpers (regionIsArm, ...)
 #include <ragdollcore/hitreaction.hpp>
 #include <ragdollcore/impactdamage.hpp>
+#include <ragdollcore/npcpopulation.hpp>
 #include <ragdollcore/passiveragdoll.hpp>
+#include <ragdollcore/pathcount.hpp>
+#include <ragdollcore/playdefaults.hpp>
 #include <ragdollcore/posecomposer.hpp>
 #include <ragdollcore/situation.hpp>
 #include <ragdollcore/staggerplan.hpp>
 #include <ragdollcore/steparbiter.hpp>
+#include <ragdollcore/stepplanner.hpp>
+#include <ragdollcore/stride.hpp>
+#include <ragdollcore/palmparry.hpp>
 #include <ragdollcore/physicaldefense.hpp>
 #include <ragdollcore/referencegait.hpp>
 #include <ragdollcore/replay.hpp>
@@ -119,7 +131,18 @@
 #include <ragdollcore/unitmodel.hpp>
 #include <ragdollcore/weaponcontact.hpp>
 #include <ragdollcore/weaponalignment.hpp>
+#include <ragdollcore/wheeloutput.hpp>
+#include <ragdollcore/handdrive.hpp>
+#include <ragdollcore/droproll.hpp>
+#include <ragdollcore/fallprotectpose.hpp>
+#include <ragdollcore/lifecycle.hpp>
+#include <ragdollcore/calmhold.hpp>
+#include <ragdollcore/roothold.hpp>
+#include <ragdollcore/rootstrength.hpp>
+#include <ragdollcore/roottarget.hpp>
+#include <ragdollcore/uprightholder.hpp>
 #include <ragdollcore/weaponswing.hpp>
+#include <ragdollcore/woundheal.hpp>
 
 #include "../mwbase/dialoguemanager.hpp"
 #include "../mwbase/environment.hpp"
@@ -142,6 +165,7 @@
 #include "../mwworld/globals.hpp"
 #include "../mwworld/inventorystore.hpp"
 #include "../mwworld/player.hpp"
+#include "../mwworld/timestamp.hpp"
 
 #include "../mwrender/joltdebugdraw.hpp"
 #include "../mwrender/animation.hpp"
@@ -262,9 +286,18 @@ namespace
         return settings;
     }
 
+    // The engine's data files, for the active body settings below.
+    const VFS::Manager* sRagdollDataFiles = nullptr;
+
     // Active body (soft root) settings: OPENMW_RAGDOLL_SOFT_ROOT=1 enables it;
     // OPENMW_RAGDOLL_ACTIVE_BODY names the settings file (key = value lines,
     // see files/data/ragdoll/active-body.cfg). Read once at startup.
+    // Without that path the game's own data file ragdoll/active-body.cfg is
+    // read, as the profile is (W1, 11-03: only the launcher named the file, so
+    // every scripted test ran the code's root - damping 1 against 2, no ground
+    // routing against 0.8, no pelvis anchor - while the player's game ran the
+    // file's). The same for footfall-gaits.cfg (passiveragdollentry.inl).
+    // OPENMW_RAGDOLL_DATA_FILES=1 (unset = the code's values, no gait table).
     const RagdollCore::PassiveRagdoll::SoftRootSettings& softRootSettings()
     {
         static const auto settings_tuned = RagdollCore::tuned<RagdollCore::PassiveRagdoll::SoftRootSettings>([] {
@@ -276,6 +309,15 @@ namespace
                 for (const std::string& problem : s.mBody.load(path))
                     Log(Debug::Warning) << "Active body settings: " << problem;
                 Log(Debug::Info) << "Active body settings loaded from " << path;
+            }
+            else if (const char* data = RagdollCore::tuningText("OPENMW_RAGDOLL_DATA_FILES");
+                     data && std::atoi(data) != 0 && sRagdollDataFiles
+                     && sRagdollDataFiles->exists(VFS::Path::NormalizedView("ragdoll/active-body.cfg")))
+            {
+                Files::IStreamPtr stream = sRagdollDataFiles->get(VFS::Path::NormalizedView("ragdoll/active-body.cfg"));
+                for (const std::string& problem : s.mBody.load(*stream, "ragdoll/active-body.cfg"))
+                    Log(Debug::Warning) << "Active body settings: " << problem;
+                Log(Debug::Info) << "Active body settings loaded from the data files (ragdoll/active-body.cfg)";
             }
             return s;
         });
@@ -450,6 +492,25 @@ namespace MWPhysics
         return osg::Quat(ptr.getRefData().getPosition().rot[2], osg::Vec3f(0, 0, -1));
     }
 
+    // OPENMW_RAGDOLL_K2_CORPSE_FRAME (registry): the frame a limp body is
+    // built and drawn in turns with the visible actor, as a powered one's
+    // does. It took the capsule's rotation, which stays identity for every
+    // actor with a rotationally invariant shape (all the humanoids): bodies
+    // carried over from a living body at their true places were drawn turned
+    // by the actor's facing about the actor - a body facing south was drawn
+    // turned half round the moment it went limp (user 11-17: "it almost looks
+    // like it rotates 180 upon change") - and a corpse built from the
+    // skeleton's pose stood in the physics turned the other way, so the walls
+    // and slopes it met were not the ones it was drawn at. 0 = the capsule's.
+    osg::Quat limpActorRotation(const MWWorld::ConstPtr& ptr, const MWPhysics::Actor& actor)
+    {
+        static const auto corpseFrame_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_CORPSE_FRAME");
+            return text && std::atof(text) > 0.0;
+        });
+        return corpseFrame_tuned.get() ? poweredActorRotation(ptr) : actor.getRotation();
+    }
+
     struct RagdollLegChain
     {
         std::size_t mHip = 0;
@@ -467,6 +528,134 @@ namespace MWPhysics
         std::size_t mElbow = 0;
         std::size_t mHand = 0;
     };
+
+    // K2_PACE_FLOOR (registry): the share of the iron weapon's weight a
+    // weapon is paced at least at (ragdollcore cutwheel pacedWeaponWeight).
+    float k2PaceFloor()
+    {
+        static const auto value_tuned = RagdollCore::tuned<float>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_PACE_FLOOR");
+            const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+            return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+        });
+        return value_tuned.get();
+    }
+
+    // K2_WEAPON_BOX_INERTIA (registry): a weapon hull turns like its box
+    // (ragdollcore ShapeProfile::mBoundsInertia).
+    // "on, roll floor share, hafts".
+    std::array<float, 3> k2WeaponBoxInertia()
+    {
+        static const auto value_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+            std::array<float, 3> value{ 0.0f, 0.0f, 0.0f };
+            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_WEAPON_BOX_INERTIA"))
+                std::sscanf(text, "%f,%f,%f", &value[0], &value[1], &value[2]);
+            for (float& v : value)
+                v = std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+            return value;
+        });
+        return value_tuned.get();
+    }
+
+    // K2_TIP_SIDE (registry): within this share of the half length the mesh
+    // centre no longer picks the tip's side (ragdollcore weaponTipSign).
+    float k2TipSide()
+    {
+        static const auto value_tuned = RagdollCore::tuned<float>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_TIP_SIDE");
+            const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+            return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+        });
+        return value_tuned.get();
+    }
+
+    // K2_SPEAR_GRIP (registry): "units, point" - a spear is held that far
+    // nearer its butt than the animation holds it, its point at most `point`
+    // ahead of the hand.
+    const std::array<float, 2>& k2SpearGrip()
+    {
+        static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+            std::array<float, 2> value{ 0.0f, 80.0f };
+            RagdollCore::tuningList("OPENMW_RAGDOLL_K2_SPEAR_GRIP", value);
+            value[0] = std::isfinite(value[0]) ? std::clamp(value[0], 0.0f, 60.0f) : 0.0f;
+            value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 40.0f, 140.0f) : 80.0f;
+            return value;
+        });
+        return value_tuned.get();
+    }
+
+    // K2_STAFF_AS_SPEAR (registry): a staff is held and driven as a spear;
+    // its record keeps its own numbers and its blows stay blunt.
+    bool k2StaffAsSpear()
+    {
+        static const auto value_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_STAFF_AS_SPEAR");
+            return text && std::atoi(text) != 0;
+        });
+        return value_tuned.get();
+    }
+
+    // The weapon types whose grip, lines, guard and thrust are the spear's.
+    bool spearHandled(const ESM::RefId& type)
+    {
+        return type == ESM::WeaponType::SpearTwoWide
+            || (type == ESM::WeaponType::BluntTwoWide && k2StaffAsSpear());
+    }
+
+    // K2_HEAD_DAMP (registry): the player's head, share held in the world.
+    float k2HeadDamp()
+    {
+        static const auto value_tuned = RagdollCore::tuned<float>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HEAD_DAMP");
+            const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+            return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+        });
+        return value_tuned.get();
+    }
+
+    // K2_BALANCE_RISK (registry): the HUD's about-to-fall value.
+    bool k2BalanceRisk()
+    {
+        static const auto value_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_BALANCE_RISK");
+            return text && std::atoi(text) != 0;
+        });
+        return value_tuned.get();
+    }
+
+    // K2_BALANCE_SIGIL (registry): the balance sigil's stance data.
+    bool k2BalanceSigil()
+    {
+        static const auto value_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_BALANCE_SIGIL");
+            return text && std::atoi(text) != 0;
+        });
+        return value_tuned.get();
+    }
+
+    RagdollCore::PacedWeaponKind pacedWeaponKind(const ESM::RefId& type)
+    {
+        using Kind = RagdollCore::PacedWeaponKind;
+        if (type == ESM::WeaponType::ShortBladeOneHand)
+            return Kind::ShortBlade;
+        if (type == ESM::WeaponType::LongBladeOneHand)
+            return Kind::LongBlade;
+        if (type == ESM::WeaponType::LongBladeTwoHand)
+            return Kind::LongBladeTwoHand;
+        if (type == ESM::WeaponType::BluntOneHand)
+            return Kind::BluntOneHand;
+        if (type == ESM::WeaponType::BluntTwoClose)
+            return Kind::BluntTwoClose;
+        if (type == ESM::WeaponType::BluntTwoWide)
+            return Kind::BluntTwoWide;
+        if (type == ESM::WeaponType::SpearTwoWide)
+            return Kind::Spear;
+        if (type == ESM::WeaponType::AxeOneHand)
+            return Kind::AxeOneHand;
+        if (type == ESM::WeaponType::AxeTwoHand)
+            return Kind::AxeTwoHand;
+        return Kind::Other;
+    }
 
     struct LiveWeaponAttachment
     {
@@ -492,9 +681,14 @@ namespace MWPhysics
         bool mAttached = true;
         bool mCallbackArmed = true;
         std::optional<PassiveRagdollWeaponReleaseReason> mReleaseReason;
+        std::uint64_t mReleasedAtStep = 0; // the physics step of the release (K2_REGRIP)
         std::uint64_t mReleaseRequests = 0;
         std::uint64_t mReleaseCount = 0;
         JPH::Vec3 mBladeAxis = JPH::Vec3::sAxisY();
+        // The same direction (grip to tip) in the frame of the bone the
+        // weapon mesh hangs on; zero when no mesh was measured. The renderer's
+        // frame for the blood on the weapon (BLADE-BLOOD-01).
+        osg::Vec3f mTipInMount;
         JPH::Vec3 mEdgeAxis = JPH::Vec3::sAxisX();
         JPH::Vec3 mFlatAxis = JPH::Vec3::sAxisZ();
         bool mUsesBladeSurface = false;
@@ -507,6 +701,13 @@ namespace MWPhysics
         // A spear's hands are ~40 units apart; tip control stretched that
         // grip past a unit in 12% of dragged steps, so it keeps hand control.
         bool mWideSpearGrip = false;
+        bool mWideStaffGrip = false; // a staff (BluntTwoWide): K2_HAFT_LINES
+        // K2_SPEAR_GRIP: the weapon sits this far (model units) toward its
+        // tip from where the animation holds it; mCenterFromHand has it, the
+        // renderer is given it (getWeaponGripTurns).
+        float mGripShift = 0.0f;
+        float mPaceWeight = 0; // the weight it is paced at (K2_PACE_FLOOR)
+        float mCrossInertia = 0; // the built body's across its long axis, kg u^2 (K2_HAND_EFFECTIVE_MASS)
         bool mShortBlade = false; // a dagger or short sword (ShortBladeOneHand)
         // A bow, crossbow or thrown weapon: a body in the hand, but no striker
         // (PassiveRagdollEntry::rangedWeaponDrawn).
@@ -880,6 +1081,7 @@ namespace MWPhysics
         JPH::Vec3 offset(0, fallbackLength * 0.44f, 0);
         bool meshBounds = false;
         bool templateBounds = false;
+        osg::Matrix mountToHand; // the measured mesh's bone frame into the hand's
 #ifdef OPENMW_RAGDOLL_DEV_API
         std::uint64_t geometryTraceId = 0;
         const char* hullOption = RagdollCore::tuningText("OPENMW_RAGDOLL_WEAPON_HULL");
@@ -918,6 +1120,10 @@ namespace MWPhysics
                 {
                     auto parentPath = weaponPaths.front();
                     parentPath.pop_back(); // the visitor applies weaponNode's transform
+                    // The renderer's own wrapper (a reversed or shifted grip
+                    // as drawn) is not the weapon's authored place.
+                    while (!parentPath.empty() && parentPath.back()->getName() == "KINETIC grip turn")
+                        parentPath.pop_back();
                     osg::Matrix toHand = osg::computeLocalToWorld(parentPath)
                         * osg::Matrix::inverse(osg::computeLocalToWorld(handPaths.front()));
                     osg::ComputeBoundsVisitor visitor;
@@ -929,6 +1135,7 @@ namespace MWPhysics
                     Log(Debug::Info) << "RAGDOLL_WEAPON_BOUNDS record=" << recordId << " valid=" << bounds.valid()
                                     << " size=" << size.x() << ',' << size.y() << ',' << size.z();
                     meshBounds = useBounds(bounds);
+                    mountToHand = toHand;
 #ifdef OPENMW_RAGDOLL_DEV_API
                     if (meshBounds)
                         geometryTraceId = traceWeaponGeometry(*weaponNode, toHand, recordId,
@@ -970,6 +1177,7 @@ namespace MWPhysics
                             visitor.setNodeMaskOverride(~0u);
                             root->accept(visitor);
                             meshBounds = templateBounds = useBounds(visitor.getBoundingBox());
+                            mountToHand = attachment->getMatrix();
 #ifdef OPENMW_RAGDOLL_DEV_API
                             if (meshBounds)
                                 geometryTraceId = traceWeaponGeometry(*root, osg::Matrix::identity(), recordId,
@@ -990,18 +1198,35 @@ namespace MWPhysics
         const auto axisVector = [](unsigned axis) {
             return axis == 0 ? JPH::Vec3::sAxisX() : axis == 1 ? JPH::Vec3::sAxisY() : JPH::Vec3::sAxisZ();
         };
-        const JPH::Vec3 bladeAxis = axisVector(axes[0]) * (offset[axes[0]] < 0 ? -1.0f : 1.0f);
+        const JPH::Vec3 bladeAxis
+            = axisVector(axes[0]) * RagdollCore::weaponTipSign(offset[axes[0]], halfExtents[axes[0]], k2TipSide());
         const float weaponLength = halfExtents[axes[0]] * 2 / UnitModel::UnitsPerMeter;
         const float weaponWidth = halfExtents[axes[1]] * 2 / UnitModel::UnitsPerMeter;
         const float gripToCenter = offset.Length() / UnitModel::UnitsPerMeter;
         Log(Debug::Info) << "RAGDOLL_WEAPON_PROXY record=" << recordId
                         << " source=" << (templateBounds ? "mesh_template" : meshBounds ? "mesh" : "reach_fallback")
                         << " length=" << UnitModel::fromMeters(weaponLength) << " long_axis=" << axes[0]
+                        << " tip_sign=" << bladeAxis[axes[0]]
                         << " center=" << offset.GetX() << ',' << offset.GetY() << ',' << offset.GetZ()
                         << " half_extents=" << halfExtents.GetX() << ',' << halfExtents.GetY() << ','
                         << halfExtents.GetZ();
         for (auto& body : profile.mBodies)
             body.mMassFraction *= actorMass / totalMass;
+
+        // K2_SPEAR_GRIP: the spear moved through the hand toward its point,
+        // the support hand's place (21 behind) and a hand's width kept on the
+        // haft. The mesh's points stay about the measured centre.
+        const JPH::Vec3 meshCentre = offset;
+        float gripShift = 0.0f;
+        if (record && spearHandled(record->mData.mType) && k2SpearGrip()[0] > 0.0f)
+        {
+            const float butt = halfExtents[axes[0]] - offset.Dot(bladeAxis);
+            const float point = halfExtents[axes[0]] + offset.Dot(bladeAxis);
+            gripShift = std::clamp(std::min(k2SpearGrip()[0], k2SpearGrip()[1] - point), 0.0f, std::max(0.0f, butt - 28.0f));
+            offset += bladeAxis * gripShift;
+            Log(Debug::Info) << "RAGDOLL_WEAPON_GRIP record=" << recordId << " shift=" << gripShift
+                            << " butt_behind_hand=" << butt - gripShift;
+        }
 
         SkeletonBone bone;
         bone.mName = "equipped_weapon";
@@ -1027,9 +1252,18 @@ namespace MWPhysics
             // Same body origin and grip anchors. Exact mesh points replace
             // empty AABB volume; shape-derived inertia keeps the original mass.
             weapon.mShape.mType = ShapeType::ConvexHull;
+            // A haft (spear, staff) only with the switch's third value: without
+            // the roll floor an iron spear's chop bent the wrist 21-24 deg past
+            // its limit (0 with the hull's own, FLOW-01 2 runs each).
+            weapon.mShape.mBoundsInertia = k2WeaponBoxInertia()[0] > 0.0f
+                && (k2WeaponBoxInertia()[2] > 0.0f
+                    || !(record
+                        && (record->mData.mType == ESM::WeaponType::SpearTwoWide
+                            || record->mData.mType == ESM::WeaponType::BluntTwoWide)));
+            weapon.mShape.mRollInertiaFloor = weapon.mShape.mBoundsInertia ? k2WeaponBoxInertia()[1] : 0.0f;
             weapon.mShape.mPoints.reserve(hullPoints.size());
             for (const auto& point : hullPoints)
-                weapon.mShape.mPoints.push_back(point - offset);
+                weapon.mShape.mPoints.push_back(point - meshCentre);
             Log(Debug::Info) << "RAGDOLL_WEAPON_HULL record=" << std::quoted(recordId)
                             << " points=" << hullPoints.size() << " geometry_id=" << geometryTraceId;
         }
@@ -1156,6 +1390,19 @@ namespace MWPhysics
         const auto built = buildRagdollSettings(skeleton, profile, options);
         if (!built.isValid())
             return std::nullopt;
+        float builtCrossInertia = 0.0f;
+        {
+            const auto& part = built.mSettings->mParts[profile.mBodies.size() - 1];
+            const auto mass = part.GetMassProperties();
+            builtCrossInertia = 0.5f * (mass.mInertia(axes[1], axes[1]) + mass.mInertia(axes[2], axes[2]));
+            const JPH::Vec3 com = part.GetShape()->GetCenterOfMass();
+            const auto& I = mass.mInertia;
+            Log(Debug::Info) << "RAGDOLL_WEAPON_MASS record=" << recordId << " mass=" << mass.mMass
+                             << " com=" << com.GetX() << ',' << com.GetY() << ',' << com.GetZ() << " inertia="
+                             << I(0, 0) << ',' << I(1, 1) << ',' << I(2, 2) << " off=" << I(0, 1) << ','
+                             << I(0, 2) << ',' << I(1, 2)
+                             << " box_across=" << weaponMass * weaponLength * weaponLength / 12.0f;
+        }
         const auto& parts = built.mSettings->mParts;
         for (const std::size_t joint : arm)
         {
@@ -1222,6 +1469,13 @@ namespace MWPhysics
         attached.mGeometryTraceId = geometryTraceId;
 #endif
         attached.mBladeAxis = bladeAxis;
+        if (osg::Matrix handToMount; meshBounds && handToMount.invert(mountToHand))
+        {
+            attached.mTipInMount = osg::Matrix::transform3x3(Misc::Convert::toOsg(bladeAxis), handToMount);
+            attached.mTipInMount.normalize();
+        }
+        attached.mGripShift = gripShift;
+        attached.mCrossInertia = builtCrossInertia;
         attached.mEdgeAxis = axisVector(axes[1]);
         attached.mFlatAxis = axisVector(axes[2]);
         if (record)
@@ -1236,9 +1490,16 @@ namespace MWPhysics
                 && (record->mData.mType == ESM::WeaponType::LongBladeTwoHand
                     || record->mData.mType == ESM::WeaponType::BluntTwoClose
                     || record->mData.mType == ESM::WeaponType::AxeTwoHand);
-            attached.mWideSpearGrip = record->mData.mType == ESM::WeaponType::SpearTwoWide;
+            // K2_STAFF_AS_SPEAR: a staff takes every spear path from here on
+            // (mWideSpearGrip is what the hand control reads); its pace
+            // weight and wound profile below stay the staff's.
+            attached.mWideSpearGrip = spearHandled(record->mData.mType);
+            attached.mWideStaffGrip = record->mData.mType == ESM::WeaponType::BluntTwoWide
+                && !attached.mWideSpearGrip;
             attached.mShortBlade = record->mData.mType == ESM::WeaponType::ShortBladeOneHand;
             attached.mRanged = type->mWeaponClass != ESM::WeaponType::Melee;
+            attached.mPaceWeight = RagdollCore::pacedWeaponWeight(
+                itemWeight, pacedWeaponKind(record->mData.mType), k2PaceFloor());
             using WoundClass = RagdollCore::WoundClass;
             const auto& weaponType = record->mData.mType;
             if (weaponType == ESM::WeaponType::ShortBladeOneHand || weaponType == ESM::WeaponType::LongBladeOneHand
@@ -1804,6 +2065,71 @@ namespace MWPhysics
         }
     }
 
+    // OPENMW_RAGDOLL_K2_LOCKOUT (registry): the share every attack/guard
+    // lockout is written at (clash knockaway, broken guard, disarm, the
+    // bearings after a hit, K2_CLASH_OPEN's open guard); 1 = as before.
+    float k2LockoutShare()
+    {
+        static const auto value_tuned = RagdollCore::tuned<float>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_LOCKOUT");
+            const float value = text ? static_cast<float>(std::atof(text)) : 1.0f;
+            return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 1.0f;
+        });
+        return value_tuned.get();
+    }
+
+    // OPENMW_RAGDOLL_K2_BLOW_PRESS (registry) = "on, body share, mass cap kg"
+    // (RagdollCore::BlowPressSettings; 0 = off).
+    const RagdollCore::BlowPressSettings& k2BlowPress()
+    {
+        static const auto value_tuned = RagdollCore::tuned<RagdollCore::BlowPressSettings>([] {
+            RagdollCore::BlowPressSettings value;
+            float on = 0.0f, share = 0.0f, cap = value.mMassCap;
+            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_BLOW_PRESS"))
+                std::sscanf(text, "%f,%f,%f", &on, &share, &cap);
+            value.mOn = std::isfinite(on) && on > 0.0f;
+            value.mBodyShare = std::isfinite(share) ? std::clamp(share, 0.0f, 1.0f) : 0.0f;
+            value.mMassCap = std::isfinite(cap) ? std::clamp(cap, 0.4f, 75.0f) : value.mMassCap;
+            return value;
+        });
+        return value_tuned.get();
+    }
+
+    // OPENMW_RAGDOLL_K2_LODGE (registry) = "stab, chop, pass" (each 1 or 0;
+    // RagdollCore::LodgeSettings; 0,0,0 = off).
+    const RagdollCore::LodgeSettings& k2Lodge()
+    {
+        static const auto value_tuned = RagdollCore::tuned<RagdollCore::LodgeSettings>([] {
+            RagdollCore::LodgeSettings value;
+            float stab = 0.0f, chop = 0.0f, pass = 0.0f;
+            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_LODGE"))
+                std::sscanf(text, "%f,%f,%f", &stab, &chop, &pass);
+            value.mStab = stab > 0.0f;
+            value.mChop = chop > 0.0f;
+            value.mPass = pass > 0.0f;
+            return value;
+        });
+        return value_tuned.get();
+    }
+
+// OPENMW_RAGDOLL_K2_PUSH_KICK (registry) = "on, body share at Hand-to-hand 0,
+    // added at 100, Strength cap, carry share, carry cap u/s, recoil share,
+    // felling carry u/s"
+    // (RagdollCore::PushKickSettings; 0 = KICK-01's push).
+    const RagdollCore::PushKickSettings& k2PushKick()
+    {
+        static const auto value_tuned = RagdollCore::tuned<RagdollCore::PushKickSettings>([] {
+            RagdollCore::PushKickSettings value;
+            float on = 0.0f;
+            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_PUSH_KICK"))
+                std::sscanf(text, "%f,%f,%f,%f,%f,%f,%f,%f", &on, &value.mBodyBase, &value.mBodySkill,
+                    &value.mStrengthCap, &value.mCarry, &value.mCarryCap, &value.mRecoil, &value.mFell);
+            value.mOn = std::isfinite(on) && on > 0.0f;
+            return value;
+        });
+        return value_tuned.get();
+    }
+
 #include "passiveragdollentry.inl"
 
     struct PassiveRagdollMotionHistory
@@ -1853,7 +2179,7 @@ namespace
 
         RagdollCore::MotionPose result;
         result.mRootTransform.mTranslation = Misc::Convert::toJolt<JPH::Vec3>(position);
-        result.mRootTransform.mRotation = Misc::Convert::toJolt(actor.getRotation());
+        result.mRootTransform.mRotation = Misc::Convert::toJolt(limpActorRotation(ptr, actor));
         result.mUniformScale = scale.x();
         result.mBodyTransforms = std::move(bodyTransforms);
         return result;
@@ -1963,6 +2289,29 @@ namespace MWPhysics
         const char* path = RagdollCore::tuningText("OPENMW_RAGDOLL_SETTINGS");
         if (path != nullptr && *path != '\0')
             load(std::filesystem::path(path), true);
+        // The values the game plays with fill whatever is still unset, so a
+        // run without a launcher or settings file plays the released game
+        // (RagdollCore::playDefaults). The scripted tests skip them with
+        // OPENMW_RAGDOLL_PLAY_DEFAULTS=0 and keep the code's own fallbacks.
+        if (const char* play = std::getenv("OPENMW_RAGDOLL_PLAY_DEFAULTS"); play == nullptr || std::atoi(play) != 0)
+        {
+            int applied = 0;
+            for (const RagdollCore::PlayDefault& entry : RagdollCore::playDefaults())
+            {
+                const std::string key(entry.mName);
+                if (std::getenv(key.c_str()) != nullptr)
+                    continue;
+                const std::string value(entry.mValue);
+#ifdef _WIN32
+                _putenv_s(key.c_str(), value.c_str());
+#else
+                setenv(key.c_str(), value.c_str(), 0);
+#endif
+                ++applied;
+            }
+            Log(Debug::Info) << "Ragdoll settings: " << applied << " of " << RagdollCore::playDefaults().size()
+                             << " play defaults";
+        }
         // The options page's sliders win over all of it (applied at once).
         MWLua::loadKineticTuning();
         RagdollCore::refreshTuning();
@@ -1983,6 +2332,7 @@ namespace MWPhysics
         , mParentNode(std::move(parentNode))
         , mPhysicsDt(1.f / 60.f)
     {
+        sRagdollDataFiles = resourceSystem->getVFS();
         loadRagdollSettingsFile();
         mResourceSystem->addResourceManager(mShapeManager.get());
 
@@ -2091,6 +2441,7 @@ namespace MWPhysics
     PhysicsSystem::~PhysicsSystem()
     {
         Log(Debug::Info) << "Destroying physics system...";
+        Log(Debug::Info) << "RAGDOLL_PATHS " << RagdollCore::pathCountReport();
 
         mResourceSystem->removeResourceManager(mShapeManager.get());
         mWaterInstance.reset();
@@ -2821,13 +3172,49 @@ namespace MWPhysics
                 const bool changed = equippedId != entry.mEquippedWeaponAtCreation
                     || shieldId != entry.mEquippedShieldAtCreation;
                 const bool unready = handControl && readyNow && !entry.mBuiltReady && !equippedId.empty();
-                if ((changed || unready)
-                    && !entry.mSwing.mSwinging && !entry.mAiStrikeActive
-                    && !entry.mSwingInput.mHeld && !entry.mHitStun.active() && entry.mControllerOutput
-                    && entry.mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Standing
-                    && entry.mRagdoll->isRootKinematic())
+                // K2_REGRIP (registry): a broken grip on the weapon still equipped.
+                static const auto regripAfter_tuned = RagdollCore::tuned<float>([] {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_REGRIP");
+                    return text ? static_cast<float>(std::atof(text)) : 0.0f;
+                });
+                RagdollCore::RegripInput regripIn;
+                if (entry.mWeapon && !entry.mWeapon->mAttached)
+                {
+                    regripIn.mReleased = true;
+                    regripIn.mBroke = entry.mWeapon->mReleaseReason == PassiveRagdollWeaponReleaseReason::Break;
+                    regripIn.mStillEquipped = !equippedId.empty() && equippedId == entry.mWeapon->mRecordId;
+                    regripIn.mSinceRelease
+                        = static_cast<float>(mJoltStepSerial - entry.mWeapon->mReleasedAtStep) * mPhysicsDt;
+                }
+                const bool regrip = RagdollCore::regripAfterRelease(regripIn, regripAfter_tuned.get());
+                RagdollCore::RebuildInput rebuildIn;
+                rebuildIn.mRigChanged = changed;
+                rebuildIn.mUnready = unready;
+                rebuildIn.mRegrip = regrip;
+                rebuildIn.mBusy = entry.mSwing.mSwinging || entry.mAiStrikeActive || entry.mSwingInput.mHeld
+                    || entry.mHitStun.active();
+                rebuildIn.mStanding = entry.mControllerOutput
+                    && entry.mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Standing;
+                rebuildIn.mRootKinematic = entry.mRagdoll->isRootKinematic();
+                const bool rebuild = RagdollCore::rebuildForRig(rebuildIn);
+                if (rebuild)
                 {
                     const auto damage = entry.mRegionDamage;
+                    // The rebuilt body keeps the standing pelvis height the old
+                    // one learned. A fresh tracker learns it only standing still
+                    // on supported feet; until then no upright control, so the
+                    // body took the idle drive, the legs never stepped and the
+                    // feet hung off the floor with the root carrying the whole
+                    // weight - the user's "stuck in a frame" (11-03: every
+                    // freeze over 1.5 s began at a rebuild, 1.5-18 s, "unstuck
+                    // after stopping"). OPENMW_RAGDOLL_REBUILD_KEEPS_HEIGHT=0
+                    // = the old rule.
+                    static const auto keepsHeight_tuned = RagdollCore::tuned<bool>([] {
+                        const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_REBUILD_KEEPS_HEIGHT");
+                        return !text || std::atoi(text) != 0;
+                    });
+                    const auto heightTracker = entry.mPelvisHeightTracker;
+                    const auto heightOutput = entry.mPelvisHeightOutput;
                     {
                         std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
                         erasePassiveRagdoll(ptr.mRef, PassiveRagdollWeaponReleaseReason::Unequip);
@@ -2845,8 +3232,23 @@ namespace MWPhysics
                         if (unready)
                             Log(Debug::Info) << "RAGDOLL_READY_REBUILD actor=" << ptr.getCellRef().getRefId()
                                              << " weapon=" << equippedId << " drawn_for=" << drawnFor;
+                        if (regrip)
+                            Log(Debug::Info) << "RAGDOLL_WEAPON_REGRIP actor=" << ptr.getCellRef().getRefId()
+                                             << " weapon=" << equippedId << " after=" << regripIn.mSinceRelease
+                                             << " attached="
+                                             << (replacement.mWeapon && replacement.mWeapon->mAttached ? 1 : 0);
                         for (std::size_t region = 0; region < damage.size(); ++region)
                             replacement.addRegionDamage(static_cast<RagdollCore::AnatomicalRegion>(region), damage[region]);
+                        const bool keepsHeight = RagdollCore::rebuildKeepsHeight(
+                            keepsHeight_tuned.get(), heightOutput.mTargetHeight.has_value());
+                        if (keepsHeight)
+                        {
+                            replacement.mPelvisHeightTracker = heightTracker;
+                            replacement.mPelvisHeightOutput = heightOutput;
+                        }
+                        Log(Debug::Info) << "RAGDOLL_REBUILD actor=" << ptr.getCellRef().getRefId()
+                                         << " kept_height=" << (keepsHeight_tuned.get() && heightOutput.mTargetHeight)
+                                         << " height=" << heightOutput.mTargetHeight.value_or(-1.0f);
                     }
                     else if (const auto actor = mActors.find(ptr.mRef); actor != mActors.end())
                         actor->second->enableCollisionBody(true);
@@ -2967,6 +3369,93 @@ namespace MWPhysics
         return done;
     }
 
+    // Corpse motion (user 11-03: "the corpses move"): RAGDOLL_CORPSE_BUILD at
+    // every limp build (deaths and cell loads) and RAGDOLL_CORPSE_TRACE every
+    // 0.5 s of a corpse's first 12 s: where its root body and its actor are,
+    // how fast it still moves and how far it is drawn off its physics.
+    // OPENMW_RAGDOLL_CORPSE_TRACE=1 (unset = off).
+    static bool corpseTrace()
+    {
+        static const auto trace_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CORPSE_TRACE");
+            return text && std::atoi(text) != 0;
+        });
+        return trace_tuned.get();
+    }
+
+    // The carry and the drag a death uses (ragdollcore lifecycle deathMotion):
+    // - OPENMW_RAGDOLL_DEATH_CARRY_TRUE_CAP=1 (unset = off): the parts keep
+    //   their share of motion off the body's own mean, not off the capped
+    //   common velocity, which leaked the whole-body motion past the cap
+    //   (corpse motion, 11-03: 15 + 0.15 x 185 = 43 u/s at a 200 u/s death);
+    // - OPENMW_RAGDOLL_DEATH_DRAG = "rate, seconds" (3, 2.5; 0 = off): the
+    //   corpse's common horizontal velocity drained at `rate` per second
+    //   (10-30 play: the pelvis slid a median 32 u, 86 at p90, in the first
+    //   1.5 s dead);
+    // - OPENMW_RAGDOLL_K2_DEATH_MOMENTUM (registry) replaces both with the
+    //   body's real motion.
+    // `carryVelocity` is DEATH_CARRY_VELOCITY's "share, cap".
+    static RagdollCore::DeathMotion deathMotionSettings(const std::array<float, 2>& carryVelocity)
+    {
+        static const auto trueCap_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DEATH_CARRY_TRUE_CAP");
+            return text && std::atoi(text) != 0;
+        });
+        static const auto deathDrag_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+            std::array<float, 2> value{ 3.0f, 2.5f };
+            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DEATH_DRAG"))
+                std::sscanf(text, "%f,%f", &value[0], &value[1]);
+            return value;
+        });
+        static const auto momentum_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+            std::array<float, 3> value{ 0.0f, 0.0f, 0.0f };
+            RagdollCore::tuningList("OPENMW_RAGDOLL_K2_DEATH_MOMENTUM", value);
+            return value;
+        });
+        RagdollCore::DeathMotion old;
+        old.mCarry = { carryVelocity[0], carryVelocity[1], trueCap_tuned.get() };
+        old.mDragRate = deathDrag_tuned.get()[0];
+        old.mDragSeconds = deathDrag_tuned.get()[1];
+        return RagdollCore::deathMotion(old, momentum_tuned.get());
+    }
+
+    // How far a body is drawn from its physics: the largest distance, over
+    // its bodies, between a body's bone where the scene graph draws it and
+    // where `pose` puts it (units; -1 = no bone found). The root bone alone
+    // cannot show a corpse drawn turned about its actor, which lies under it.
+    static float drawnOffPhysics(const PassiveRagdollEntry& entry, const RagdollCore::RagdollPose& pose,
+        const RagdollCore::RagdollProfile* profile)
+    {
+        MWRender::Animation* animation = MWBase::Environment::get().getWorld()->getAnimation(entry.getPtr());
+        if (!animation || !profile || !entry.mRagdoll)
+            return -1.0f;
+        float worst = -1.0f;
+        const std::size_t count
+            = std::min({ entry.mRagdoll->getBodyCount(), profile->mBodies.size(), pose.mBodyTransforms.size() });
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const osg::Node* bone = animation->getNode(profile->mBodies[i].mBone);
+            const auto placed = entry.mRagdoll->getWorldBodyPosition(pose, i);
+            if (!bone || !placed || bone->getParentalNodePaths().empty())
+                continue;
+            const osg::Vec3f drawn = osg::computeLocalToWorld(bone->getParentalNodePaths().front()).getTrans();
+            worst = std::max(
+                worst, (drawn - Misc::Convert::toOsg(*placed - JPH::RVec3(entry.mRenderShift))).length());
+        }
+        return worst;
+    }
+
+    // OPENMW_RAGDOLL_K2_DEATH_LIMITS (registry): the seconds a corpse's
+    // opened joints take to close, 0 = off.
+    static float deathLimitSeconds()
+    {
+        static const auto seconds_tuned = RagdollCore::tuned<float>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_DEATH_LIMITS");
+            return text ? std::max(0.0f, static_cast<float>(std::atof(text))) : 0.0f;
+        });
+        return seconds_tuned.get();
+    }
+
     bool PhysicsSystem::addPassiveRagdoll(const MWWorld::Ptr& ptr, SceneUtil::Skeleton& skeleton, bool force)
     {
         // A physical death (OPENMW_RAGDOLL_DEATH_PHYSICAL): the powered body
@@ -3002,6 +3491,23 @@ namespace MWPhysics
             return !(text && std::atoi(text) == 0);
         });
         static const auto& carry = carry_tuned.get();
+        // K2_DEATH_JOINTS: the corpse is built on the living body's joints.
+        static const auto deathJoints_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_DEATH_JOINTS");
+            return text && std::atof(text) > 0.0;
+        });
+        std::optional<LivingBuild> living;
+        // K2_DEATH_DRAW: the pose the living body is drawn in this frame, by
+        // body, and its drawn root bone in the world.
+        std::map<std::string, RagdollCore::Transform> livingDrawn;
+        const auto drawnRoot = [&]() -> std::optional<osg::Matrixf> {
+            MWRender::Animation* animation = MWBase::Environment::get().getWorld()->getAnimation(ptr);
+            const osg::Node* bone = animation ? animation->getNode("bip01 pelvis") : nullptr;
+            if (!bone || bone->getParentalNodePaths().empty())
+                return std::nullopt;
+            return osg::Matrixf(osg::computeLocalToWorld(bone->getParentalNodePaths().front()));
+        };
+        std::optional<osg::Matrixf> livingRoot;
         if (const auto existing = mPassiveRagdolls.find(ptr.mRef); existing != mPassiveRagdolls.end())
         {
             if (!existing->second->mPowered)
@@ -3010,6 +3516,17 @@ namespace MWPhysics
             const PassiveRagdollEntry& old = *existing->second;
             const RagdollCore::RagdollProfile* profile
                 = old.mRuntimeProfile ? old.mRuntimeProfile.get() : mPassiveRagdollProfile.get();
+            if (carry && old.mRagdoll && profile && deathJoints_tuned.get() && !old.mReplayCreationSkeleton.mBones.empty())
+                living = LivingBuild{ old.mReplayCreationSkeleton, old.mFrameKey, old.mFramesFromStanding };
+            if (living && old.mPoseBinding)
+            {
+                std::vector<RagdollCore::Transform> pose;
+                if (old.mPoseBinding->captureEvaluatedPose(pose))
+                    for (std::size_t i = 0;
+                         i < pose.size() && i < old.mPoseBindingBodyCount && i < profile->mBodies.size(); ++i)
+                        livingDrawn[profile->mBodies[i].mName] = pose[i];
+                livingRoot = drawnRoot();
+            }
             if (carry && old.mRagdoll && profile)
             {
                 JPH::BodyInterface& bodies = mPhysicsSystem.GetBodyInterface();
@@ -3025,7 +3542,9 @@ namespace MWPhysics
             }
             erasePassiveRagdoll(ptr.mRef, PassiveRagdollWeaponReleaseReason::Death);
         }
-        const bool added = addRagdoll(ptr, skeleton, false);
+        if (carried.empty())
+            living.reset();
+        const bool added = addRagdoll(ptr, skeleton, false, living ? &*living : nullptr);
         if (added && !carried.empty())
         {
             std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
@@ -3059,14 +3578,17 @@ namespace MWPhysics
                         std::sscanf(text, "%f,%f", &value[0], &value[1]);
                     return value;
                 });
-                static const auto& carryVelocity = carryVelocity_tuned.get();
-                JPH::Vec3 common = JPH::Vec3::sZero();
+                static const auto& carryVelocityOld = carryVelocity_tuned.get();
+                const RagdollCore::DeathMotion deathMotion = deathMotionSettings(carryVelocityOld);
+                const bool trueCap = deathMotion.mCarry.mTrueCap;
+                std::vector<JPH::Vec3> parts;
+                parts.reserve(carried.size());
                 for (const auto& [name, state] : carried)
-                    common += state.mLinear;
-                if (!carried.empty())
-                    common /= static_cast<float>(carried.size());
-                if (carryVelocity[1] > 0.0f && common.Length() > carryVelocity[1])
-                    common = common.Normalized() * carryVelocity[1];
+                    parts.push_back(state.mLinear);
+                const RagdollCore::DeathCarry k2Carry = RagdollCore::deathCarry(parts, deathMotion.mCarry);
+                const JPH::Vec3 common = k2Carry.mCommon;
+                const JPH::Vec3 uncapped = k2Carry.mUncapped;
+                JPH::Vec3 carriedSum = JPH::Vec3::sZero();
                 for (std::size_t i = 0; profile && i < fresh.mRagdoll->getBodyCount() && i < profile->mBodies.size(); ++i)
                 {
                     const auto found = carried.find(profile->mBodies[i].mName);
@@ -3074,33 +3596,213 @@ namespace MWPhysics
                         continue;
                     const JPH::BodyID id = fresh.mRagdoll->getBodyId(i);
                     snap = std::max(snap, static_cast<float>((bodies.GetPosition(id) - found->second.mPosition).Length()));
-                    const JPH::Vec3 linear = common + (found->second.mLinear - common) * carryVelocity[0];
+                    const JPH::Vec3 linear = k2Carry.linear(found->second.mLinear);
                     bodies.SetPositionRotationAndVelocity(id, found->second.mPosition, found->second.mRotation,
-                        linear, found->second.mAngular * carryVelocity[0]);
+                        linear, k2Carry.angular(found->second.mAngular));
+                    carriedSum += linear;
                     ++placed;
                 }
                 Log(Debug::Info) << "RAGDOLL_DEATH_CARRY actor=" << ptr.getCellRef().getRefId() << " bodies=" << placed
-                                 << " snap_avoided=" << snap << " common_speed=" << common.Length();
+                                 << " snap_avoided=" << snap << " common_speed=" << common.Length()
+                                 << " uncapped_speed=" << uncapped.Length() << " carried_speed="
+                                 << (placed > 0 ? (carriedSum / static_cast<float>(placed)).Length() : 0.0f)
+                                 << " true_cap=" << trueCap << " living_joints=" << (living ? 1 : 0)
+                                 << " drag=" << deathMotion.mDragRate;
+                // K2_DEATH_JOINTS draws the corpse from the physics at once,
+                // and the poses it draws from were captured at the build, in
+                // the build skeleton's standing pose (`snap_avoided` away,
+                // 94-128 u on 11-12): the corpse was drawn standing on the
+                // swap's frame and between standing and lying until the next
+                // step (user 11-12: the hand-off "pops or snaps"). They are
+                // taken again from the placed bodies.
+                if (living && placed > 0)
+                {
+                    PassiveRagdollEntry& drawn = *created->second;
+                    drawn.mCurrentPhysicsPoseCaptured = drawn.mRagdoll->captureModelPose(drawn.mCurrentPhysicsPose);
+                    if (drawn.mCurrentPhysicsPoseCaptured)
+                    {
+                        drawn.mPreviousPhysicsPose = drawn.mCurrentPhysicsPose;
+                        drawn.mRenderPose = drawn.mCurrentPhysicsPose;
+                    }
+                    // K2_DEATH_DRAW (registry): this swap runs after the
+                    // frame's poses were written to the skeletons. The living
+                    // body's binding put the animation's pose (the death clip)
+                    // back on the bones as it was destroyed, and the corpse's
+                    // writes nothing before the next frame's update: the
+                    // swap's frame drew the death clip at the actor, the next
+                    // one the corpse on the floor (user 11-17: not "a
+                    // continuous motion", "it almost looks like it rotates
+                    // 180"). The corpse's binding is given the pose the living
+                    // body was drawn in this frame (the physics pose where a
+                    // body of it is missing), so this frame draws what the
+                    // last one led to and the next continues from the swap's
+                    // step.
+                    static const auto deathDraw_tuned = RagdollCore::tuned<bool>([] {
+                        const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_DEATH_DRAW");
+                        return text && std::atof(text) > 0.0;
+                    });
+                    int swapDrawn = 0; // 2 = the living body's drawn pose, 1 = the physics pose
+                    if (deathDraw_tuned.get() && drawn.mCurrentPhysicsPoseCaptured && drawn.mPoseBinding && profile
+                        && drawn.mRenderPose.mBodyTransforms.size() >= drawn.mPoseBindingBodyCount)
+                    {
+                        std::vector<RagdollCore::Transform> pose(drawn.mRenderPose.mBodyTransforms.begin(),
+                            drawn.mRenderPose.mBodyTransforms.begin()
+                                + static_cast<std::ptrdiff_t>(drawn.mPoseBindingBodyCount));
+                        std::vector<RagdollCore::Transform> asLiving = pose;
+                        bool whole = pose.size() <= profile->mBodies.size();
+                        for (std::size_t i = 0; whole && i < asLiving.size(); ++i)
+                        {
+                            const auto found = livingDrawn.find(profile->mBodies[i].mName);
+                            whole = found != livingDrawn.end();
+                            if (whole)
+                                asLiving[i] = found->second;
+                        }
+                        if (whole && drawn.mPoseBinding->applyPose(asLiving))
+                            swapDrawn = 2;
+                        else if (drawn.mPoseBinding->applyPose(pose))
+                            swapDrawn = 1;
+                    }
+                    // What this frame draws against what the living body drew:
+                    // the root bone's move and turn over the swap, and the
+                    // farthest any bone is from its corpse body.
+                    if (const auto corpseRoot = drawnRoot(); corpseRoot && livingRoot)
+                    {
+                        const osg::Quat before = livingRoot->getRotate();
+                        const osg::Quat after = corpseRoot->getRotate();
+                        const double lengths = before.length() * after.length();
+                        const double along = lengths > 0.0
+                            ? std::abs(before.x() * after.x() + before.y() * after.y() + before.z() * after.z()
+                                  + before.w() * after.w()) / lengths
+                            : 1.0;
+                        Log(Debug::Info) << "RAGDOLL_DEATH_SWAP actor=" << ptr.getCellRef().getRefId()
+                                         << " drawn=" << swapDrawn << " drawn_moved="
+                                         << (corpseRoot->getTrans() - livingRoot->getTrans()).length()
+                                         << " drawn_turned_deg="
+                                         << osg::RadiansToDegrees(2.0 * std::acos(std::min(1.0, along)))
+                                         << " body_off="
+                                         << drawnOffPhysics(drawn, drawn.mCurrentPhysicsPose, profile);
+                    }
+                    // K2_DEATH_LIMITS (ragdollcore lifecycle): the joints the
+                    // placed bodies hold outside the corpse's ranges start in
+                    // ranges opened to hold them (stepDeathLimits closes them).
+                    {
+                        constexpr float outsideFrom = 0.03f; // radians: a joint resting on its limit is inside
+                        const float seconds = deathLimitSeconds();
+                        int outside = 0;
+                        float worst = 0.0f;
+                        std::string worstBody = "-";
+                        for (std::size_t i = 0; i < drawn.mRagdoll->getBodyCount(); ++i)
+                        {
+                            const auto joint = drawn.mRagdoll->getJointRange(i);
+                            if (!joint)
+                                continue;
+                            const float excess = RagdollCore::jointExcess(joint->first, joint->second);
+                            if (!(excess > outsideFrom))
+                                continue;
+                            ++outside;
+                            if (excess > worst)
+                            {
+                                worst = excess;
+                                worstBody = profile && i < profile->mBodies.size() ? profile->mBodies[i].mName : "?";
+                            }
+                            if (!(seconds > 0.0f))
+                                continue;
+                            const RagdollCore::JointRange opened
+                                = RagdollCore::deathRangeOpened(joint->first, joint->second);
+                            if (drawn.mRagdoll->setJointRange(i, opened))
+                                drawn.mDeathLimits.push_back({ i, joint->first, opened });
+                        }
+                        drawn.mDeathLimitsTime = 0.0f;
+                        Log(Debug::Info) << "RAGDOLL_DEATH_LIMITS actor=" << ptr.getCellRef().getRefId()
+                                         << " outside=" << outside << " opened=" << drawn.mDeathLimits.size()
+                                         << " worst=" << worstBody << " worst_deg=" << osg::RadiansToDegrees(worst)
+                                         << " seconds=" << seconds;
+                    }
+                }
                 created->second->mDeathWatchStart = created->second->mRagdoll->getBodyCount() > 0
                     ? std::optional(bodies.GetCenterOfMassPosition(fresh.mRagdoll->getBodyId(0)))
                     : std::nullopt;
                 created->second->mDeathWatchStep = mJoltStepSerial;
                 created->second->mDeathWatchActorStart = ptr.getRefData().getPosition().asVec3();
-                // The corpse's slide (10-30 play: the pelvis travelled a median
-                // 32 units, 86 at p90, in the first 1.5 s dead, with only 15 u/s
-                // carried): the body's common horizontal velocity is drained
-                // at `rate` per second for `seconds`; the limbs keep their own
-                // motion, so it still crumples and falls as before.
-                // OPENMW_RAGDOLL_DEATH_DRAG = "rate, seconds" (0 = off).
-                static const auto deathDrag_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                    std::array<float, 2> value{ 3.0f, 2.5f };
-                    if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DEATH_DRAG"))
-                        std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                    return value;
-                });
-                const auto& deathDrag = deathDrag_tuned.get();
-                created->second->mDeathDragSteps = deathDrag[0] > 0.0f && mPhysicsDt > 0.0f
-                    ? static_cast<int>(deathDrag[1] / mPhysicsDt) : 0;
+                // The death drag (deathMotionSettings): steps left of it.
+                created->second->mDeathDragSteps
+                    = RagdollCore::deathDragSteps(deathMotion.mDragRate, deathMotion.mDragSeconds, mPhysicsDt);
+            }
+        }
+        // A corpse rebuilt with nothing carried (a cell load or saved game)
+        // came from the skeleton's standing pose and fell again: 26 of 26
+        // such builds in the 11-03 play started with the pelvis 76 units up,
+        // and one guard slid 415 units. It is laid on its back on the floor
+        // under it instead, at rest. OPENMW_RAGDOLL_CORPSE_LOAD_POSE=1
+        // (unset = off).
+        static const auto loadPose_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CORPSE_LOAD_POSE");
+            return text && std::atoi(text) != 0;
+        });
+        if (added && carried.empty() && loadPose_tuned.get() && ptr.getClass().isActor()
+            && ptr.getClass().getCreatureStats(ptr).isDead()
+            && ptr.getClass().getCreatureStats(ptr).isDeathAnimationFinished())
+        {
+            std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
+            if (const auto created = mPassiveRagdolls.find(ptr.mRef); created != mPassiveRagdolls.end()
+                && created->second->mRagdoll && created->second->mRagdoll->getBodyCount() > 0
+                && created->second->mSurfaceQuery)
+            {
+                const auto& ragdoll = *created->second->mRagdoll;
+                JPH::BodyInterface& bodies = mPhysicsSystem.GetBodyInterface();
+                const JPH::RVec3 root = bodies.GetCenterOfMassPosition(ragdoll.getBodyId(0));
+                const auto floor
+                    = created->second->mSurfaceQuery(root + JPH::RVec3(0.0, 0.0, 10.0), -JPH::Vec3::sAxisZ(), 400.0f);
+                // Only a body still standing: one already low was laid by its
+                // own pose.
+                std::optional<RagdollCore::CorpseLoadPose> k2Pose;
+                if (floor)
+                {
+                    const ESM::Position& at = ptr.getRefData().getPosition();
+                    k2Pose = RagdollCore::corpseLoadPose(
+                        at.rot[2], JPH::RVec3(at.pos[0], at.pos[1], 0.0), root, floor->first.GetZ());
+                }
+                if (k2Pose)
+                {
+                    for (std::size_t i = 0; i < ragdoll.getBodyCount(); ++i)
+                    {
+                        const JPH::BodyID id = ragdoll.getBodyId(i);
+                        JPH::RVec3 position;
+                        JPH::Quat rotation;
+                        bodies.GetPositionAndRotation(id, position, rotation);
+                        bodies.SetPositionRotationAndVelocity(id, k2Pose->place(position, root),
+                            k2Pose->turn(rotation), JPH::Vec3::sZero(), JPH::Vec3::sZero());
+                    }
+                    const JPH::Vec3 offActor(bodies.GetCenterOfMassPosition(ragdoll.getBodyId(0)) - k2Pose->mPivot);
+                    Log(Debug::Info) << "RAGDOLL_CORPSE_LOAD_POSE actor=" << ptr.getCellRef().getRefId()
+                                     << " was_above_floor=" << root.GetZ() - floor->first.GetZ()
+                                     << " root_off_actor_xy=" << std::hypot(offActor.GetX(), offActor.GetY());
+                }
+            }
+        }
+        // A limp build with nothing carried (a cell load or saved game: the
+        // body is rebuilt from the skeleton's pose) starts as high as that
+        // pose holds it: pelvis_above_floor near standing height is a corpse
+        // that falls again.
+        if (added && corpseTrace())
+        {
+            std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
+            if (const auto created = mPassiveRagdolls.find(ptr.mRef); created != mPassiveRagdolls.end()
+                && created->second->mRagdoll && created->second->mRagdoll->getBodyCount() > 0)
+            {
+                const JPH::RVec3 root = mPhysicsSystem.GetBodyInterface().GetCenterOfMassPosition(
+                    created->second->mRagdoll->getBodyId(0));
+                float above = -1.0f;
+                if (created->second->mSurfaceQuery)
+                    if (const auto floor = created->second->mSurfaceQuery(
+                            root + JPH::RVec3(0.0, 0.0, 10.0), -JPH::Vec3::sAxisZ(), 400.0f))
+                        above = static_cast<float>(root.GetZ() - floor->first.GetZ());
+                const bool dead = ptr.getClass().isActor() && ptr.getClass().getCreatureStats(ptr).isDead();
+                Log(Debug::Info) << "RAGDOLL_CORPSE_BUILD actor=" << ptr.getCellRef().getRefId()
+                                 << " serial=" << created->second->mSerial << " carried=" << !carried.empty()
+                                 << " force=" << force << " dead=" << dead << " death_anim_done="
+                                 << (dead && ptr.getClass().getCreatureStats(ptr).isDeathAnimationFinished())
+                                 << " pelvis_above_floor=" << above;
             }
         }
         return added;
@@ -3149,7 +3851,8 @@ namespace MWPhysics
         return releaseWeapon(*found->second, reason);
     }
 
-    bool PhysicsSystem::addRagdoll(const MWWorld::Ptr& ptr, SceneUtil::Skeleton& skeleton, bool powered)
+    bool PhysicsSystem::addRagdoll(
+        const MWWorld::Ptr& ptr, SceneUtil::Skeleton& skeleton, bool powered, const LivingBuild* living)
     {
         if (!powered && Settings::game().mPassiveRagdollCap <= 0)
             return false;
@@ -3184,7 +3887,7 @@ namespace MWPhysics
         buildOptions.mUniformScale = scale.x();
         buildOptions.mRootPosition = Misc::Convert::toJolt<JPH::RVec3>(ptr.getRefData().getPosition().asVec3());
         buildOptions.mRootRotation = Misc::Convert::toJolt(
-            powered ? poweredActorRotation(ptr) : foundActor->second->getRotation());
+            powered ? poweredActorRotation(ptr) : limpActorRotation(ptr, *foundActor->second));
         // A powered body is a fighter and has to be able to reach another
         // one; a corpse is debris and should keep touching nothing but the
         // floor. Choosing here rather than switching later means a body never
@@ -3200,79 +3903,19 @@ namespace MWPhysics
         if (powered)
         {
             runtimeProfile = std::make_unique<RagdollCore::RagdollProfile>(*profile);
-            const auto findProfileBody = [&](const std::string& name) -> RagdollCore::BodyProfile* {
-                for (auto& body : runtimeProfile->mBodies)
-                    if (body.mName == name) return &body;
-                return nullptr;
-            };
-            const auto findBone = [&](const std::string& name) -> const RagdollCore::Transform* {
-                for (const auto& bone : creationSkeleton.mBones)
-                    if (bone.mName == name) return &bone.mModelTransform;
-                return nullptr;
-            };
-            for (const auto& handName : { profile->mLandmarks.mLeftHand, profile->mLandmarks.mRightHand })
-            {
-                auto* hand = handName ? findProfileBody(*handName) : nullptr;
-                auto* lower = hand && hand->mParentBody ? findProfileBody(*hand->mParentBody) : nullptr;
-                auto* upper = lower && lower->mParentBody ? findProfileBody(*lower->mParentBody) : nullptr;
-                if (!upper || !lower->mConstraint || !lower->mConstraint->mDeriveFrameFromSkeleton
-                    || lower->mConstraint->mType != RagdollCore::ConstraintType::Hinge)
-                    continue;
-                const auto* a = findBone(upper->mBone);
-                const auto* b = findBone(lower->mBone);
-                const auto* c = findBone(hand->mBone);
-                if (!a || !b || !c || !RagdollCore::setAnatomicalHingeFrame(*lower->mConstraint,
-                        *a, *b, *c, upper->mCenterOfMass, lower->mCenterOfMass))
-                {
-                    Log(Debug::Warning) << "Powered ragdoll creation failed: invalid elbow frame for "
-                                        << ptr.getCellRef().getRefId();
-                    return false;
-                }
-            }
             bool anatomicalKnees = true;
 #ifdef OPENMW_RAGDOLL_DEV_API
             if (const char* option = RagdollCore::tuningText("OPENMW_RAGDOLL_ANATOMICAL_KNEES"))
                 anatomicalKnees = std::string_view(option) != "0";
 #endif
-            if (profile->mActiveController.mLocomotionRoute == RagdollCore::LocomotionRoute::KinematicRoot
-                && anatomicalKnees)
+            // The elbows' and knees' anatomical frames (shared with StrideSim).
+            if (const auto failed = RagdollCore::applyAnatomicalFrames(*runtimeProfile, creationSkeleton,
+                    profile->mActiveController.mLocomotionRoute == RagdollCore::LocomotionRoute::KinematicRoot
+                        && anatomicalKnees))
             {
-                std::array<std::array<RagdollCore::BodyProfile*, 3>, 2> legs;
-                std::size_t side = 0;
-                for (const auto& footName : { profile->mLandmarks.mLeftFoot, profile->mLandmarks.mRightFoot })
-                {
-                    auto* foot = footName ? findProfileBody(*footName) : nullptr;
-                    auto* lower = foot && foot->mParentBody ? findProfileBody(*foot->mParentBody) : nullptr;
-                    auto* upper = lower && lower->mParentBody ? findProfileBody(*lower->mParentBody) : nullptr;
-                    if (!upper || !lower->mConstraint)
-                        return false;
-                    legs[side++] = { upper, lower, foot };
-                }
-                const auto* leftHip = findBone(legs[0][0]->mBone);
-                const auto* rightHip = findBone(legs[1][0]->mBone);
-                if (!leftHip || !rightHip)
-                    return false;
-                const JPH::Vec3 lateral = rightHip->mTranslation - leftHip->mTranslation;
-                for (const auto& leg : legs)
-                {
-                    auto* upper = leg[0];
-                    auto* lower = leg[1];
-                    auto* foot = leg[2];
-                    // Authored frames retain their owner. Correct only the
-                    // generic frame that otherwise calls this bent pose zero.
-                    if (!lower->mConstraint->mDeriveFrameFromSkeleton)
-                        continue;
-                    const auto* a = findBone(upper->mBone);
-                    const auto* b = findBone(lower->mBone);
-                    const auto* c = findBone(foot->mBone);
-                    if (!a || !b || !c || !RagdollCore::setAnatomicalHingeFrame(*lower->mConstraint,
-                            *a, *b, *c, upper->mCenterOfMass, lower->mCenterOfMass, -1.0f, lateral))
-                    {
-                        Log(Debug::Warning) << "Powered ragdoll creation failed: invalid anatomical knee frame for "
-                                            << ptr.getCellRef().getRefId();
-                        return false;
-                    }
-                }
+                Log(Debug::Warning) << "Powered ragdoll creation failed: invalid " << (*failed == "elbow" ? "elbow" : "anatomical knee")
+                                    << " frame for " << ptr.getCellRef().getRefId();
+                return false;
             }
             creationProfile = runtimeProfile.get();
             // Joint frames from a standing pose (user 11-01 bookmarks 5-11,
@@ -3287,85 +3930,31 @@ namespace MWPhysics
             // and used by every later build. Arms keep the build pose (the
             // weapon arm was tuned on it). No standing pose seen yet: the
             // build pose, as before. OPENMW_RAGDOLL_BUILD_FRAMES=0 = off.
-            static const auto buildFrames_tuned = RagdollCore::tuned<bool>([] {
+            // Only a neutral stance stands for the frames (11-05, the player's
+            // "always walking with its heels"): a session loaded with fists or
+            // a weapon up captured the fighting stance's bent knees and flexed
+            // ankles as every same-rig body's zero, and the planted foot walked
+            // 25 deg toe-up (median; 70 at p90) for the whole session, where a
+            // plain-idle NPC caught first gave 0 to -10. Nothing drawn and not
+            // sneaking (1, the game); 2 = any stance (before 11-05).
+            static const auto buildFrames_tuned = RagdollCore::tuned<int>([] {
                 const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_BUILD_FRAMES");
-                return !(text && std::atoi(text) == 0);
+                return text ? std::atoi(text) : 1;
             });
-            if (buildFrames_tuned.get())
+            if (buildFrames_tuned.get() != 0)
             {
-                const auto boneOfBody = [&](const std::string& bodyName) -> std::string {
-                    for (const auto& body : runtimeProfile->mBodies)
-                        if (body.mName == bodyName)
-                            return body.mBone;
-                    return {};
-                };
-                const auto parentOfBody = [&](const std::string& bodyName) -> std::string {
-                    for (const auto& body : runtimeProfile->mBodies)
-                        if (body.mName == bodyName && body.mParentBody)
-                            return *body.mParentBody;
-                    return {};
-                };
-                std::vector<std::string> frameBodies{ profile->mLandmarks.mPelvis };
-                frameBodies.insert(frameBodies.end(), profile->mLandmarks.mSpine.begin(), profile->mLandmarks.mSpine.end());
-                if (profile->mLandmarks.mHead)
-                    frameBodies.push_back(*profile->mLandmarks.mHead);
-                for (const auto& footName : { profile->mLandmarks.mLeftFoot, profile->mLandmarks.mRightFoot })
-                    if (footName)
-                    {
-                        const std::string calf = parentOfBody(*footName);
-                        frameBodies.insert(frameBodies.end(), { *footName, calf, parentOfBody(calf) });
-                    }
-                RagdollCore::SkeletonDescriptor frames;
-                frames.mId = creationSkeleton.mId;
-                // The skeleton's bones and leg lengths name it (the same rig at
-                // the same size shares one standing pose). Only thigh-calf and
-                // calf-foot: no joint between them, so the length does not
-                // change with the pose (across the neck it did, and a running
-                // build never found the standing one).
-                std::string key = creationSkeleton.mId;
-                for (const auto& bone : creationSkeleton.mBones)
-                    key += ";" + bone.mName;
-                for (const auto& footName : { profile->mLandmarks.mLeftFoot, profile->mLandmarks.mRightFoot })
-                    if (footName)
-                    {
-                        const std::string calf = parentOfBody(*footName);
-                        const auto* a = findBone(boneOfBody(parentOfBody(calf)));
-                        const auto* b = findBone(boneOfBody(calf));
-                        const auto* c = findBone(boneOfBody(*footName));
-                        if (a && b && c)
-                            key += ":" + std::to_string(std::lround((b->mTranslation - a->mTranslation).Length()))
-                                + "," + std::to_string(std::lround((c->mTranslation - b->mTranslation).Length()));
-                    }
-                for (const auto& bone : creationSkeleton.mBones)
-                {
-                    for (const std::string& body : frameBodies)
-                        if (!body.empty() && boneOfBody(body) == bone.mName)
-                        {
-                            frames.mBones.push_back(bone);
-                            frames.mBones.back().mParent = -1;
-                            break;
-                        }
-                }
-                const auto modelBone = [&](const std::optional<std::string>& body) -> const RagdollCore::Transform* {
-                    return body ? findBone(boneOfBody(*body)) : nullptr;
-                };
-                const RagdollCore::Transform* pelvis = findBone(boneOfBody(profile->mLandmarks.mPelvis));
-                const RagdollCore::Transform* left = modelBone(profile->mLandmarks.mLeftFoot);
-                const RagdollCore::Transform* right = modelBone(profile->mLandmarks.mRightFoot);
-                const RagdollCore::Transform* chest = profile->mLandmarks.mSpine.empty()
-                    ? nullptr : findBone(boneOfBody(profile->mLandmarks.mSpine.back()));
-                bool standing = pelvis && left && right && chest && foundActor->second->getOnGround()
+                // ragdollcore lifecycle's buildFrames.
+                const auto& frameStats = ptr.getClass().getCreatureStats(ptr);
+                const bool neutralStance = buildFrames_tuned.get() == 2
+                    || (frameStats.getDrawState() == MWMechanics::DrawState::Nothing
+                        && !frameStats.getStance(MWMechanics::CreatureStats::Stance_Sneak));
+                const bool onGroundStill = neutralStance && foundActor->second->getOnGround()
                     && foundActor->second->getQueuedVelocity().length2() < 1.0f;
-                if (standing)
-                {
-                    const auto flat = [](JPH::Vec3Arg a, JPH::Vec3Arg b) {
-                        return std::hypot(a.GetX() - b.GetX(), a.GetY() - b.GetY());
-                    };
-                    standing = flat(left->mTranslation, pelvis->mTranslation) < 15.0f
-                        && flat(right->mTranslation, pelvis->mTranslation) < 15.0f
-                        && std::abs(left->mTranslation.GetZ() - right->mTranslation.GetZ()) < 4.0f
-                        && flat(chest->mTranslation, pelvis->mTranslation) < 8.0f;
-                }
+                RagdollCore::BuildFrames k2Frames
+                    = RagdollCore::buildFrames(*profile, *runtimeProfile, creationSkeleton, onGroundStill);
+                RagdollCore::SkeletonDescriptor frames = std::move(k2Frames.mFrames);
+                const std::string key = std::move(k2Frames.mKey);
+                const bool standing = k2Frames.mStanding;
                 auto reference = mStandingFrameSkeletons.find(key);
                 const bool captured = standing && reference == mStandingFrameSkeletons.end();
                 if (captured)
@@ -3375,7 +3964,16 @@ namespace MWPhysics
                 frameKey = key;
                 Log(Debug::Info) << "RAGDOLL_BUILD_FRAMES actor=" << ptr.getCellRef().getRefId()
                                  << " standing=" << standing << " captured=" << captured
-                                 << " source=" << (buildOptions.mFrameSkeleton ? "standing" : "build");
+                                 << " source=" << (buildOptions.mFrameSkeleton ? "standing" : "build")
+                                 << " scale=" << buildOptions.mUniformScale << " mass=" << buildOptions.mTotalMass
+                                 << " model_scale=" << [&] {
+                                        osg::Vec3f s(1.0f, 1.0f, 1.0f);
+                                        ptr.getClass().adjustScale(ptr, s, true);
+                                        std::ostringstream text;
+                                        text << s.x() << "," << s.y() << "," << s.z();
+                                        return text.str();
+                                    }()
+                                 << " legs=" << key.substr(key.rfind(';') + 1);
             }
             // Diagnostics (2026-10-05): a body built before the weapon is at its
             // ready stance (drawn under 0.8 s), as play builds it mid-draw,
@@ -3502,6 +4100,35 @@ namespace MWPhysics
                         MWBase::Environment::get().getWorld()->getAnimation(ptr));
             }
         }
+        // K2_DEATH_JOINTS (ragdollcore lifecycle corpseBuild): a corpse carried
+        // over from a living body is built on that body's joints - its build
+        // skeleton, its standing frames and its anatomical elbows and knees -
+        // so the carried pose starts inside every limit. The weapon and shield
+        // bones the living build appended are not in this profile, so they
+        // are not built.
+        const RagdollCore::CorpseBuild corpse = RagdollCore::corpseBuild(living != nullptr, living != nullptr,
+            living != nullptr && !living->mSkeleton.mBones.empty(), profile->mPoseTransition.mDeathBlendDuration);
+        if (!powered && corpse.mLivingFrames)
+        {
+            auto corpseProfile = std::make_unique<RagdollCore::RagdollProfile>(*profile);
+            bool anatomicalKnees = true;
+#ifdef OPENMW_RAGDOLL_DEV_API
+            if (const char* option = RagdollCore::tuningText("OPENMW_RAGDOLL_ANATOMICAL_KNEES"))
+                anatomicalKnees = std::string_view(option) != "0";
+#endif
+            if (!RagdollCore::applyAnatomicalFrames(*corpseProfile, living->mSkeleton,
+                    profile->mActiveController.mLocomotionRoute == RagdollCore::LocomotionRoute::KinematicRoot
+                        && anatomicalKnees))
+            {
+                creationSkeleton = living->mSkeleton;
+                runtimeProfile = std::move(corpseProfile);
+                creationProfile = runtimeProfile.get();
+                if (living->mFramesFromStanding)
+                    if (const auto reference = mStandingFrameSkeletons.find(living->mFrameKey);
+                        reference != mStandingFrameSkeletons.end())
+                        buildOptions.mFrameSkeleton = &reference->second;
+            }
+        }
 
         RagdollCore::PassiveRagdollInitialState initialState;
         initialState.mActorMotion.mLinearVelocity
@@ -3566,11 +4193,33 @@ namespace MWPhysics
             entry->mMotorTargetPose = entry->mTransitionSourcePose;
             entry->mMotorTargetCaptured = true;
         }
-        entry->mModeTransitionDuration = profile->mPoseTransition.mDeathBlendDuration;
+        entry->mModeTransitionDuration = powered ? profile->mPoseTransition.mDeathBlendDuration : corpse.mBlendSeconds;
         const std::uint64_t userData = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(entry.get()));
         const JPH::CollisionGroup::GroupID group = mNextPassiveRagdollGroup++;
         if (mNextPassiveRagdollGroup == 0)
             mNextPassiveRagdollGroup = 1;
+
+        // The player's body as built, for StrideSim (MOVE-01 W1): the skeleton,
+        // its standing frames when it had them, the scale and the mass, once
+        // a run (the first powered build).
+        // OPENMW_RAGDOLL_SKELETON_DUMP=path (unset = off).
+        if (powered && ptr == MWMechanics::getPlayer())
+            if (const char* dumpPath = RagdollCore::tuningText("OPENMW_RAGDOLL_SKELETON_DUMP"); dumpPath && *dumpPath)
+            {
+                static bool dumped = false;
+                if (!dumped)
+                {
+                    RagdollCore::SkeletonDump dump;
+                    dump.mSkeleton = creationSkeleton;
+                    if (buildOptions.mFrameSkeleton)
+                        dump.mFrames = *buildOptions.mFrameSkeleton;
+                    dump.mUniformScale = buildOptions.mUniformScale;
+                    dump.mTotalMass = buildOptions.mTotalMass;
+                    dumped = RagdollCore::writeSkeletonDump(dumpPath, dump);
+                    Log(Debug::Info) << "RAGDOLL_SKELETON_DUMP path=" << dumpPath << " written=" << dumped
+                                     << " bones=" << creationSkeleton.mBones.size();
+                }
+            }
 
         std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
         RagdollCore::PassiveRagdollCreateResult created = RagdollCore::createPassiveRagdoll(
@@ -3909,7 +4558,7 @@ namespace MWPhysics
 
 #ifdef OPENMW_RAGDOLL_DEV_API
     std::uint64_t PhysicsSystem::stageWoundReceipt(const MWWorld::Ptr& ptr, std::string_view body, int kind,
-        const osg::Vec3f& point, const osg::Vec3f& normal)
+        const osg::Vec3f& point, const osg::Vec3f& normal, const MWWorld::Ptr& attacker, float weaponAlong)
     {
         // Native diagnostic seam: exercise the real Lua receipt, renderer and
         // controller without claiming the fixture is a measured weapon hit.
@@ -3939,9 +4588,23 @@ namespace MWPhysics
         const auto id = ++nextTestId;
         while (entry.mPendingWounds.size() >= 32)
             entry.mPendingWounds.erase(entry.mPendingWounds.begin());
+        // The attacker's side of the contact, when one is named: a point on
+        // its weapon (the receipt reads the blood's place from it).
+        std::uint64_t attackerIdentity = entry.mSerial + 1;
+        JPH::RVec3 contactPoint = Misc::Convert::toJolt<JPH::RVec3>(point);
+        if (const auto striker = attacker.isEmpty() ? mPassiveRagdolls.end() : mPassiveRagdolls.find(attacker.mRef);
+            striker != mPassiveRagdolls.end() && striker->second->mWeapon && striker->second->mWeapon->mAttached)
+        {
+            const auto& weapon = *striker->second->mWeapon;
+            const JPH::BodyID weaponId = striker->second->mRagdoll->getBodyId(weapon.mWeaponBody);
+            attackerIdentity = striker->second->mSerial;
+            contactPoint = bodies.GetCenterOfMassPosition(weaponId)
+                + bodies.GetRotation(weaponId)
+                    * (weapon.mBladeAxis * (weaponAlong * weapon.tipDistanceFromHand()) - weapon.mCenterFromHand);
+        }
         entry.mPendingWounds.emplace(id, PassiveRagdollEntry::PendingWound{ RagdollCore::WeaponContactEvent(
-            id, entry.mSerial + 1, entry.mSerial, "diagnostic", 0, bodyId.GetIndexAndSequenceNumber(),
-            mJoltStepSerial, id, true, Misc::Convert::toJolt<JPH::RVec3>(point),
+            id, attackerIdentity, entry.mSerial, "diagnostic", 0, bodyId.GetIndexAndSequenceNumber(),
+            mJoltStepSerial, id, true, contactPoint,
             -Misc::Convert::toJolt<JPH::Vec3>(normal), 1, 1, 1, index, region, entry.mSerial, wound) });
         return id;
     }
@@ -4030,32 +4693,63 @@ namespace MWPhysics
             {
                 ++entry.mWoundMarkCount;
                 // WOUNDFX FX4 (level 4): the blade that cut flesh or cloth
-                // carries the blood where it went in (0 grip .. 1 tip, the
-                // contact code's measure; the pose at the receipt).
+                // carries the blood where it went in (the pose at the receipt),
+                // 0 .. 1 from where the animation holds the mesh to its tip:
+                // the renderer's measure, so K2_SPEAR_GRIP's shift of the hand
+                // is taken out and it is told which way the tip is
+                // (BLADE-BLOOD-01: the renderer took the end further from the
+                // grip for the tip - a steel spear's butt, 72 against 65, and
+                // either end of an iron spear, 53.1 both ways).
                 const int surface = animation->getLastWoundSurface(); // 0 skin, 1 cloth, 2 armour
+                float bloodAlong = std::numeric_limits<float>::quiet_NaN();
+                bool bloodQueued = false;
                 const auto attacker = std::find_if(mPassiveRagdolls.begin(), mPassiveRagdolls.end(),
                     [&](const auto& c) { return c.second->mSerial == contact.attackerActorIdentity(); });
-                if ((surface == 0 || surface == 1) && wound.mKind != RagdollCore::WoundKind::Bruise
+                // A stab that hurt through armour leaves a little on the very
+                // point (user 11-16: "only a little bit of blood"); other
+                // hits on armour leave none.
+                const bool throughArmour
+                    = surface == 2 && wound.mKind == RagdollCore::WoundKind::Puncture && health > 0.0f;
+                if (((surface == 0 || surface == 1) ? wound.mKind != RagdollCore::WoundKind::Bruise : throughArmour)
                     && attacker != mPassiveRagdolls.end() && attacker->second->mWeapon
                     && attacker->second->mWeapon->mAttached && attacker->second->mWeapon->tipDistanceFromHand() > 1.0f)
                     if (auto* blade = MWBase::Environment::get().getWorld()->getAnimation(attacker->second->getPtr()))
                     {
                         const auto& weapon = *attacker->second->mWeapon;
                         const JPH::BodyID id = attacker->second->mRagdoll->getBodyId(weapon.mWeaponBody);
-                        const float along = (bodies.GetRotation(id).Conjugated()
-                                                    * JPH::Vec3(contact.point() - bodies.GetCenterOfMassPosition(id))
-                                                + weapon.mCenterFromHand)
-                                                .Dot(weapon.mBladeAxis)
-                            / weapon.tipDistanceFromHand();
+                        const float originToTip = weapon.tipDistanceFromHand() - weapon.mGripShift;
+                        const float along = ((bodies.GetRotation(id).Conjugated()
+                                                     * JPH::Vec3(contact.point() - bodies.GetCenterOfMassPosition(id))
+                                                 + weapon.mCenterFromHand)
+                                                    .Dot(weapon.mBladeAxis)
+                                                - weapon.mGripShift)
+                            / std::max(originToTip, 1.0f);
                         const float spread = 0.06f + 0.1f * std::min(severity, 1.0f);
                         const int bloodType = ptr.getType() == ESM::REC_NPC_ ? ptr.get<ESM::NPC>()->mBase->mBloodType
                             : ptr.getType() == ESM::REC_CREA ? ptr.get<ESM::Creature>()->mBase->mBloodType
                                                               : 0;
-                        if (std::isfinite(along))
-                            blade->addWeaponBlood(along - spread,
-                                wound.mKind == RagdollCore::WoundKind::Puncture ? 1.0f : along + spread,
-                                std::min(severity, 1.0f) * (surface == 1 ? 0.5f : 1.0f), bloodType);
+                        const bool puncture = wound.mKind == RagdollCore::WoundKind::Puncture;
+                        bloodAlong = along;
+                        // A stab bloodies the point whatever the pose at the
+                        // receipt says (a point already drawn back reads past 1).
+                        if (std::isfinite(along) && originToTip > 1.0f)
+                            bloodQueued = blade->addWeaponBlood(
+                                throughArmour ? 1.0f - spread
+                                    : puncture ? std::min(along - spread, 1.0f - 2.0f * spread)
+                                               : along - spread,
+                                puncture ? 1.0f : along + spread,
+                                std::min(severity, 1.0f) * (throughArmour ? 0.25f : surface == 1 ? 0.5f : 1.0f),
+                                bloodType,
+                                weapon.mTipInMount);
                     }
+                // Why a hit did or did not bloody the weapon (BLADE-BLOOD-01:
+                // the 11-16 spear bookmark's log could not say).
+                Log(Debug::Info) << "RAGDOLL_WEAPON_BLOOD victim=" << ptr.getCellRef().getRefId() << " kind="
+                                 << RagdollCore::woundKindName(wound.mKind) << " surface=" << surface
+                                 << " attacker_weapon="
+                                 << (attacker != mPassiveRagdolls.end() && attacker->second->mWeapon
+                                         && attacker->second->mWeapon->mAttached)
+                                 << " along=" << bloodAlong << " queued=" << bloodQueued;
             }
 
         // A pose flinch is local, and does not feed generic whole-body stun.
@@ -4277,8 +4971,10 @@ namespace MWPhysics
             return text ? std::max(0.0f, static_cast<float>(std::atof(text))) : 0.0f;
         });
         static const auto& balanceK = balanceK_tuned.get();
+        // A push that throws the whole body (Blow::mBodyCarry) counts in full.
+        const float carry = std::isfinite(blow.mBodyCarry) ? std::max(0.0f, blow.mBodyCarry) : 0.0f;
         const float bandImpulse = balanceK > 0.0f && bodyMass > 0.0f
-            ? pushed / bodyMass * balanceK : blow.mReactionImpulse;
+            ? (pushed / bodyMass + carry) * balanceK : blow.mReactionImpulse;
         // A physical contact is a hit like any other: its reaction impulse
         // goes to the victim's banding so it flinches, staggers or falls by
         // where it was struck, and the kinematic root is pushed a bounded few
@@ -4291,7 +4987,7 @@ namespace MWPhysics
         if (!blow.mLocalizedWound || reactAll)
         {
             victim.registerBlowV2(bandImpulse, canKnockDown,
-                balanceK > 0.0f && bodyMass > 0.0f ? pushed / bodyMass : -1.0f);
+                balanceK > 0.0f && bodyMass > 0.0f ? pushed / bodyMass + carry : -1.0f);
             victim.noteKnockingBlow(blow.mDirection, canKnockDown);
             if (!blow.mBlocked)
                 victim.beginDaze(blow.mRegion, blow.mReactionImpulse);
@@ -4337,6 +5033,21 @@ namespace MWPhysics
         if (lever.Length() > leverCap)
             lever *= leverCap / lever.Length();
         bodies.AddImpulse(struck, normal * pushed, centre + lever);
+        JPH::Vec3 carried = JPH::Vec3::sZero();
+        if (carry > 0.0f)
+        {
+            // Along the ground from the attacker, a little up so the feet come free.
+            const JPH::Vec3 flat = JPH::Vec3(blow.mAttackerToVictim.GetX(), blow.mAttackerToVictim.GetY(), 0.0f)
+                                       .NormalizedOr(JPH::Vec3(normal.GetX(), normal.GetY(), 0.0f).NormalizedOr(normal));
+            carried = (flat + JPH::Vec3(0.0f, 0.0f, 0.12f)).Normalized() * carry;
+            for (std::size_t i = 0; i < masses.size() && i < victim.mRagdoll->getBodyCount(); ++i)
+                if (!victim.isDetachedWeaponBody(i))
+                    bodies.AddLinearVelocity(victim.mRagdoll->getBodyId(i),
+                        carried
+                            * RagdollCore::bodyCarryShare(i < victim.mBodyRegions.size()
+                                    ? victim.mBodyRegions[i]
+                                    : RagdollCore::AnatomicalRegion::Unknown));
+        }
         {
             // V2: the reaction controller reads what the push did to the
             // body's momentum; it gives the struck chain, snaps, reflexes
@@ -4347,7 +5058,8 @@ namespace MWPhysics
                 if (!victim.isDetachedWeaponBody(i))
                     weighted += bodies.GetCenterOfMassPosition(victim.mRagdoll->getBodyId(i)) * masses[i];
             const JPH::RVec3 com = bodyMass > 0.0f ? weighted / bodyMass : centre;
-            const auto reaction = victim.onBlowV2(blow, normal * pushed, com, bodyMass, masses[blow.mBodyIndex]);
+            const auto reaction
+                = victim.onBlowV2(blow, normal * pushed + carried * bodyMass, com, bodyMass, masses[blow.mBodyIndex]);
             victim.rollVanillaKnockdown(blow, reaction.mTier);
             // A blow on the weapon arm knocks the weapon off line (WEAPON_KNOCK).
             const bool weaponArm = blow.mRegion == RagdollCore::AnatomicalRegion::RightHand
@@ -4366,7 +5078,8 @@ namespace MWPhysics
         if (react[4] > 0.0f && blow.mRegion == RagdollCore::AnatomicalRegion::Head
             && victim.getPtr() != MWMechanics::getPlayer() && blow.mApproachSpeed >= react[4] && victim.mHscActive
             && victim.mAttackStage != PassiveRagdollEntry::AttackStage::Wind
-            && victim.mAttackStage != PassiveRagdollEntry::AttackStage::Cut && !victim.mGuardActive)
+            && victim.mAttackStage != PassiveRagdollEntry::AttackStage::Cut && !victim.mGuardActive
+            && !victim.mArmStrain.spent())
         {
             victim.mGuardActive = true;
             victim.mGuardStartPhysicsStep = mJoltStepSerial;
@@ -4414,8 +5127,16 @@ namespace MWPhysics
         if (!entry.updateGraspCollisionFilters(false, true))
             entry.failPoweredControl(__LINE__);
         weapon.mReleaseReason = reason;
+        weapon.mReleasedAtStep = mJoltStepSerial;
         ++weapon.mReleaseCount;
         ++mWeaponReleases;
+        // Every release, with the grip joint's last measured impulses against
+        // its break limits (a break is the only release the body does itself).
+        Log(Debug::Info) << "RAGDOLL_WEAPON_RELEASE actor=" << entry.getPtr().getCellRef().getRefId()
+                         << " weapon=" << weapon.mRecordId << " reason=" << weaponReleaseReasonName(reason)
+                         << " linear=" << weapon.mLastLinearImpulse << "/" << weapon.mLinearBreakImpulse
+                         << " angular=" << weapon.mLastAngularImpulse << "/" << weapon.mAngularBreakImpulse
+                         << " step=" << mJoltStepSerial;
         if (weapon.mCallbackArmed)
         {
             weapon.mCallbackArmed = false;
@@ -4523,37 +5244,13 @@ namespace MWPhysics
             return value;
         });
         const auto& settings = settings_tuned.get();
-        // Steep ground walks vanilla too (user 11-01 playthrough: the guard
-        // after Jiub "walks very weirdly and also cant get on the ramp", the
-        // prison ship's 40 deg ramp; RAMP-01): an AI-walked body's swing foot
-        // lifts 2 u at most (the player's 9), scuffs into a ramp's lip and the
-        // body braces there; the feet leash then holds the capsule, so NPC_STUCK
-        // fires late or, while the AI shuffles aside, never (powered guard 2 of
-        // 3 stalled, deck 10.8-35.6 s; vanilla 8.3 s). A powered NPC out of
-        // combat whose ground under the capsule - or, walking, `ahead` units
-        // ahead - is steeper than `degrees` is unpowered before it stalls, and
-        // powered again (as NPC_STUCK: 300 units on or 6 s still) only off
-        // the steep ground. Ordinary hills (Balmora's ~30 deg) stay physical.
-        // OPENMW_RAGDOLL_NPC_STEEP = "degrees, ahead u" (0 = off).
-        static const auto steep_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-            std::array<float, 2> value{ 0.0f, 35.0f };
-            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_NPC_STEEP"))
-                std::sscanf(text, "%f,%f", &value[0], &value[1]);
-            return value;
-        });
-        const auto& steep = steep_tuned.get();
-        if (!(settings[0] > 0.0f) && !(steep[0] > 0.0f))
+        if (!(settings[0] > 0.0f))
             return;
-        const float steepUp = std::cos(osg::DegreesToRadians(std::clamp(steep[0], 0.0f, 89.0f)));
-        const auto steepAt = [&](const MWWorld::Ptr& ptr, const osg::Vec3f& at) {
-            const auto hit = castRay(at + osg::Vec3f(0.0f, 0.0f, 40.0f), at - osg::Vec3f(0.0f, 0.0f, 80.0f), { ptr }, {},
-                MWPhysics::Layers::WORLD | MWPhysics::Layers::HEIGHTMAP);
-            return hit.mHit && hit.mHitNormal.valid() && hit.mHitNormal.z() < steepUp;
-        };
         const double now
             = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
         const MWWorld::Ptr player = MWMechanics::getPlayer();
-        std::vector<std::pair<MWWorld::Ptr, bool>> stuck; // the actor, let go by NPC_STEEP
+        std::vector<MWWorld::Ptr> stuck;
+        std::vector<MWWorld::Ptr> refalling;
         for (const auto& [ref, entry] : mPassiveRagdolls)
         {
             if (!entry->mPowered)
@@ -4567,22 +5264,35 @@ namespace MWPhysics
                 mStuckWatch.erase(ref);
                 continue;
             }
+            // K2_NPC_REFALL (registry): down again right after a get-up, again
+            // and again (a steep cave slope): the vanilla capsule, until it
+            // has walked on.
+            {
+                static const auto refall_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                    std::array<float, 2> v{ 0.0f, 60.0f };
+                    RagdollCore::tuningList("OPENMW_RAGDOLL_K2_NPC_REFALL", v);
+                    return v;
+                });
+                const auto& refall = refall_tuned.get();
+                if (refall[0] >= 1.0f)
+                {
+                    const std::uint64_t window = static_cast<std::uint64_t>(std::max(1.0f, refall[1]) * 60.0f);
+                    unsigned recent = 0;
+                    for (const std::uint64_t step : entry->mRefallSteps)
+                        if (entry->mFixedSteps - step <= window)
+                            ++recent;
+                    if (recent >= static_cast<unsigned>(refall[0]))
+                    {
+                        refalling.push_back(ptr);
+                        continue;
+                    }
+                }
+            }
             // Its own walking request (the movement settings are cleared
             // by the character controller before this reads them).
             const osg::Vec3f request(
                 entry->mRawTargetHorizontalVelocity.GetX(), entry->mRawTargetHorizontalVelocity.GetY(), 0.0f);
-            if (steep[0] > 0.0f)
-            {
-                const osg::Vec3f position = ptr.getRefData().getPosition().asVec3();
-                if (steepAt(ptr, position)
-                    || (request.length() >= 20.0f && steepAt(ptr, position + request * (steep[1] / request.length()))))
-                {
-                    Log(Debug::Info) << "RAGDOLL_NPC_STEEP actor=" << ptr.getCellRef().getRefId() << " vanilla=1";
-                    stuck.emplace_back(ptr, true);
-                    continue;
-                }
-            }
-            if (!(settings[0] > 0.0f) || request.length() < 20.0f)
+            if (request.length() < 20.0f)
             {
                 mStuckWatch.erase(ref);
                 continue;
@@ -4595,15 +5305,26 @@ namespace MWPhysics
                 continue;
             }
             if (now - found->second.mSince >= settings[0])
-                stuck.emplace_back(ptr, false);
+                stuck.push_back(ptr);
         }
-        for (const auto& [ptr, steepLetGo] : stuck)
+        for (const MWWorld::Ptr& ptr : stuck)
         {
             Log(Debug::Info) << "RAGDOLL_NPC_STUCK actor=" << ptr.getCellRef().getRefId() << " vanilla=1";
             mStuckWatch.erase(ptr.mRef);
             removePassiveRagdoll(ptr);
             mStuckSuspended[ptr.mRef] = { ptr.getRefData().getPosition().asVec3(), -1.0,
-                ptr.getRefData().getPosition().asVec3(), steepLetGo };
+                ptr.getRefData().getPosition().asVec3() };
+            if (const auto actor = mActors.find(ptr.mRef); actor != mActors.end())
+                actor->second->enableCollisionBody(true);
+        }
+        for (const MWWorld::Ptr& ptr : refalling)
+        {
+            Log(Debug::Info) << "RAGDOLL_NPC_REFALL actor=" << ptr.getCellRef().getRefId() << " vanilla=1";
+            mStuckWatch.erase(ptr.mRef);
+            removePassiveRagdoll(ptr);
+            StuckWatch watch{ ptr.getRefData().getPosition().asVec3(), -1.0, ptr.getRefData().getPosition().asVec3() };
+            watch.mWalkOnOnly = true;
+            mStuckSuspended[ptr.mRef] = watch;
             if (const auto actor = mActors.find(ptr.mRef); actor != mActors.end())
                 actor->second->enableCollisionBody(true);
         }
@@ -4630,15 +5351,9 @@ namespace MWPhysics
                 it->second.mSince = now;
             }
             const bool walkedOn = (position - it->second.mAnchor).length() >= 300.0f;
-            const bool settled = now - it->second.mSince >= 6.0;
-            // NPC_STEEP: never powered again on the steep ground itself, and
-            // only standing still (2 s): powered mid-stride where the ramp
-            // ends, the guard fell at once (RAMP-01, 1 of 2).
-            if (steep[0] > 0.0f && (steepAt(ptr, position) || (it->second.mSteep && now - it->second.mSince < 2.0)))
-            {
-                ++it;
-                continue;
-            }
+            // A body that kept falling where it stood comes back only once it
+            // has left the spot.
+            const bool settled = !it->second.mWalkOnOnly && now - it->second.mSince >= 6.0;
             const MWRender::Animation* animation = MWBase::Environment::get().getWorld()->getAnimation(ptr);
             if ((walkedOn || settled) && animation != nullptr && animation->getSkeleton() != nullptr
                 && addPoweredRagdoll(ptr, *animation->getSkeleton()))
@@ -4797,19 +5512,33 @@ namespace MWPhysics
                 std::sscanf(text, "%f,%f,%f", &value[0], &value[1], &value[2]);
             return value;
         });
+        // A powered body with no controller is stranded too (user 11-03
+        // bookmark 1, "I was downed and im stuck on the floor": a weapon-ready
+        // rebuild built the body from a pose with the feet 21-26 units off the
+        // floor, the root was let go on its first frame, the controller never
+        // ran, and the body lay on the floor for 22 s until the player had
+        // walked 150 units away). OPENMW_RAGDOLL_STRANDED_UNDRIVEN=0 = only
+        // the distance rule.
+        static const auto undrivenRule_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_STRANDED_UNDRIVEN");
+            return !text || std::atoi(text) != 0;
+        });
         if (const auto& stranded = stranded_tuned.get(); stranded[0] > 0.0f)
         {
             const MWWorld::Ptr self = MWMechanics::getPlayer();
             const auto found = self.isEmpty() ? mPassiveRagdolls.end() : mPassiveRagdolls.find(self.mRef);
             bool apart = false;
+            bool undriven = false;
             if (found != mPassiveRagdolls.end() && found->second->mRagdoll
                 && found->second->mRagdoll->getBodyCount() > 0 && !self.getClass().getCreatureStats(self).isDead())
             {
                 const osg::Vec3f body = Misc::Convert::toOsg(
                     mPhysicsSystem.GetBodyInterface().GetCenterOfMassPosition(found->second->mRagdoll->getBodyId(0)));
                 const osg::Vec3f actor = self.getRefData().getPosition().asVec3();
+                undriven = undrivenRule_tuned.get() && found->second->mPowered && !found->second->mControllerOutput
+                    && !found->second->mRagdoll->isRootKinematic();
                 apart = osg::Vec2f(body.x() - actor.x(), body.y() - actor.y()).length() > stranded[0]
-                    || body.z() < actor.z() - stranded[1];
+                    || body.z() < actor.z() - stranded[1] || undriven;
                 // Not in a jump's flight: a cell load hitch in an Icarian
                 // Flight jump (ICARIAN-01 acro 1000, 5000 u/s) left the body
                 // 300-575 units behind for 2 s while it caught up, and the
@@ -4826,6 +5555,7 @@ namespace MWPhysics
             else if (now - mStrandedSince >= stranded[2])
             {
                 Log(Debug::Info) << "RAGDOLL_STRANDED actor=player powered=" << found->second->mPowered
+                                 << " undriven=" << undriven << " fault=" << found->second->mPoweredControlFailureLine
                                  << " repower=1";
                 mStrandedSince = -1.0;
                 removePassiveRagdoll(self);
@@ -4906,56 +5636,87 @@ namespace MWPhysics
         if (player.isEmpty())
             return;
         const osg::Vec3f playerPosition = player.getRefData().getPosition().asVec3();
-        // Hysteresis: acquire close, release farther out, so an actor pacing
-        // the boundary does not flip between the two states every frame. The
-        // budget bounds the solver cost until the population policy is tuned.
-        constexpr float acquireRadius = 2000.0f;
-        constexpr float releaseRadius = 3500.0f;
-        constexpr std::size_t maximumPowered = 10;
-        std::vector<MWWorld::Ptr> release;
-        std::size_t poweredCount = 0;
+        // Which NPCs have bodies: ragdollcore npcpopulation (OPENMW_RAGDOLL_NPC_BODIES,
+        // count and radius, live from the options page). The player's body is not counted.
+        static const auto limits_tuned
+            = RagdollCore::tuned<RagdollCore::NpcPopulationLimits>([] { return RagdollCore::npcPopulationLimits(); });
+        const RagdollCore::NpcPopulationLimits& limits = limits_tuned.get();
+        std::vector<MWWorld::Ptr> ptrs;
+        std::vector<RagdollCore::NpcPopulationCandidate> candidates;
+        const auto distanceTo = [&](const MWWorld::Ptr& ptr) {
+            return (ptr.getRefData().getPosition().asVec3() - playerPosition).length();
+        };
         for (const auto& [ref, entry] : mPassiveRagdolls)
         {
             if (!entry->mPowered)
                 continue;
-            ++poweredCount;
             const MWWorld::Ptr& ptr = entry->getPtr();
-            if (ptr.isEmpty() || ptr == player)
+            if (ptr == player)
                 continue;
-            const bool dead
-                = !ptr.getClass().isActor() || ptr.getClass().getCreatureStats(ptr).isDead();
-            const float distance = (ptr.getRefData().getPosition().asVec3() - playerPosition).length();
-            if (dead || distance > releaseRadius)
-                release.push_back(ptr);
+            RagdollCore::NpcPopulationCandidate candidate;
+            candidate.mId = ptrs.size();
+            candidate.mPowered = true;
+            // A physical death in progress (DEATH_PHYSICAL) keeps its body
+            // until the death makes it the corpse: released as a dead actor's,
+            // the dying body was dropped and the corpse rebuilt standing from
+            // the animation pose with nothing carried, then laid flat (11-06,
+            // CORPSE-01: RAGDOLL_CORPSE_LOAD_POSE 1.4 s after every death).
+            if (ptr.isEmpty() || entry->mDying)
+                candidate.mHeld = true;
+            else
+            {
+                candidate.mEligible = ptr.getClass().isActor() && !ptr.getClass().getCreatureStats(ptr).isDead();
+                candidate.mDistance = distanceTo(ptr);
+                candidate.mPinned = mPinnedBodies.contains(ref);
+            }
+            ptrs.push_back(ptr);
+            candidates.push_back(candidate);
         }
-        for (const MWWorld::Ptr& ptr : release)
-        {
-            removePassiveRagdoll(ptr);
-            --poweredCount;
-        }
-        if (poweredCount >= maximumPowered)
-            return;
+        // Forget pinned bodies that are gone (death, swim, released).
+        std::erase_if(mPinnedBodies, [&](const MWWorld::LiveCellRefBase* ref) {
+            const auto found = mPassiveRagdolls.find(ref);
+            return found == mPassiveRagdolls.end() || !found->second->mPowered;
+        });
         for (const auto& [ref, actor] : mActors)
         {
-            if (poweredCount >= maximumPowered)
-                break;
             const MWWorld::Ptr ptr = actor->getPtr();
-            if (ptr.isEmpty() || ptr == player || !PassiveRagdollEntry::kineticHumanoid(ptr))
+            if (ptr.isEmpty() || ptr == player || mPassiveRagdolls.contains(ptr.mRef)
+                || !PassiveRagdollEntry::kineticHumanoid(ptr))
                 continue;
-            if (mPassiveRagdolls.contains(ptr.mRef) || mSwimSuspended.contains(ptr.mRef)
-                || mStuckSuspended.contains(ptr.mRef)
+            if (mSwimSuspended.contains(ptr.mRef) || mStuckSuspended.contains(ptr.mRef)
                 || ptr.getClass().getCreatureStats(ptr).isDead()
                 || MWBase::Environment::get().getWorld()->isSwimming(ptr))
                 continue;
-            const float distance = (ptr.getRefData().getPosition().asVec3() - playerPosition).length();
-            if (distance > acquireRadius)
+            const float distance = distanceTo(ptr);
+            if (distance > limits.mAcquireRadius)
                 continue;
+            RagdollCore::NpcPopulationCandidate candidate;
+            candidate.mId = ptrs.size();
+            candidate.mDistance = distance;
+            ptrs.push_back(ptr);
+            candidates.push_back(candidate);
+        }
+        const RagdollCore::NpcPopulationPlan plan = RagdollCore::planNpcPopulation(candidates, limits);
+        for (const std::size_t id : plan.mRelease)
+            removePassiveRagdoll(ptrs[id]);
+        std::size_t powered = 0;
+        for (const std::size_t id : plan.mAcquire)
+        {
+            if (powered >= plan.mFreeSlots)
+                break;
+            const MWWorld::Ptr& ptr = ptrs[id];
             const MWRender::Animation* animation = MWBase::Environment::get().getWorld()->getAnimation(ptr);
             if (animation == nullptr || animation->getSkeleton() == nullptr)
                 continue;
             if (addPoweredRagdoll(ptr, *animation->getSkeleton()))
-                ++poweredCount;
+                ++powered;
         }
+    }
+
+    void PhysicsSystem::pinPoweredRagdoll(const MWWorld::Ptr& ptr)
+    {
+        if (!ptr.isEmpty())
+            mPinnedBodies.insert(ptr.mRef);
     }
 
     void PhysicsSystem::updateAutoDuel()
@@ -5464,7 +6225,7 @@ namespace MWPhysics
         if (entry.mAiGuardRaiseIn >= 0.0f)
         {
             entry.mAiGuardRaiseIn -= mPhysicsDt;
-            if (entry.mAiGuardRaiseIn < 0.0f && entry.mClashLockout <= 0.0f)
+            if (entry.mAiGuardRaiseIn < 0.0f && entry.mClashLockout <= 0.0f && !entry.mArmStrain.spent())
             {
                 if (threat && read[0] >= 0.0f && guardSkill() > read[2])
                     readZone(*threat, entry.mAiGuardDecidedSwing * 0x94D049BB133111EBull, "raise");
@@ -5505,6 +6266,9 @@ namespace MWPhysics
         {
             PassiveRagdollEntry& entry = *entryPtr;
             entry.mGuardThreat.reset();
+            entry.mGuardStrike.reset();
+            entry.mGuardStrikeStage = -1;
+            entry.mGuardStrikeAi = false;
             // An NPC's block holds the line it was raised against (C3,
             // OPENMW_RAGDOLL_FEINT): a feint draws it, the real cut comes past.
             const bool latching = PassiveRagdollEntry::feintSettings()[0] > 0.0f && entry.mHscActive
@@ -5527,6 +6291,7 @@ namespace MWPhysics
             if (!chest)
                 continue;
             float best = 250.0f;
+            const PassiveRagdollEntry* nearest = nullptr;
             for (auto& [otherRef, otherPtr] : mPassiveRagdolls)
             {
                 const PassiveRagdollEntry& other = *otherPtr;
@@ -5541,9 +6306,53 @@ namespace MWPhysics
                 {
                     best = distance;
                     entry.mGuardThreat = *blade;
+                    nearest = &other;
                 }
             }
-            if (latching && entry.mGuardThreat)
+            // K2_PARRY_STEER: the player's block steers to that weapon's
+            // striking part (0.7 of hand to tip) and reads where it is going.
+            if (nearest
+                && (PassiveRagdollEntry::parrySteerSetting() > 0.0f || PassiveRagdollEntry::palmParrySettings().mOn)
+                && entry.getPtr() == MWMechanics::getPlayer()
+                && nearest->mWeapon->mHandBody < nearest->mRagdoll->getBodyCount()
+                && nearest->mWeapon->mWeaponBody < nearest->mRagdoll->getBodyCount())
+            {
+                JPH::BodyInterface& bodies = mPhysicsSystem.GetBodyInterface();
+                const JPH::BodyID hand = nearest->mRagdoll->getBodyId(nearest->mWeapon->mHandBody);
+                const JPH::BodyID weapon = nearest->mRagdoll->getBodyId(nearest->mWeapon->mWeaponBody);
+                const JPH::Vec3 blade
+                    = (bodies.GetRotation(hand) * nearest->mWeapon->mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY());
+                const JPH::RVec3 strike = bodies.GetCenterOfMassPosition(hand)
+                    + JPH::RVec3(blade * (0.7f * std::max(10.0f, nearest->mWeapon->tipDistanceFromHand())));
+                const JPH::Vec3 velocity = bodies.GetPointVelocity(weapon, strike);
+                if (!strike.IsNaN() && !velocity.IsNaN())
+                {
+                    entry.mGuardStrike = strike;
+                    entry.mGuardStrikeVelocity = velocity;
+                    // FIST-08 (K2_PALM_PARRY): the weapon hand, and its stroke.
+                    entry.mGuardStrikeHand = bodies.GetCenterOfMassPosition(hand);
+                    entry.mGuardStrikeStage = nearest->mHscActive ? static_cast<int>(nearest->mAttackStage) : -1;
+                    entry.mGuardStrikeAi = nearest->mAiStrikeActive;
+                }
+            }
+            // K2_GUARD_THREAT: the line is latched once the blade has left
+            // the middle (above the head, below the belt or wide of a
+            // shoulder): raised as a cut starts, the guard latched the
+            // attacker's resting blade at chest height and stayed in the
+            // middle while the chop climbed to its chamber (CLASH-02 11-05).
+            static const auto threatZone_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_GUARD_THREAT");
+                return text && std::atof(text) > 0.0;
+            });
+            bool committed = true;
+            if (threatZone_tuned.get() && entry.mGuardThreat)
+            {
+                const float yaw = entry.getPtr().getRefData().getPosition().rot[2];
+                const JPH::Vec3 d(*entry.mGuardThreat - *chest);
+                const float lateral = d.GetX() * std::cos(yaw) - d.GetY() * std::sin(yaw);
+                committed = d.GetZ() > 14.0f || d.GetZ() < -16.0f || std::abs(lateral) > 14.0f;
+            }
+            if (latching && entry.mGuardThreat && committed)
                 entry.mGuardThreatLatch = entry.mGuardThreat;
         }
     }
@@ -5764,18 +6573,18 @@ namespace MWPhysics
             return;
         const JPH::RVec3 root = bodies.GetCenterOfMassPosition(entry.mRagdoll->getBodyId(0));
         const JPH::RVec3 reference = entry.mRagdoll->getReferencePosition();
-        // Over the floor under the root body; with no floor in reach (a fall
-        // off a ledge) no higher than the root body.
-        JPH::RVec3 next(root.GetX(), root.GetY(), std::min(reference.GetZ(), root.GetZ()));
+        std::optional<JPH::Real> floorZ;
         if (entry.mSurfaceQuery)
             if (const auto floor = entry.mSurfaceQuery(root + JPH::RVec3(0.0, 0.0, 10.0), -JPH::Vec3::sAxisZ(), 200.0f))
-                next.SetZ(floor->first.GetZ());
-        // Still, and the actor where it was put (leftover inertia moves it).
+                floorZ = floor->first.GetZ();
+        const osg::Vec3f actorAt = actor.getPhysicsPosition();
+        const std::optional<JPH::RVec3> followed = RagdollCore::corpseFollowTarget(
+            root, reference, floorZ, JPH::RVec3(actorAt.x(), actorAt.y(), actorAt.z()));
+        if (!followed)
+            return;
+        const JPH::RVec3 next = *followed;
         const osg::Vec3f nextActor(static_cast<float>(next.GetX()), static_cast<float>(next.GetY()),
             static_cast<float>(next.GetZ()));
-        if (JPH::Vec3(next - reference).LengthSq() < 0.25f * 0.25f
-            && (actor.getPhysicsPosition() - nextActor).length2() < 0.25f * 0.25f)
-            return;
         const JPH::Quat rotation = entry.mExperimentalReferenceRotation;
         RagdollCore::RagdollPose previous = entry.mPreviousPhysicsPose;
         RagdollCore::RagdollPose current = entry.mCurrentPhysicsPose;
@@ -5793,15 +6602,133 @@ namespace MWPhysics
         entry.mSynchronizedActorPosition = JPH::RVec3(synchronized.x(), synchronized.y(), synchronized.z());
     }
 
+    void PhysicsSystem::endLodge(PassiveRagdollEntry& entry, const char* reason)
+    {
+        if (!entry.mLodge)
+            return;
+        Log(Debug::Info) << "RAGDOLL_LODGE end attacker=" << entry.getPtr().getCellRef().getRefId()
+                         << " kind=" << RagdollCore::lodgeKindName(entry.mLodge->mKind) << " reason=" << reason
+                         << " held=" << entry.mLastLodgeHeld << " deepest=" << entry.mLastLodgeDeepest
+                         << " age=" << entry.mLodge->mAge + entry.mLodge->mClearAge;
+        entry.mLodge.reset();
+        entry.mLodgeDriveYield = 1.0f;
+        entry.mContactLodgeVictim.store(0, std::memory_order_relaxed);
+    }
+
+    void PhysicsSystem::stepLodges(float dt)
+    {
+        const RagdollCore::LodgeSettings& settings = k2Lodge();
+        JPH::BodyInterface& bodies = mPhysicsSystem.GetBodyInterface();
+        for (auto& [_, entryPtr] : mPassiveRagdolls)
+        {
+            PassiveRagdollEntry& entry = *entryPtr;
+            if (!entry.mLodge)
+                continue;
+            auto& lodge = *entry.mLodge;
+            const auto victim = std::find_if(mPassiveRagdolls.begin(), mPassiveRagdolls.end(),
+                [&](const auto& candidate) { return candidate.second->mSerial == lodge.mVictimSerial; });
+            if (!entry.mRagdoll || !entry.mWeapon || !entry.mWeapon->mAttached
+                || entry.mWeapon->mWeaponBody >= entry.mRagdoll->getBodyCount() || victim == mPassiveRagdolls.end()
+                || !victim->second->mRagdoll || lodge.mVictimBody >= victim->second->mRagdoll->getBodyCount())
+            {
+                endLodge(entry, "gone");
+                continue;
+            }
+            const auto& weapon = *entry.mWeapon;
+            const JPH::BodyID weaponId = entry.mRagdoll->getBodyId(weapon.mWeaponBody);
+            const JPH::BodyID bodyId = victim->second->mRagdoll->getBodyId(lodge.mVictimBody);
+            const JPH::Quat weaponTurn = bodies.GetRotation(weaponId);
+            const JPH::Quat bodyTurn = bodies.GetRotation(bodyId);
+            const JPH::RVec3 weaponCentre = bodies.GetCenterOfMassPosition(weaponId);
+            const JPH::RVec3 entryPoint = bodies.GetCenterOfMassPosition(bodyId) + bodyTurn * lodge.mVictimPoint;
+            // A stab is held on the blade's line (from the tip toward the
+            // grip); a chop and a pass are measured on the way they went in.
+            const bool stab = lodge.mKind == RagdollCore::LodgeKind::Stab;
+            const JPH::Vec3 blade = weaponTurn * weapon.mBladeAxis;
+            // The blade's own line runs through the weapon body's centre (the
+            // hand's origin sits 6-8 u beside it).
+            const JPH::RVec3 tip = weaponCentre + weaponTurn * (weapon.mBladeAxis * (0.5f * weapon.mLength));
+            const JPH::RVec3 edgePoint = weaponCentre + weaponTurn * lodge.mWeaponPoint;
+            const JPH::RVec3 point = stab ? entryPoint : edgePoint;
+            RagdollCore::LodgeStepInput input;
+            input.mOffset = stab ? JPH::Vec3(entryPoint - tip) : JPH::Vec3(edgePoint - entryPoint);
+            input.mAxis = stab ? -blade : bodyTurn * lodge.mVictimAxis;
+            const JPH::Vec3 weaponSpeed = bodies.GetPointVelocity(weaponId, point);
+            const JPH::Vec3 bodySpeed = bodies.GetPointVelocity(bodyId, point);
+            input.mRelativeVelocity = stab ? bodySpeed - weaponSpeed : weaponSpeed - bodySpeed;
+            // The weapon is the arm's: its mass and some of the arm behind it.
+            const auto& masses = victim->second->mRagdoll->getBodyMasses();
+            const float bodyMass = lodge.mVictimBody < masses.size() ? std::max(0.5f, masses[lodge.mVictimBody]) : 5.0f;
+            const float weaponMass = std::max(0.4f, weapon.mPhysicalMass) + std::max(0.0f, settings.mArmMass);
+            input.mEffectiveMass = bodyMass * weaponMass / (bodyMass + weaponMass);
+            input.mDepthMax = lodge.mDepthMax;
+            input.mAge = lodge.mAge;
+            input.mHold = lodge.mHold;
+            input.mDt = dt;
+            entry.mLodgeDriveYield = lodge.mClearing || lodge.mKind == RagdollCore::LodgeKind::Pass
+                ? 1.0f : std::clamp(settings.mDriveYield, 0.05f, 1.0f);
+            if (lodge.mClearing || lodge.mKind == RagdollCore::LodgeKind::Pass)
+            {
+                // No hold: the weapon goes through until it is out, or the
+                // time is up (a blade still in a body then is the embed rule's).
+                const float depth = input.mOffset.Dot(input.mAxis);
+                (lodge.mClearing ? lodge.mClearAge : lodge.mAge) += dt;
+                if (!lodge.mClearing && lodge.mAge >= lodge.mHold)
+                    lodge.mClearing = true;
+                else if (lodge.mClearing && (depth < -1.5f || lodge.mClearAge >= settings.mClearTime))
+                    endLodge(entry, depth < -1.5f ? "clear" : "clear_time");
+                continue;
+            }
+            const RagdollCore::LodgeStep step = RagdollCore::stepLodge(input, settings);
+            lodge.mAge += dt;
+            lodge.mDepth = step.mDepth;
+            lodge.mDeepest = std::max(lodge.mDeepest, step.mDepth);
+            entry.mLastLodgeDeepest = lodge.mDeepest;
+            entry.mLastLodgeHeld = lodge.mAge;
+            if (step.mRelease != RagdollCore::LodgeRelease::Held)
+            {
+                entry.mLastLodgeRelease = step.mRelease;
+                Log(Debug::Info) << "RAGDOLL_LODGE release attacker=" << entry.getPtr().getCellRef().getRefId()
+                                 << " kind=" << RagdollCore::lodgeKindName(lodge.mKind) << " reason="
+                                 << RagdollCore::lodgeReleaseName(step.mRelease) << " held=" << lodge.mAge
+                                 << " depth=" << step.mDepth << " deepest=" << lodge.mDeepest << " off_line="
+                                 << step.mOffLine;
+                entry.mLodgeDriveYield = 1.0f;
+                if (step.mRelease == RagdollCore::LodgeRelease::Out)
+                    endLodge(entry, "out");
+                else
+                    lodge.mClearing = true;
+                continue;
+            }
+            if (!step.mImpulse.IsNearZero())
+            {
+                bodies.AddImpulse(stab ? bodyId : weaponId, step.mImpulse, point);
+                bodies.AddImpulse(stab ? weaponId : bodyId, -step.mImpulse, point);
+            }
+        }
+    }
+
+    void PhysicsSystem::stepDeathLimits(float dt)
+    {
+        const float seconds = deathLimitSeconds();
+        for (auto& [_, entry] : mPassiveRagdolls)
+        {
+            if (entry->mDeathLimits.empty() || !entry->mRagdoll)
+                continue;
+            entry->mDeathLimitsTime += dt;
+            const float progress = seconds > 0.0f ? entry->mDeathLimitsTime / seconds : 1.0f;
+            for (const RagdollCore::DeathLimit& limit : entry->mDeathLimits)
+                entry->mRagdoll->setJointRange(
+                    limit.mBody, RagdollCore::deathRangeEased(limit.mAuthored, limit.mOpened, progress));
+            if (progress >= 1.0f)
+                entry->mDeathLimits.clear();
+        }
+    }
+
     void PhysicsSystem::stepDeathDrag(float dt)
     {
-        static const auto rate_tuned = RagdollCore::tuned<float>([] {
-            std::array<float, 2> value{ 3.0f, 2.5f };
-            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_DEATH_DRAG"))
-                std::sscanf(text, "%f,%f", &value[0], &value[1]);
-            return value[0];
-        });
-        const float keep = std::exp(-std::max(0.0f, rate_tuned.get()) * dt);
+        // The rate only (deathMotionSettings; the carry's share is not read).
+        const float rate = deathMotionSettings({ 0.0f, 0.0f }).mDragRate;
         JPH::BodyInterface& bodies = mPhysicsSystem.GetBodyInterface();
         for (auto& [_, entry] : mPassiveRagdolls)
         {
@@ -5818,8 +6745,7 @@ namespace MWPhysics
             }
             if (!(mass > 0.0f))
                 continue;
-            JPH::Vec3 drain = momentum / mass * (1.0f - keep);
-            drain.SetZ(0.0f);
+            const JPH::Vec3 drain = RagdollCore::deathDragDrain(momentum / mass, rate, dt);
             for (std::size_t i = 0; i < entry->mRagdoll->getBodyCount(); ++i)
             {
                 const JPH::BodyID id = entry->mRagdoll->getBodyId(i);
@@ -5987,7 +6913,7 @@ namespace MWPhysics
                                 centre + JPH::RVec3(0.0, 0.0, 80.0), -JPH::Vec3::sAxisZ(), 160.0f))
                             under = std::max(under, static_cast<float>(hit->first.GetZ() - centre.GetZ()));
                     }
-                Log(Debug::Info) << "RAGDOLL_DEATH_SLIDE actor=" << (attacker.isEmpty() ? std::string("?") : attacker.getCellRef().getRefId().toDebugString())
+                Log(Debug::Info) << "RAGDOLL_DEATH_SLIDE actor=" << (attacker.isEmpty() ? std::string("?") : attacker.getCellRef().getRefId().serializeText())
                                  << " horizontal=" << moved.Length() << " vertical=" << vertical << " under=" << under;
                 entry->mDeathWatchStart.reset();
             }
@@ -5998,10 +6924,79 @@ namespace MWPhysics
                 const float actorMoved = attacker.isEmpty() ? 0.0f
                     : (attacker.getRefData().getPosition().asVec3() - *entry->mDeathWatchActorStart).length();
                 Log(Debug::Info) << "RAGDOLL_DEATH_DRAWN actor="
-                                 << (attacker.isEmpty() ? std::string("?") : attacker.getCellRef().getRefId().toDebugString())
-                                 << " drawn_off=" << entry->mDeathDrawnOff << " actor_moved=" << actorMoved
+                                 << (attacker.isEmpty() ? std::string("?") : attacker.getCellRef().getRefId().serializeText())
+                                 << " drawn_off=" << entry->mDeathDrawnOff << " body_off=" << entry->mDeathBodyOff
+                                 << " actor_moved=" << actorMoved
                                  << " follow=" << corpseFollow();
                 entry->mDeathWatchActorStart.reset();
+            }
+            // RAGDOLL_CORPSE_TRACE (corpseTrace): a corpse every 0.5 s for its
+            // first 12 s limp. moved = the root body's horizontal travel since
+            // the last line; actor_off = the actor (looting, saves) off the
+            // root, horizontal; ref/phys/sim = the ragdoll reference, the
+            // actor's physics and interpolated positions off the actor's own;
+            // drawn_shift = the drawn pelvis's drift off its physics place
+            // since the first line (what DEATH_DRAWN measures for 4 s).
+            if (corpseTrace() && !entry->mPowered && entry->mRagdoll && entry->mRagdoll->getBodyCount() > 0
+                && !attacker.isEmpty() && !isNetPuppetEntry(*entry))
+            {
+                struct CorpseSample
+                {
+                    std::uint64_t mFirstStep = 0, mLastStep = 0;
+                    JPH::RVec3 mLastRoot;
+                    std::optional<osg::Vec3f> mFirstOffset;
+                };
+                static std::map<std::uint64_t, CorpseSample> samples; // by entry serial
+                const JPH::BodyInterface& bodies = mPhysicsSystem.GetBodyInterface();
+                const JPH::RVec3 root = bodies.GetCenterOfMassPosition(entry->mRagdoll->getBodyId(0));
+                auto [sample, fresh] = samples.try_emplace(entry->mSerial);
+                if (fresh)
+                    sample->second = CorpseSample{ mJoltStepSerial, mJoltStepSerial, root, std::nullopt };
+                const std::uint64_t age = mJoltStepSerial - sample->second.mFirstStep;
+                if (age <= 720 && (fresh || mJoltStepSerial - sample->second.mLastStep >= 30))
+                {
+                    float speed = 0.0f;
+                    for (std::size_t i = 0; i < entry->mRagdoll->getBodyCount(); ++i)
+                        speed = std::max(speed, bodies.GetLinearVelocity(entry->mRagdoll->getBodyId(i)).Length());
+                    JPH::Vec3 moved(root - sample->second.mLastRoot);
+                    moved.SetZ(0.0f);
+                    const osg::Vec3f placed = attacker.getRefData().getPosition().asVec3();
+                    const osg::Vec3f rootOsg = Misc::Convert::toOsg(root);
+                    const float actorOff = std::hypot(placed.x() - rootOsg.x(), placed.y() - rootOsg.y());
+                    const float refOff = (Misc::Convert::toOsg(entry->mRagdoll->getReferencePosition()) - placed).length();
+                    float physOff = -1.0f, simOff = -1.0f;
+                    if (const auto actor = mActors.find(attacker.mRef); actor != mActors.end())
+                    {
+                        physOff = (actor->second->getPhysicsPosition() - placed).length();
+                        simOff = (actor->second->getInterpolatedPosition() - placed).length();
+                    }
+                    float drawnShift = -1.0f;
+                    MWRender::Animation* animation = MWBase::Environment::get().getWorld()->getAnimation(attacker);
+                    const osg::Node* rootBone = animation ? animation->getNode("bip01 pelvis") : nullptr;
+                    const auto physical = entry->mRenderPosePrepared
+                        ? entry->mRagdoll->getWorldBodyPosition(entry->mRenderPose, 0)
+                        : std::nullopt;
+                    if (rootBone && physical && !rootBone->getParentalNodePaths().empty())
+                    {
+                        const osg::Vec3f drawn
+                            = osg::computeLocalToWorld(rootBone->getParentalNodePaths().front()).getTrans();
+                        const osg::Vec3f offset
+                            = drawn - Misc::Convert::toOsg(*physical - JPH::RVec3(entry->mRenderShift));
+                        if (!sample->second.mFirstOffset)
+                            sample->second.mFirstOffset = offset;
+                        drawnShift = (offset - *sample->second.mFirstOffset).length();
+                    }
+                    Log(Debug::Info) << "RAGDOLL_CORPSE_TRACE actor=" << attacker.getCellRef().getRefId().serializeText()
+                                     << " serial=" << entry->mSerial << " t=" << age * mPhysicsDt << " root="
+                                     << root.GetX() << "," << root.GetY() << "," << root.GetZ()
+                                     << " moved=" << moved.Length() << " speed_max=" << speed
+                                     << " active=" << entry->mRagdoll->isActive() << " actor_off=" << actorOff
+                                     << " ref=" << refOff << " phys=" << physOff << " sim=" << simOff
+                                     << " drawn_shift=" << drawnShift << " drag_steps=" << entry->mDeathDragSteps
+                                     << " follow=" << corpseFollow();
+                    sample->second.mLastStep = mJoltStepSerial;
+                    sample->second.mLastRoot = root;
+                }
             }
             // DMG-04: skill as weapon control, for everyone who swings (the
             // player's tip controller included).
@@ -6334,7 +7329,12 @@ namespace MWPhysics
                     entry->mAiStrikeAimPoint.reset();
                 }
                 else
+                {
                     entry->mAiStrikeActive = true;
+                    if (entry->mHscActive)
+                        RagdollCore::countPath(
+                            RagdollCore::CountedPath::AiStrikeOverHsc, attacker == MWMechanics::getPlayer());
+                }
             }
             else if (entry->mAiStrikeActive && attackAnimation)
             {
@@ -6368,11 +7368,122 @@ namespace MWPhysics
         }
     }
 
+    // SHOVE-02 (K2_NPC_SHOVE, registry): an NPC fighting the player shoves
+    // it (ragdollcore npcshove). Main thread: it reads the AI's combat.
+    void PhysicsSystem::updateNpcShoves()
+    {
+        static const auto settings_tuned = RagdollCore::tuned<std::optional<RagdollCore::NpcShoveSettings>>(
+            []() -> std::optional<RagdollCore::NpcShoveSettings> {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_NPC_SHOVE");
+                RagdollCore::NpcShoveSettings value;
+                float on = 0.0f;
+                if (!text || std::sscanf(text, "%f,%f,%f,%f,%f", &on, &value.mGuardRate, &value.mCloseRate,
+                                 &value.mCooldown, &value.mMinFatigue) < 1 || !(on > 0.0f))
+                    return std::nullopt;
+                return value;
+            });
+        const auto& settings = settings_tuned.get();
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const float elapsed = std::clamp(std::chrono::duration<float>(now - last).count(), 0.0f, 0.25f);
+        last = now;
+        if (!settings || !(elapsed > 0.0f))
+            return;
+        const MWWorld::Ptr player = MWMechanics::getPlayer();
+        if (player.isEmpty())
+            return;
+        std::vector<MWWorld::Ptr> shovers;
+        {
+            std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
+            const auto foe = mPassiveRagdolls.find(player.mRef);
+            if (foe == mPassiveRagdolls.end() || !foe->second->mPowered || !foe->second->mSituationKnown)
+                return;
+            for (auto& [ref, entry] : mPassiveRagdolls)
+            {
+                entry->mNpcShoveSince += elapsed;
+                if (ref == player.mRef || !entry->mPowered || !entry->mSituationKnown)
+                    continue;
+                const MWWorld::Ptr ptr = entry->getPtr();
+                if (ptr.isEmpty() || !ptr.getClass().isNpc())
+                    continue;
+                auto& stats = ptr.getClass().getCreatureStats(ptr);
+                if (stats.isDead() || !stats.getAiSequence().isInCombat(player))
+                    continue;
+                const JPH::Vec3 d(foe->second->mSituationCom - entry->mSituationCom);
+                const float flat = std::hypot(d.GetX(), d.GetY());
+                const JPH::Vec3 facing = entry->reactionForward();
+                RagdollCore::NpcShoveInput input;
+                input.mDistance = flat;
+                input.mFacing = flat > 1.0f ? (d.GetX() * facing.GetX() + d.GetY() * facing.GetY()) / flat : 0.0f;
+                input.mFoeGuarding = foe->second->mGuardActive;
+                input.mAttacking = entry->mAiStrikeActive || entry->mShoveArms > 0.0f;
+                input.mFatigue = stats.getFatigue().getRatio();
+                input.mStrength = stats.getAttribute(ESM::Attribute::Strength).getModified();
+                input.mSinceLast = entry->mNpcShoveSince;
+                input.mDt = elapsed;
+                entry->mNpcShoveRoll = entry->mNpcShoveRoll * 6364136223846793005ull + 1442695040888963407ull
+                    + entry->mSerial;
+                input.mRoll = static_cast<float>((entry->mNpcShoveRoll >> 40) & 0xffffff) / 16777216.0f;
+                if (RagdollCore::npcShouldShove(input, *settings))
+                {
+                    entry->mNpcShoveSince = 0.0f;
+                    shovers.push_back(ptr);
+                    Log(Debug::Info) << "RAGDOLL_NPC_SHOVE actor=" << ptr.getCellRef().getRefId()
+                                     << " distance=" << flat << " guarding=" << input.mFoeGuarding
+                                     << " fatigue=" << input.mFatigue;
+                }
+            }
+        }
+        for (const MWWorld::Ptr& ptr : shovers)
+            shovePassiveRagdoll(ptr);
+    }
+
     void PhysicsSystem::updatePassiveRagdolls()
     {
+        updateNpcShoves();
+        // KINETIC-2 step 3: the path counters, once a minute.
+        {
+            static auto lastReport = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastReport >= std::chrono::minutes(1))
+            {
+                lastReport = now;
+                Log(Debug::Info) << "RAGDOLL_PATHS " << RagdollCore::pathCountReport();
+            }
+        }
         // Scene changes asked for from other threads (clearRegionDamage).
         for (auto& [_, entry] : mPassiveRagdolls)
             entry->applyPendingTintClear();
+        // K2_WOUND_HEAL (registry): each body's limb damage follows its
+        // health. The marks follow it by the same rule in
+        // NpcAnimation::healWounds.
+        {
+            static const auto settings_tuned = RagdollCore::tuned<RagdollCore::WoundHealSettings>([] {
+                return RagdollCore::parseWoundHealSettings(
+                    RagdollCore::tuningText("OPENMW_RAGDOLL_K2_WOUND_HEAL"));
+            });
+            static const auto& settings = settings_tuned.get();
+            const MWWorld::TimeStamp stamp = MWBase::Environment::get().getWorld()->getTimeStamp();
+            const double hours = stamp.getDay() * 24.0 + stamp.getHour();
+            std::vector<std::pair<PassiveRagdollEntry*, float>> healed;
+            for (auto& [_, entry] : mPassiveRagdolls)
+            {
+                const MWWorld::Ptr ptr = entry->getPtr();
+                if (ptr.isEmpty() || !ptr.getClass().isActor())
+                    continue;
+                const auto& health = ptr.getClass().getCreatureStats(ptr).getHealth();
+                const float share = RagdollCore::woundHealShare(
+                    entry->mWoundHeal, health.getCurrent(), health.getModified(), hours, settings);
+                if (share > 0.0f)
+                    healed.emplace_back(entry.get(), share);
+            }
+            if (!healed.empty())
+            {
+                std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
+                for (const auto& [entry, share] : healed)
+                    entry->healRegionDamage(share);
+            }
+        }
         // Gore (stage 6): bursts queued by the hit receipts, and bleeding.
         if (goreSettings()[0] > 0.0f)
         {
@@ -6465,6 +7576,11 @@ namespace MWPhysics
                     return !(text && std::atoi(text) == 0);
                 });
                 entry->mRenderShift = JPH::Vec3::sZero();
+                entry->mRenderActorDrawn.reset();
+                if (entry->mRenderPosePrepared && entry->mPowered && entry->mRagdoll->isRootKinematic())
+                    if (const auto actor = mActors.find(entry->getPtr().mRef); actor != mActors.end())
+                        entry->mRenderActorDrawn
+                            = Misc::Convert::toJolt<JPH::RVec3>(actor->second->getInterpolatedPosition());
                 if (entry->mRenderPosePrepared && renderRebase_tuned.get() && entry->mSynchronizedActorPosition
                     && !(entry->mPowered && !entry->mRagdoll->isRootKinematic()))
                     if (const auto actor = mActors.find(entry->getPtr().mRef); actor != mActors.end())
@@ -6563,6 +7679,13 @@ namespace MWPhysics
         {
             const std::span<const RagdollCore::Transform> renderBodies(entry->mRenderPose.mBodyTransforms.data(),
                 std::min(entry->mPoseBindingBodyCount, entry->mRenderPose.mBodyTransforms.size()));
+            static const auto calmDraw_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_CALM_DRAW");
+                return !(text && std::atoi(text) == 0);
+            });
+            if (entry->mPoseBinding)
+                entry->mPoseBinding->setAnimationShare(
+                    entry->mPowered && calmDraw_tuned.get() ? entry->mCalm.mDraw : 0.0f);
             const bool poseApplied = entry->mRenderPosePrepared && renderBodies.size() == entry->mPoseBindingBodyCount
                 && entry->mPoseBinding->applyPose(renderBodies);
             // Death watch, drawn: the root bone where the scene graph draws
@@ -6581,6 +7704,9 @@ namespace MWPhysics
                         entry->mDeathDrawnOrigin = offset;
                     entry->mDeathDrawnOff = std::max(entry->mDeathDrawnOff, (offset - *entry->mDeathDrawnOrigin).length());
                 }
+                entry->mDeathBodyOff = std::max(entry->mDeathBodyOff,
+                    drawnOffPhysics(*entry, entry->mRenderPose,
+                        entry->mRuntimeProfile ? entry->mRuntimeProfile.get() : mPassiveRagdollProfile.get()));
             }
             if (!entry->mPoweredControlFailureLine && poseApplied)
                 continue;
@@ -6950,9 +8076,29 @@ namespace MWPhysics
         result.mHscGrip = Misc::Convert::toOsg(found->second->mHscGrip);
         result.mChamberLine = found->second->mAttackLine;
         result.mHscStage = static_cast<int>(found->second->mAttackStage);
+        result.mFistHudActive = found->second->mHscActive && found->second->mFistHudActive;
+        result.mFistHudCharge = found->second->mFistHudCharge;
+        result.mFistAimBlend = found->second->mFistAimBlend;
+        if (found->second->mSwingAimRayOrigin)
+            result.mFistAimOrigin = Misc::Convert::toOsg(*found->second->mSwingAimRayOrigin);
+        result.mFistAimDirection = Misc::Convert::toOsg(found->second->mSwingAimRayDirection);
+        for (std::size_t side = 0; side < 2; ++side)
+            result.mFistHudKind[side] = static_cast<int>(found->second->mFistHudKind[side]);
         result.mHscStanceX = found->second->mStanceX;
         result.mHscStanceY = found->second->mStanceY;
         result.mHscAngle = found->second->mAttackAngle;
+        // FIST-12: a fist held winding up by the mouse reads on the reticle
+        // as a weapon's wind-up (1800 stance counts = the reticle's full).
+        result.mFistHudDrag = result.mFistHudActive && found->second->mFistHudDrag;
+        if (result.mFistHudDrag && found->second->mFistHudDraw)
+        {
+            const auto& draw = *found->second->mFistHudDraw;
+            result.mHscStage = static_cast<int>(RagdollCore::WheelStage::Wind);
+            result.mHscStanceX = draw[0] * 1800.0f;
+            result.mHscStanceY = draw[1] * 1800.0f;
+            if (std::hypot(draw[0], draw[1]) > 0.02f)
+                result.mHscAngle = std::atan2(draw[1], draw[0]);
+        }
         result.mHscDrivePhase = found->second->mHscDrivePhase;
         result.mHscPlaneMiss = found->second->mCutPlaneMiss;
         result.mHscSnap = found->second->mSnapCut;
@@ -6963,6 +8109,7 @@ namespace MWPhysics
         result.mHscSinceParryWon = found->second->mAiSinceParryWon;
         result.mHscGripMode = static_cast<int>(found->second->mGrip);
         result.mHscJabs = found->second->mJabCount;
+        result.mHscPalmParries = found->second->mPalmParries;
         result.mHscJab = found->second->leftJabExtension();
         result.mHscRoute = found->second->mFlowU;
         result.mHscReseat = found->second->mReseatEase;
@@ -6970,6 +8117,10 @@ namespace MWPhysics
         result.mHscTrajectory.reserve(found->second->mHscPreview.size());
         for (const JPH::RVec3& point : found->second->mHscPreview)
             result.mHscTrajectory.push_back(Misc::Convert::toOsg(point));
+        if (found->second->mHscMark)
+            result.mHscMark = Misc::Convert::toOsg(*found->second->mHscMark);
+        result.mHscMarkHit = found->second->mHscMarkHit;
+        result.mHscMarkGap = found->second->mHscMarkGap;
         result.mArmOwnerLeft = found->second->armOwnerName(found->second->mArmOwner[0]);
         result.mOwnerLegs = found->second->armOwnerName(found->second->mBodyOwner[PassiveRagdollEntry::ChannelLegs]);
         result.mOwnerTrunk = found->second->armOwnerName(found->second->mBodyOwner[PassiveRagdollEntry::ChannelTrunk]);
@@ -6982,6 +8133,10 @@ namespace MWPhysics
         result.mTipGap = found->second->mTipGap;
         result.mTipCommand = Misc::Convert::toOsg(found->second->mTipDesiredTip);
         result.mBlockStaggers = found->second->mBlockStaggerCount;
+        result.mClashes = found->second->mParryBounceCount;
+        result.mClashSlides = found->second->mClashSlideCount;
+        result.mKicks = found->second->mKickCount;
+        result.mKickHits = found->second->mKickHitCount;
         result.mDazeTime = found->second->mDazeTime;
         result.mDazeDrop = found->second->mDazeDrop;
         result.mDazeCount = found->second->mDazeCount;
@@ -7185,6 +8340,17 @@ namespace MWPhysics
             result.mBalanceRight = balance[0];
             result.mBalanceForward = balance[1];
             result.mBalanceTip = balance[2];
+            if (k2BalanceRisk() && found->second->mControllerOutput)
+                result.mBalanceRisk = RagdollCore::balanceRisk(balance[2], found->second->mControllerOutput->mMode);
+            const auto weight = found->second->hudWeightShift();
+            result.mWeightRight = weight[0];
+            result.mWeightForward = weight[1];
+            result.mWeightEdge = weight[2];
+            if (k2BalanceSigil())
+            {
+                result.mBalanceSigil = found->second->hudBalanceSigil();
+                result.mBalanceDaze = found->second->hudDaze();
+            }
             result.mAttackReady = found->second->attackReadiness();
         }
         result.mGuardStartPhysicsStep = found->second->mGuardStartPhysicsStep;
@@ -7468,6 +8634,12 @@ namespace MWPhysics
         return found != mPassiveRagdolls.end() && found->second->mPowered;
     }
 
+    float PhysicsSystem::poweredMoveScale(const MWWorld::ConstPtr& ptr) const
+    {
+        const auto found = mPassiveRagdolls.find(ptr.mRef);
+        return found != mPassiveRagdolls.end() && found->second->mPowered ? found->second->mMoveScale : 1.f;
+    }
+
     bool PhysicsSystem::hasAttachedRagdollWeapon(const MWWorld::ConstPtr& ptr) const
     {
         const auto found = mPassiveRagdolls.find(ptr.mRef);
@@ -7516,10 +8688,33 @@ namespace MWPhysics
                 // Plus the smoothed absorb's offset (OPENMW_RAGDOLL_STOP_CAMERA):
                 // the absorb is taken in one step at a stop.
                 const float factor = entry.mRenderInterpolationFactor;
-                const JPH::RVec3 target = entry.mSoftRootPrevTarget
+                JPH::RVec3 target = entry.mSoftRootPrevTarget
                     + (*entry.mSoftRootLastTarget - entry.mSoftRootPrevTarget) * static_cast<double>(factor)
                     + JPH::RVec3(entry.mCameraTargetOffsetPrevious
                         + (entry.mCameraTargetOffset - entry.mCameraTargetOffsetPrevious) * factor);
+                // K2_CAMERA_STEADY (registry): the target is built from the
+                // actor's position, which is written once a rendered frame.
+                // Under 60 fps a frame holds two steps now and then, the
+                // second sees the actor where the first did and a later one
+                // sees it two steps on, so the camera moved 0 or two steps of
+                // travel where the body moved one (user 11-12, 11-13: "the
+                // model vibrates back an forth"; 3.8 u at a 229 u/s run, every
+                // 3 steps at 47 fps). The camera takes the actor's share of
+                // the target from where the actor is drawn this frame, which
+                // advances with the frame's own time.
+                static const auto cameraSteady_tuned = RagdollCore::tuned<bool>([] {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_CAMERA_STEADY");
+                    return text && std::atof(text) > 0.0;
+                });
+                if (cameraSteady_tuned.get() && entry.mRenderActorDrawn && entry.mSoftRootActorKnown)
+                {
+                    const JPH::RVec3 stepped = entry.mSoftRootPrevActor
+                        + (entry.mSoftRootLastActor - entry.mSoftRootPrevActor) * static_cast<double>(factor);
+                    const JPH::Vec3 correction(*entry.mRenderActorDrawn - stepped);
+                    // Not across a teleport or a cell change.
+                    if (correction.LengthSq() < 60.0f * 60.0f)
+                        target += JPH::RVec3(correction);
+                }
                 const JPH::RVec3 sway = *pelvis - JPH::RVec3(entry.mRenderShift) - target;
                 return Misc::Convert::toOsg(
                     *position - sway * static_cast<double>(1.0f - entry.mCameraPhysicalBlend));
@@ -7738,6 +8933,19 @@ namespace MWPhysics
         return true;
     }
 
+    bool PhysicsSystem::drivePassiveRagdollLeftFist(
+        const MWWorld::ConstPtr& ptr, float countsRight, float countsUp, bool held, bool cancel)
+    {
+        if (!std::isfinite(countsRight) || !std::isfinite(countsUp))
+            return false;
+        const auto found = mPassiveRagdolls.find(ptr.mRef);
+        if (found == mPassiveRagdolls.end())
+            return false;
+        std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
+        found->second->driveLeftFist(countsRight, countsUp, held, cancel);
+        return true;
+    }
+
     bool PhysicsSystem::setPassiveRagdollGuard(const MWWorld::ConstPtr& ptr, bool active,
         const std::optional<osg::Vec3f>& worldFacing)
     {
@@ -7748,8 +8956,9 @@ namespace MWPhysics
             return false;
         std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
         auto& entry = *found->second;
-        // A guard broken in a clash cannot come back up yet (M7).
-        if (entry.mClashLockout > 0.0f)
+        // A guard broken in a clash cannot come back up yet (M7), nor one
+        // whose arm is spent (K2_ARM_STRAIN).
+        if (entry.mClashLockout > 0.0f || entry.mArmStrain.spent())
             active = false;
         if (active && !entry.mGuardActive)
             entry.mGuardStartPhysicsStep = mJoltStepSerial;
@@ -7769,6 +8978,16 @@ namespace MWPhysics
     {
         const auto found = mPassiveRagdolls.find(ptr.mRef);
         return found != mPassiveRagdolls.end() && found->second->mHscActive;
+    }
+
+    // K2_PALM_TAP: the bare-handed guard is up and reads a blow, or its palm is out.
+    bool PhysicsSystem::isPassiveRagdollPalmBusy(const MWWorld::ConstPtr& ptr) const
+    {
+        const auto found = mPassiveRagdolls.find(ptr.mRef);
+        if (found == mPassiveRagdolls.end() || !found->second->mGuardActive)
+            return false;
+        const RagdollCore::PalmParry& palm = found->second->mPalmParry;
+        return palm.coming() || palm.phase() == RagdollCore::PalmPhase::Reach;
     }
 
     std::optional<float> PhysicsSystem::getPassiveRagdollArmReach(
@@ -8054,6 +9273,29 @@ namespace MWPhysics
         return mRagdollWeaponSwing.mMotorTorqueScale;
     }
 
+    std::optional<PhysicsSystem::RagdollLodgeView> PhysicsSystem::getRagdollLodge(const MWWorld::ConstPtr& ptr) const
+    {
+        const auto found = mPassiveRagdolls.find(ptr.mRef);
+        if (found == mPassiveRagdolls.end())
+            return std::nullopt;
+        const PassiveRagdollEntry& entry = *found->second;
+        RagdollLodgeView view;
+        view.mKind = RagdollCore::lodgeKindName(entry.mLodge ? entry.mLodge->mKind : RagdollCore::LodgeKind::None);
+        view.mLastKind = RagdollCore::lodgeKindName(entry.mLastLodgeKind);
+        view.mLastRelease = RagdollCore::lodgeReleaseName(entry.mLastLodgeRelease);
+        if (entry.mLodge)
+        {
+            view.mClearing = entry.mLodge->mClearing;
+            view.mDepth = entry.mLodge->mDepth;
+            view.mDeepest = entry.mLodge->mDeepest;
+            view.mAge = entry.mLodge->mAge;
+        }
+        view.mLastDeepest = entry.mLastLodgeDeepest;
+        view.mLastHeld = entry.mLastLodgeHeld;
+        view.mCount = entry.mLodgeCount;
+        return view;
+    }
+
     std::optional<float> PhysicsSystem::getRagdollWeaponSwingSpeed(const MWWorld::ConstPtr& ptr) const
     {
         const auto found = mPassiveRagdolls.find(ptr.mRef);
@@ -8266,8 +9508,17 @@ namespace MWPhysics
         if (!best)
         {
             Log(Debug::Info) << "RAGDOLL_SHOVE actor=" << ptr.getCellRef().getRefId() << " target=- (nobody in reach)";
-            return false;
+            // K2_SHOVE_ARMS: the arms go out all the same (no lunge, no cost).
+            if (!PassiveRagdollEntry::shoveArmsSetting())
+                return false;
+            entry.mShoveArms = s.mHands + 0.3f;
+            entry.mShoveCooldown = s.mCooldown;
+            entry.mShoveTarget = nullptr;
+            entry.mShoveAt.reset();
+            entry.mShoveAhead = facing;
+            return true;
         }
+        entry.mShoveAhead.reset();
         const float strength = std::clamp(attribute(ESM::Attribute::Strength) / 50.0f, 0.6f, 1.4f);
         spend();
         // The lunge: the shover's own walk carries it forward (the stumble
@@ -8295,13 +9546,21 @@ namespace MWPhysics
         std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
         for (const auto& [ref, entry] : mPassiveRagdolls)
         {
+            const bool shifted = entry->mWeapon && entry->mWeapon->mGripShift > 0.0f;
             const bool turned = entry->mMurder.has_value() && entry->mWeapon;
-            if (!turned && !entry->mGripTurnShown)
+            if (!turned && !shifted && !entry->mGripTurnShown)
                 continue;
-            entry->mGripTurnShown = turned;
-            if (!turned)
+            entry->mGripTurnShown = turned || shifted;
+            if (!turned && !shifted)
             {
                 out.emplace_back(entry->getPtr(), std::nullopt);
+                continue;
+            }
+            // K2_SPEAR_GRIP: the spear drawn where its body is.
+            if (!turned)
+            {
+                out.emplace_back(entry->getPtr(),
+                    osg::Matrixf::translate(Misc::Convert::toOsg(entry->mWeapon->mBladeAxis * entry->mWeapon->mGripShift)));
                 continue;
             }
             // The weapon as drawn: the hold point to the hand, turned half
@@ -8362,9 +9621,18 @@ namespace MWPhysics
             entry->mShoveArms = std::max(0.0f, entry->mShoveArms - dt);
             const auto target
                 = mPassiveRagdolls.find(static_cast<const MWWorld::LiveCellRefBase*>(entry->mShoveTarget));
+            // A shove at nobody: the hands go to chest height ahead.
+            if (entry->mShoveArms > 0.0f && entry->mShoveAhead && entry->mSituationKnown)
+            {
+                entry->mShoveAt = std::make_pair(
+                    entry->mSituationCom + JPH::RVec3(*entry->mShoveAhead * 60.0f) + JPH::RVec3(0.0, 0.0, 22.0),
+                    -*entry->mShoveAhead);
+                continue;
+            }
             if (entry->mShoveArms <= 0.0f || target == mPassiveRagdolls.end() || !target->second->mSituationKnown)
             {
                 entry->mShoveAt.reset();
+                entry->mShoveAhead.reset();
                 continue;
             }
             const JPH::Vec3 d(target->second->mSituationCom - entry->mSituationCom);
@@ -8435,6 +9703,303 @@ namespace MWPhysics
                              << " speed=" << blow.mApproachSpeed << " guard=" << victim.mGuardActive
                              << " pushed=" << pushed << " clicks=" << shove.mExtraClicks << " hand_gap=" << handGap.value_or(-1.0f)
                              << " after=" << shoveSettings().mHands - shove.mLeft;
+        }
+    }
+
+    // KICK-01 (PassiveRagdollEntry::kickSettings): the target is the nearest
+    // powered body within `reach` (flat, between the centres of mass) and
+    // `cone` of the facing; with nobody there the leg kicks the air. A kick
+    // costs Morrowind's attack fatigue (fFatigueAttackBase + encumbrance x
+    // fFatigueAttackMult) x `fatigue`.
+    bool PhysicsSystem::kickPassiveRagdoll(const MWWorld::ConstPtr& ptr)
+    {
+        const auto& k = PassiveRagdollEntry::kickSettings();
+        if (!k.mOn)
+            return false;
+        const auto found = mPassiveRagdolls.find(ptr.mRef);
+        if (found == mPassiveRagdolls.end())
+            return false;
+        PassiveRagdollEntry& entry = *found->second;
+        std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
+        const MWWorld::Ptr actor = entry.getPtr();
+        if (actor.isEmpty() || !actor.getClass().isActor() || !entry.mPowered || !entry.mSituationKnown
+            || entry.mSituation.mAirborne || entry.kicking() || entry.mKickCooldown > 0.0f || !entry.mLeftLeg
+            || !entry.mRightLeg || !entry.mCurrentPhysicsPoseCaptured)
+            return false;
+        auto& stats = actor.getClass().getCreatureStats(actor);
+        if (stats.getKnockedDown() || stats.isParalyzed() || stats.isDead())
+            return false;
+        const JPH::Vec3 facing = entry.reactionForward();
+        const float cone = std::cos(k.mCone * 3.14159265f / 180.0f);
+        const MWWorld::LiveCellRefBase* best = nullptr;
+        float nearest = k.mReach;
+        for (const auto& [ref, other] : mPassiveRagdolls)
+        {
+            if (other.get() == &entry || !other->mPowered || !other->mSituationKnown)
+                continue;
+            const JPH::Vec3 d(other->mSituationCom - entry.mSituationCom);
+            const float flat = std::hypot(d.GetX(), d.GetY());
+            if (flat < 1.0f || flat > nearest || std::abs(d.GetZ()) > 60.0f
+                || (d.GetX() * facing.GetX() + d.GetY() * facing.GetY()) / flat < cone)
+                continue;
+            nearest = flat;
+            best = ref;
+        }
+        // The free leg kicks: the right, unless the right foot is the one
+        // under the body (nearer the centre of mass by 8 u or more).
+        const auto footGap = [&](const RagdollLegChain& leg) {
+            const auto foot = entry.mRagdoll->getWorldBodyPosition(entry.mCurrentPhysicsPose, leg.mFoot);
+            if (!foot)
+                return 0.0f;
+            const JPH::Vec3 d(*foot - entry.mSituationCom);
+            return std::hypot(d.GetX(), d.GetY());
+        };
+        entry.mKickRight = !(footGap(*entry.mRightLeg) + 8.0f < footGap(*entry.mLeftLeg));
+        const MWWorld::Store<ESM::GameSetting>& gmst = MWBase::Environment::get().getESMStore()->get<ESM::GameSetting>();
+        const float cost = k.mFatigue
+            * (gmst.find("fFatigueAttackBase")->mValue.getFloat()
+                + actor.getClass().getNormalizedEncumbrance(actor) * gmst.find("fFatigueAttackMult")->mValue.getFloat());
+        if (cost > 0.0f
+            && !(actor == MWMechanics::getPlayer() && MWBase::Environment::get().getWorld()->getGodModeState()))
+        {
+            auto fatigue = stats.getFatigue();
+            fatigue.setCurrent(fatigue.getCurrent() - cost);
+            stats.setFatigue(fatigue);
+        }
+        entry.mKickTime = 0.0f;
+        entry.mKickLanded = false;
+        entry.mKickFootSpeed = 0.0f;
+        entry.mKickTarget = best;
+        entry.mKickAim.reset();
+        entry.mKickCooldown = k.mCooldown;
+        ++entry.mKickCount;
+        Log(Debug::Info) << "RAGDOLL_KICK actor=" << ptr.getCellRef().getRefId() << " target="
+                         << (best ? mPassiveRagdolls.at(best)->getPtr().getCellRef().getRefId().serializeText()
+                                  : std::string("-"))
+                         << " distance=" << (best ? nearest : -1.0f) << " leg=" << (entry.mKickRight ? "right" : "left")
+                         << " fatigue=" << cost;
+        return true;
+    }
+
+    // KICK-01: the kick's clock, its aim (the target's middle, followed) and
+    // the blow - when the kicking foot touches a body of the target in the
+    // strike: Morrowind's hand-to-hand damage at the foot's speed (fatigue
+    // damage, Hand-to-hand skill, as a fist), and a push of `push u/s` x
+    // `push kg` x Strength / 50 (0.6-1.4) x the foot's speed / 350 (0.5-1.25),
+    // x 0.8 into a raised guard, through the blow reactions (stagger plan,
+    // catch steps, knockdown odds).
+    // KICK-01: the leg's muscles - a spring pulling the foot (and half as
+    // much the shin) to the kick's point for its time (the chamber, then the
+    // aim), with gravity carried, and the pelvis pushed back by the same.
+    static void driveKickFoot(JPH::PhysicsSystem& physics, PassiveRagdollEntry& entry, const RagdollLegChain& leg)
+    {
+        const auto& k = PassiveRagdollEntry::kickSettings();
+        if (!(k.mDrive > 0.0f) || !entry.mPelvisBodyIndex || entry.mKickTime >= k.mChamber + k.mStrike
+            || !entry.mCurrentPhysicsPoseCaptured)
+            return;
+        JPH::BodyInterface& bodies = physics.GetBodyInterface();
+        const auto geometry = entry.mRagdoll->getHingeLegGeometry(leg.mHip, leg.mKnee, leg.mFoot);
+        const auto hip = entry.mRagdoll->getWorldBodyPosition(entry.mCurrentPhysicsPose, leg.mHip);
+        if (!geometry || !hip)
+            return;
+        const auto unit = entry.mRagdoll->getWorldVector(JPH::Vec3::sAxisX());
+        const float scale = unit && unit->Length() > 0.0f ? unit->Length() : 1.0f;
+        const float reach = (geometry->mUpperOffset.Length() + geometry->mLowerOffset.Length()) * scale;
+        const float yaw = entry.getPtr().getRefData().getPosition().rot[2];
+        const JPH::Vec3 forward(std::sin(yaw), std::cos(yaw), 0.0f);
+        const JPH::Vec3 up = JPH::Vec3::sAxisZ();
+        // The hip joint is at the thigh's top; the thigh body's centre is
+        // half a thigh lower.
+        const JPH::RVec3 joint = *hip + JPH::RVec3(up * (0.5f * geometry->mUpperOffset.Length() * scale));
+        JPH::RVec3 goal = joint + JPH::RVec3(forward * (0.35f * reach) - up * (0.5f * reach));
+        if (entry.mKickTime >= k.mChamber)
+        {
+            JPH::Vec3 out = entry.mKickAim ? JPH::Vec3(*entry.mKickAim - joint) : forward * reach - up * (0.3f * reach);
+            const float length = out.Length();
+            if (length > 1e-3f)
+                goal = joint + JPH::RVec3(out * (std::min(length, 0.98f * reach) / length));
+        }
+        const auto& masses = entry.mRagdoll->getBodyMasses();
+        const JPH::BodyID pelvis = entry.mRagdoll->getBodyId(*entry.mPelvisBodyIndex);
+        const JPH::Vec3 base = bodies.GetLinearVelocity(pelvis);
+        const float omega = 2.0f * 3.14159265f * k.mDrive;
+        const JPH::Vec3 gravity = physics.GetGravity();
+        JPH::Vec3 total = JPH::Vec3::sZero();
+        for (const auto& [body, share] : { std::pair{ leg.mFoot, 1.0f }, std::pair{ leg.mKnee, 0.5f } })
+        {
+            if (body >= masses.size())
+                continue;
+            const JPH::BodyID id = entry.mRagdoll->getBodyId(body);
+            const JPH::Vec3 error(goal - bodies.GetCenterOfMassPosition(id));
+            const JPH::Vec3 velocity = bodies.GetLinearVelocity(id) - base;
+            const float mass = masses[body] * share;
+            JPH::Vec3 force = mass * (omega * omega * error - 1.4f * omega * velocity) - masses[body] * share * gravity;
+            // At most 40 body weights of the part (a hard kick, not a launch).
+            const float cap = 40.0f * masses[body] * gravity.Length();
+            if (force.Length() > cap)
+                force *= cap / force.Length();
+            bodies.AddForce(id, force);
+            total += force;
+        }
+        bodies.AddForce(pelvis, -total);
+    }
+
+    void PhysicsSystem::stepKicks(float dt)
+    {
+        const auto& k = PassiveRagdollEntry::kickSettings();
+        JPH::BodyInterface& bodies = mPhysicsSystem.GetBodyInterface();
+        for (auto& [ref, entryPtr] : mPassiveRagdolls)
+        {
+            PassiveRagdollEntry& entry = *entryPtr;
+            entry.mKickCooldown = std::max(0.0f, entry.mKickCooldown - dt);
+            if (!entry.kicking())
+                continue;
+            entry.mKickTime += dt;
+            const RagdollLegChain* leg = entry.kickLeg();
+            if (entry.mKickTime >= k.mChamber + k.mStrike + k.mRecover || !entry.mPowered || !leg
+                || leg->mFoot >= entry.mRagdoll->getBodyCount())
+            {
+                Log(Debug::Info) << "RAGDOLL_KICK_END actor=" << entry.getPtr().getCellRef().getRefId()
+                                 << " landed=" << entry.mKickLanded << " foot_speed=" << entry.mKickFootSpeed;
+                entry.endKick();
+                continue;
+            }
+            const auto target = mPassiveRagdolls.find(static_cast<const MWWorld::LiveCellRefBase*>(entry.mKickTarget));
+            if (target == mPassiveRagdolls.end() || !target->second->mPowered || !target->second->mRagdoll)
+            {
+                entry.mKickAim.reset();
+                driveKickFoot(mPhysicsSystem, entry, *leg);
+                continue;
+            }
+            PassiveRagdollEntry& victim = *target->second;
+            // The aim: the abdomen (else the pelvis or chest).
+            std::optional<std::uint32_t> aimBody;
+            for (const auto region : { RagdollCore::AnatomicalRegion::Abdomen, RagdollCore::AnatomicalRegion::Pelvis,
+                     RagdollCore::AnatomicalRegion::Chest })
+            {
+                for (std::size_t i = 0; i < victim.mBodyRegions.size() && !aimBody; ++i)
+                    if (victim.mBodyRegions[i] == region && !victim.isDetachedWeaponBody(i)
+                        && i < victim.mRagdoll->getBodyCount())
+                        aimBody = static_cast<std::uint32_t>(i);
+                if (aimBody)
+                    break;
+            }
+            if (aimBody)
+                entry.mKickAim = bodies.GetCenterOfMassPosition(victim.mRagdoll->getBodyId(*aimBody));
+            const JPH::BodyID footId = entry.mRagdoll->getBodyId(leg->mFoot);
+            const JPH::Vec3 footVelocity = bodies.GetLinearVelocity(footId);
+            driveKickFoot(mPhysicsSystem, entry, *leg);
+            if (entry.mKickLanded || !entry.kickStriking())
+                continue;
+            entry.mKickFootSpeed = std::max(entry.mKickFootSpeed, footVelocity.Length());
+            // Touching: the foot's shape within 1.5 u of one of the target's.
+            JPH::TransformedShape footShape;
+            {
+                JPH::BodyLockRead lock(mPhysicsSystem.GetBodyLockInterface(), footId);
+                if (lock.Succeeded())
+                    footShape = lock.GetBody().GetTransformedShape();
+            }
+            std::optional<std::uint32_t> struck;
+            for (std::size_t body = 0; footShape.mShape && body < victim.mRagdoll->getBodyCount(); ++body)
+            {
+                if (victim.isDetachedWeaponBody(body))
+                    continue;
+                JPH::TransformedShape targetShape;
+                {
+                    JPH::BodyLockRead lock(mPhysicsSystem.GetBodyLockInterface(), victim.mRagdoll->getBodyId(body));
+                    if (lock.Succeeded())
+                        targetShape = lock.GetBody().GetTransformedShape();
+                }
+                if (targetShape.mShape && RagdollCore::contactShapesWithinDistance(footShape, targetShape, 1.5f))
+                {
+                    struck = static_cast<std::uint32_t>(body);
+                    break;
+                }
+            }
+            if (!struck)
+                continue;
+            entry.mKickLanded = true;
+            // The leg comes back from here.
+            entry.mKickTime = std::max(entry.mKickTime, k.mChamber + k.mStrike);
+            const MWWorld::Ptr kicker = entry.getPtr();
+            const MWWorld::Ptr victimPtr = victim.getPtr();
+            const JPH::RVec3 point = bodies.GetCenterOfMassPosition(footId);
+            const JPH::Vec3 relative = footVelocity - bodies.GetLinearVelocity(victim.mRagdoll->getBodyId(*struck));
+            const float footSpeed = std::max(entry.mKickFootSpeed, relative.Length());
+            const auto region
+                = *struck < victim.mBodyRegions.size() ? victim.mBodyRegions[*struck] : RagdollCore::AnatomicalRegion::Abdomen;
+            const auto damage = MWMechanics::applyPhysicalHandStrike(kicker, victimPtr, Misc::Convert::toOsg(point),
+                footSpeed, 1.0f, RagdollCore::PhysicalDefenseOutcome::Hit);
+            const JPH::Vec3 d(victim.mSituationCom - entry.mSituationCom);
+            const float flat = std::max(1.0f, std::hypot(d.GetX(), d.GetY()));
+            const JPH::Vec3 direction = JPH::Vec3(d.GetX() / flat, d.GetY() / flat, 0.1f).Normalized();
+            const auto& kickerStats = kicker.getClass().getCreatureStats(kicker);
+            // K2_PUSH_KICK: Strength, the body behind the sole, the run-in.
+            RagdollCore::PushKickInput kickIn;
+            kickIn.mStrength = kickerStats.getAttribute(ESM::Attribute::Strength).getModified();
+            kickIn.mHandToHand = kicker.getClass().getSkill(kicker, ESM::Skill::HandToHand);
+            {
+                RagdollCore::RagdollMomentum momentum;
+                if (entry.mRagdoll && entry.mRagdoll->captureMomentum(momentum) && momentum.mTotalMass > 0.0f)
+                {
+                    kickIn.mKickerMass = momentum.mTotalMass;
+                    kickIn.mKickerAlong = (momentum.mLinearMomentum / momentum.mTotalMass)
+                                              .Dot(JPH::Vec3(direction.GetX(), direction.GetY(), 0.0f));
+                }
+            }
+            kickIn.mFootSpeed = footSpeed;
+            kickIn.mLegMass = k.mMass;
+            kickIn.mBaseSpeed = k.mSpeed;
+            kickIn.mGuarded = victim.mGuardActive;
+            {
+                float victimMass = 0.0f;
+                const auto& victimMasses = victim.mRagdoll->getBodyMasses();
+                for (std::size_t i = 0; i < victimMasses.size(); ++i)
+                    if (!victim.isDetachedWeaponBody(i))
+                        victimMass += victimMasses[i];
+                if (victimMass > 0.0f)
+                    kickIn.mVictimMass = victimMass;
+            }
+            const RagdollCore::PushKick kickPush = RagdollCore::pushKick(kickIn, k2PushKick());
+            RagdollCore::Blow blow;
+            blow.mId = RagdollCore::nextBlowId();
+            blow.mPhysicsStep = mJoltStepSerial;
+            blow.mAttacker = entry.mSerial;
+            blow.mVictim = victim.mSerial;
+            blow.mKind = RagdollCore::BlowKind::Fist;
+            blow.mRegion = region;
+            blow.mBodyIndex = *struck;
+            blow.mDirection = direction;
+            blow.mPoint = point;
+            blow.mAttackerToVictim = JPH::Vec3(direction.GetX(), direction.GetY(), 0.0f).Normalized();
+            blow.mApproachSpeed = kickPush.mSpeed;
+            blow.mCarriedMass = kickPush.mMass;
+            blow.mBodyCarry = kickPush.mCarry;
+            blow.mDamage = damage ? damage->mFinalDamage : 0.0f;
+            blow.mReactionImpulse = 0.0f;
+            blow.mVictimState = victim.blowVictimState();
+            const float pushed = applyBlowReaction(victim, blow);
+            // A kick this heavy puts its victim on the ground, along the kick.
+            if (kickPush.mFells && victim.mPowered && !victim.mSoftRootToppled && victim.mFallDecidedTime >= 1.5f
+                && !victimPtr.getClass().getCreatureStats(victimPtr).isDead())
+                victim.decideFall("kick", { blow.mAttackerToVictim.GetX(), blow.mAttackerToVictim.GetY() });
+            // The kicker pays for a heavy kick with its own balance: its body
+            // takes the recoil, back along the kick (user 11-03: "the drawback
+            // of kicking is that it will unbalance you").
+            if (kickPush.mRecoil > 0.0f)
+                for (std::size_t i = 0; i < entry.mRagdoll->getBodyCount(); ++i)
+                    if (!entry.isDetachedWeaponBody(i))
+                        bodies.AddLinearVelocity(entry.mRagdoll->getBodyId(i), -blow.mAttackerToVictim * kickPush.mRecoil);
+            ++entry.mKickHitCount;
+            if (kicker == MWMechanics::getPlayer())
+                entry.mCameraKick = std::max(entry.mCameraKick, 0.3f);
+            Log(Debug::Info) << "RAGDOLL_KICK_HIT actor=" << kicker.getCellRef().getRefId()
+                             << " victim=" << victimPtr.getCellRef().getRefId()
+                             << " region=" << static_cast<int>(region) << " foot_speed=" << footSpeed
+                             << " push=" << blow.mApproachSpeed << " mass=" << blow.mCarriedMass
+                             << " pushed=" << pushed << " carry=" << kickPush.mCarry << " recoil=" << kickPush.mRecoil << " fells=" << kickPush.mFells
+                             << " damage=" << blow.mDamage << " guard=" << victim.mGuardActive
+                             << " at=" << entry.mKickTime;
         }
     }
 
@@ -8796,6 +10361,14 @@ namespace MWPhysics
             found->second->mRiposteGranted = 0.5f;
     }
 
+    void PhysicsSystem::requestRagdollAiFightThrough(const MWWorld::ConstPtr& ptr)
+    {
+        std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
+        const auto found = mPassiveRagdolls.find(ptr.mRef);
+        if (found != mPassiveRagdolls.end())
+            found->second->mFightThroughGranted = 0.5f;
+    }
+
     bool PhysicsSystem::requestRagdollDodge(const MWWorld::ConstPtr& ptr, std::optional<osg::Vec3f> direction)
     {
         std::scoped_lock lock(mTaskScheduler->getSimulationMutex());
@@ -8859,6 +10432,7 @@ namespace MWPhysics
                                                                  : 0;
         }
         view.mGuardBroken = entry.mClashLockout > 0.0f;
+        view.mGettingBearings = entry.mLastBearings > 0.0f;
         view.mSinceParryWon = entry.mAiSinceParryWon;
         // The blade's side (NPC dodges): its tip across the body's facing.
         if (entry.mDuelTipPoint && entry.mPelvisBodyIndex && entry.mCurrentPhysicsPoseCaptured)
@@ -9191,7 +10765,13 @@ namespace MWPhysics
             }
             // Physical momentum: bound how fast the capsule's horizontal
             // velocity may change, over the fixed steps since the last call.
-            const float limit = entry.mRagdoll->getSoftRoot().mBody.mCapsuleAcceleration;
+            // K2_MOVE_ACCEL (roottarget.hpp): the bound from the actor's Speed.
+            static const auto moveAccel_tuned = RagdollCore::tuned([] { return RagdollCore::moveAccelSettings(); });
+            const RagdollCore::MoveAccelSettings& moveAccel = moveAccel_tuned.get();
+            float limit = entry.mRagdoll->getSoftRoot().mBody.mCapsuleAcceleration;
+            if (moveAccel.mLow > 0.0f)
+                limit = RagdollCore::moveAcceleration(moveAccel, limit,
+                    ptr.getClass().getCreatureStats(ptr).getAttribute(ESM::Attribute::Speed).getModified());
             const float elapsed = static_cast<float>(mJoltStepSerial - entry.mCapsuleStepSerial) * mPhysicsDt;
             entry.mCapsuleStepSerial = mJoltStepSerial;
             if (limit > 0.0f && entry.mCapsuleVelocity && elapsed > 0.0f && elapsed < 0.25f)
@@ -9679,7 +11259,10 @@ namespace MWPhysics
             traceStep("input");
 #endif
             stepPendingShoves(mPhysicsDt);
+            stepKicks(mPhysicsDt);
             stepDeathDrag(mPhysicsDt);
+            stepDeathLimits(mPhysicsDt);
+            stepLodges(mPhysicsDt);
             stepNetPuppet();
             // PGC-03 D13: the nearest other body within 70 units of each
             // powered one (last step's situations), for a hand to catch.
@@ -10029,7 +11612,9 @@ namespace MWPhysics
                         continue;
                     }
                     const bool animationAssisted = mPassiveRagdollProfile && entry->mMotorTargetCaptured
-                        && entry->mControllerOutput && entry->mUprightControllerOutput
+                        && entry->mControllerOutput
+                        && RagdollCore::animationRouteHasControl(
+                            entry->mUprightControllerOutput.has_value(), entry->mRagdoll->isRootKinematic())
                         && entry->mPelvisBodyIndex
                         && RagdollCore::shouldUseAnimationAssistedActuation(
                             mPassiveRagdollProfile->mActiveController.mLocomotionRoute,
@@ -10069,16 +11654,117 @@ namespace MWPhysics
                         gated(std::nullopt, [&] { entry->applyWeaponFixtureYaw(drivePose); });
                         gated(Owner::Balance,
                             [&] { entry->applyBalanceLegCorrection(drivePose, animationTargetPose, activeProfile); });
+                        // KINETIC-2 step 3: which bodies each pre-Footfall leg
+                        // writer changed, to see below whether its value
+                        // reached the motors or Footfall rewrote it.
+                        using Path = RagdollCore::CountedPath;
+                        std::array<std::vector<std::pair<std::size_t, RagdollCore::Transform>>, 4> legWrites;
+                        const auto recordLegWrite = [&](std::size_t writer, auto&& write) {
+                            const std::vector<RagdollCore::Transform> before = drivePose.mBodyTransforms;
+                            write();
+                            for (std::size_t body = 0; body < before.size() && body < drivePose.mBodyTransforms.size();
+                                 ++body)
+                                if (!(before[body].mTranslation == drivePose.mBodyTransforms[body].mTranslation)
+                                    || !(before[body].mRotation == drivePose.mBodyTransforms[body].mRotation))
+                                    legWrites[writer].emplace_back(body, drivePose.mBodyTransforms[body]);
+                        };
                         gated(Owner::Locomotion, [&] {
-                            entry->applyLegTravelYaw(drivePose, mPhysicsDt);
-                            entry->applyRunBackKick(drivePose);
-                            entry->applyFootGrounding(drivePose, mPhysicsDt);
-                            entry->applySwingClearance(drivePose);
+                            recordLegWrite(0, [&] { entry->applyLegTravelYaw(drivePose, mPhysicsDt); });
+                            recordLegWrite(1, [&] { entry->applyRunBackKick(drivePose); });
+                            recordLegWrite(2, [&] { entry->applyFootGrounding(drivePose, mPhysicsDt); });
+                            recordLegWrite(3, [&] { entry->applySwingClearance(drivePose); });
                             entry->applyFootfall(drivePose, animationTargetPose, mPhysicsDt);
+                            // The clip Footfall stepped from, every physics step,
+                            // for StrideSim's playback (MOVE-01 W1).
+                            // OPENMW_RAGDOLL_CLIP_DUMP=path (unset = off).
+                            if (entry->getPtr() == MWMechanics::getPlayer())
+                                if (const char* clipPath = RagdollCore::tuningText("OPENMW_RAGDOLL_CLIP_DUMP");
+                                    clipPath && *clipPath)
+                                {
+                                    static std::ofstream clipOut(clipPath);
+                                    clipOut << RagdollCore::clipTrackLine(
+                                                   std::hypot(entry->mRawTargetHorizontalVelocity.GetX(),
+                                                       entry->mRawTargetHorizontalVelocity.GetY()),
+                                                   animationTargetPose.mBodyTransforms)
+                                            << '\n';
+                                }
+                            // The player's body state every physics step, line for
+                            // line with the clip dump, for StrideSim to start from
+                            // (MOVE-01 W1, the replay bridge): the actor's origin and
+                            // yaw and the body count, then per body its centre of
+                            // mass, rotation (x y z w), linear and angular velocity,
+                            // in body order. OPENMW_RAGDOLL_STATE_DUMP=path (unset = off).
+                            if (entry->getPtr() == MWMechanics::getPlayer())
+                                if (const char* statePath = RagdollCore::tuningText("OPENMW_RAGDOLL_STATE_DUMP");
+                                    statePath && *statePath)
+                                {
+                                    static std::ofstream stateOut(statePath);
+                                    const auto& origin = entry->getPtr().getRefData().getPosition();
+                                    const JPH::BodyInterface& bodies = mPhysicsSystem.GetBodyInterface();
+                                    // Once: each body's mass and shape bounds (W1 parity).
+                                    static bool massesLogged = false;
+                                    if (!massesLogged)
+                                    {
+                                        massesLogged = true;
+                                        std::ostringstream masses;
+                                        masses << "RAGDOLL_BODY_MASSES";
+                                        const auto& mass = entry->mRagdoll->getBodyMasses();
+                                        for (std::size_t body = 0; body < entry->mRagdoll->getBodyCount(); ++body)
+                                        {
+                                            const JPH::Vec3 size = bodies.GetShape(entry->mRagdoll->getBodyId(body))
+                                                                       ->GetLocalBounds()
+                                                                       .GetSize();
+                                            masses << ' ' << body << ':' << (body < mass.size() ? mass[body] : -1.0f)
+                                                   << '/' << size.GetX() << 'x' << size.GetY() << 'x' << size.GetZ() << '/'
+                                                   << static_cast<int>(bodies.GetShape(entry->mRagdoll->getBodyId(body))->GetSubType());
+                                        }
+                                        Log(Debug::Info) << masses.str();
+                                    }
+                                    stateOut << std::setprecision(9) << origin.pos[0] << ' ' << origin.pos[1] << ' '
+                                             << origin.pos[2] << ' ' << origin.rot[2] << ' '
+                                             << entry->mRagdoll->getBodyCount();
+                                    for (std::size_t body = 0; body < entry->mRagdoll->getBodyCount(); ++body)
+                                    {
+                                        const JPH::BodyID id = entry->mRagdoll->getBodyId(body);
+                                        const JPH::RVec3 p = bodies.GetCenterOfMassPosition(id);
+                                        const JPH::Quat q = bodies.GetRotation(id);
+                                        const JPH::Vec3 v = bodies.GetLinearVelocity(id);
+                                        const JPH::Vec3 w = bodies.GetAngularVelocity(id);
+                                        stateOut << ' ' << p.GetX() << ' ' << p.GetY() << ' ' << p.GetZ() << ' '
+                                                 << q.GetX() << ' ' << q.GetY() << ' ' << q.GetZ() << ' ' << q.GetW()
+                                                 << ' ' << v.GetX() << ' ' << v.GetY() << ' ' << v.GetZ() << ' '
+                                                 << w.GetX() << ' ' << w.GetY() << ' ' << w.GetZ();
+                                    }
+                                    stateOut << '\n';
+                                }
                             // Jump tuck in the locomotion branch too (jumps run here).
                             entry->applyJumpTuck(drivePose, mPhysicsDt);
                             entry->applyLandingReach(drivePose);
+                            entry->applyKickLeg(drivePose);
                         });
+                        {
+                            const bool player = entry->getPtr() == MWMechanics::getPlayer();
+                            constexpr std::array<std::pair<Path, Path>, 4> legPaths{ {
+                                { Path::LegTravelYawWrote, Path::LegTravelYawKept },
+                                { Path::RunBackKickWrote, Path::RunBackKickKept },
+                                { Path::FootGroundingWrote, Path::FootGroundingKept },
+                                { Path::SwingClearanceWrote, Path::SwingClearanceKept },
+                            } };
+                            for (std::size_t writer = 0; writer < legWrites.size(); ++writer)
+                            {
+                                if (legWrites[writer].empty())
+                                    continue;
+                                RagdollCore::countPath(legPaths[writer].first, player);
+                                for (const auto& [body, written] : legWrites[writer])
+                                    if (body < drivePose.mBodyTransforms.size()
+                                        && written.mTranslation == drivePose.mBodyTransforms[body].mTranslation
+                                        && written.mRotation == drivePose.mBodyTransforms[body].mRotation)
+                                    {
+                                        RagdollCore::countPath(legPaths[writer].second, player);
+                                        break;
+                                    }
+                            }
+                        }
                         entry->mAdaptedMotorTargetPose = drivePose;
                         entry->mAdaptedMotorTargetCaptured = true;
                         std::vector<std::size_t> slackBodies;
@@ -10107,6 +11793,20 @@ namespace MWPhysics
                             && std::find(slackBodies.begin(), slackBodies.end(), *entry->mHeadBodyIndex) == slackBodies.end())
                             if (const auto headTarget = entry->mRagdoll->getWorldBodyRotation(drivePose, *entry->mHeadBodyIndex))
                                 entry->mRagdoll->driveMotorToWorldOrientation(*entry->mHeadBodyIndex, *headTarget, mPhysicsDt);
+                        // K2_HEAD_DAMP: the player's head, part held in the world.
+                        if (const float headDamp = k2HeadDamp();
+                            headDamp > 0.0f && entry->mJointMotorsApplied && entry->mHeadBodyIndex && entry->mTorsoBodyIndex
+                            && entry->mCurrentPhysicsPoseCaptured && entry->getPtr() == MWMechanics::getPlayer()
+                            && std::find(slackBodies.begin(), slackBodies.end(), *entry->mHeadBodyIndex) == slackBodies.end())
+                        {
+                            const auto head = entry->mRagdoll->getWorldBodyRotation(drivePose, *entry->mHeadBodyIndex);
+                            const auto torsoPose = entry->mRagdoll->getWorldBodyRotation(drivePose, *entry->mTorsoBodyIndex);
+                            const auto torsoNow
+                                = entry->mRagdoll->getWorldBodyRotation(entry->mCurrentPhysicsPose, *entry->mTorsoBodyIndex);
+                            if (head && torsoPose && torsoNow)
+                                entry->mRagdoll->driveMotorToWorldOrientation(*entry->mHeadBodyIndex,
+                                    RagdollCore::dampedHeadTarget(*head, *torsoPose, *torsoNow, headDamp), mPhysicsDt);
+                        }
                         if (entry->mJointMotorsApplied && entry->mAiStrikeActive
                             && RagdollCore::tuningText("OPENMW_RAGDOLL_STRIKE_JOINT_FOLLOW")
                             && !RagdollCore::tuningText("OPENMW_RAGDOLL_STRIKE_NO_FEEDFORWARD"))
@@ -10146,25 +11846,6 @@ namespace MWPhysics
                             && entry->mTorsoBodyIndex && entry->mLeftLeg && entry->mRightLeg
                             && entry->mGaitActuationDecision)
                         {
-                            RagdollCore::UprightControllerOutput control
-                                = *entry->mUprightControllerOutput;
-                            if (entry->mRagdoll->isRootKinematic())
-                            {
-                                control.mPelvisForce = JPH::Vec3::sZero();
-                                control.mPelvisTorque = JPH::Vec3::sZero();
-                                // The spine torque holds the chest to world up: under
-                                // the held root it pulled against the animation's
-                                // lean every step (chest 4-11 deg behind the running
-                                // lean, rocking ~3x the animation's pitch, and the
-                                // spine springs could not win; 2026-09-28).
-                                // OPENMW_RAGDOLL_HELD_SPINE_UPRIGHT scales it (1 = old).
-                                static const auto heldSpineUpright_tuned = RagdollCore::tuned<float>([] {
-                                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HELD_SPINE_UPRIGHT");
-                                    return text ? static_cast<float>(std::atof(text)) : 1.0f;
-                                });
-                                static const auto& heldSpineUpright = heldSpineUpright_tuned.get();
-                                control.mSpineTorque *= heldSpineUpright;
-                            }
                             const auto reactions = RagdollCore::selectGaitReactionBodies(
                                 *entry->mGaitActuationDecision,
                                 entry->mSupportEstimate.value_or(RagdollCore::SupportEstimate{}),
@@ -10173,13 +11854,12 @@ namespace MWPhysics
                                 entry->mControllerOutput
                                     && entry->mControllerOutput->mMode
                                         == RagdollCore::ActiveControllerMode::BlendBack);
-                            if (reactions.mHorizontal.empty())
-                            {
-                                control.mPelvisForce.SetX(0.0f);
-                                control.mPelvisForce.SetY(0.0f);
-                            }
-                            if (reactions.mVertical.empty())
-                                control.mPelvisForce.SetZ(0.0f);
+                            // The one rule (ragdollcore uprightholder): under
+                            // the held root only the scaled spine torque.
+                            const RagdollCore::UprightControllerOutput control
+                                = RagdollCore::composeUprightControl(*entry->mUprightControllerOutput,
+                                    entry->mRagdoll->isRootKinematic(), PassiveRagdollEntry::k2HeldSpineUpright(),
+                                    !reactions.mHorizontal.empty(), !reactions.mVertical.empty());
                             entry->mUprightControlApplied = entry->mRagdoll->applyUprightControl(control,
                                 *entry->mPelvisBodyIndex, *entry->mTorsoBodyIndex,
                                 reactions.mVertical, reactions.mHorizontal, activeProfile,
@@ -10743,16 +12423,14 @@ namespace MWPhysics
                             entry->mControllerOutput
                                 && entry->mControllerOutput->mMode == RagdollCore::ActiveControllerMode::BlendBack);
                         entry->mUprightActuationStage = entry->mUprightPolicyStage;
-                        entry->mAppliedUprightControllerOutput = entry->mUprightControllerOutput;
-                        if (reactions.mHorizontal.empty())
-                        {
-                            entry->mAppliedUprightControllerOutput->mPelvisForce.SetX(0.0f);
-                            entry->mAppliedUprightControllerOutput->mPelvisForce.SetY(0.0f);
-                        }
-                        if (reactions.mVertical.empty())
-                            entry->mAppliedUprightControllerOutput->mPelvisForce.SetZ(0.0f);
+                        // The one rule, off the held root: the whole output, a
+                        // force part with no reaction body dropped.
+                        entry->mAppliedUprightControllerOutput
+                            = RagdollCore::composeUprightControl(*entry->mUprightControllerOutput, false, 1.0f,
+                                !reactions.mHorizontal.empty(), !reactions.mVertical.empty());
                         entry->mUprightControlApplied = entry->mRagdoll->applyUprightControl(
-                            *entry->mUprightControllerOutput, *entry->mPelvisBodyIndex, *entry->mTorsoBodyIndex,
+                            *entry->mAppliedUprightControllerOutput,
+                            *entry->mPelvisBodyIndex, *entry->mTorsoBodyIndex,
                             reactions.mVertical, reactions.mHorizontal,
                             mPassiveRagdollProfile->mActiveController, reactions.mAngular,
                             entry->mGaitActuationDecision->mLocomoting, reactions.mSecondaryAngular);
@@ -10965,6 +12643,77 @@ namespace MWPhysics
                             };
                             const float mySpeed = pointSpeed(*entry);
                             const float theirSpeed = bladeOnBlade ? pointSpeed(defender) : 0.0f;
+                            // CLASH-SLIDE: no guard held on either side - the
+                            // blades slide off each other with a small nudge
+                            // (PassiveRagdollEntry::clashSlideSettings).
+                            const auto& slide = PassiveRagdollEntry::clashSlideSettings();
+                            if (bladeOnBlade && slide.mOn && !entry->mGuardActive && !defender.mGuardActive)
+                            {
+                                if (defender.mLastParryStep == strike.physicsStep()
+                                    && defender.mLastParryWith == entry->mSerial)
+                                    continue; // the other side already handled this contact
+                                entry->mLastParryStep = strike.physicsStep();
+                                entry->mLastParryWith = defender.mSerial;
+                                const float theirMass = defender.mWeapon ? defender.mWeapon->mPhysicalMass : 1.0f;
+                                const float nudge = std::clamp(
+                                    std::max(weaponMass, theirMass) * approach * slide.mDeflect, 0.0f, slide.mCap);
+                                if (nudge > 0.0f)
+                                {
+                                    if (entry->mWeapon && entry->mWeapon->mAttached)
+                                        parryBodies.AddImpulse(entry->mRagdoll->getBodyId(entry->mWeapon->mWeaponBody),
+                                            -normal * nudge, strike.point());
+                                    if (defender.mWeapon && defender.mWeapon->mAttached)
+                                        parryBodies.AddImpulse(
+                                            defender.mRagdoll->getBodyId(defender.mWeapon->mWeaponBody),
+                                            normal * nudge, strike.point());
+                                }
+                                spawnSparks(strike.point(), strike.normal(), approach * 0.3f);
+                                static const ESM::RefId scrape = ESM::RefId::stringRefId("Heavy Armor Hit");
+                                MWBase::Environment::get().getSoundManager()->playSound3D(victim, scrape, 0.35f, 1.6f);
+                                ++entry->mClashSlideCount;
+                                ++defender.mClashSlideCount;
+                                Log(Debug::Info) << "RAGDOLL_CLASH_SLIDE reporter=" << attacker.getCellRef().getRefId()
+                                                 << " other=" << victim.getCellRef().getRefId()
+                                                 << " approach=" << approach << " speed=" << mySpeed
+                                                 << " other_speed=" << theirSpeed << " nudge=" << nudge;
+                                // KINETIC-2 (play-6 bookmark): an unparried clash throws
+                                // the struck side's hand up and away and opens its guard
+                                // for a follow-up. The struck side is the slower blade;
+                                // its hand goes along the contact's normal (away from the
+                                // striker) and up, `units` far, its stroke spent, and its
+                                // block stays down `seconds`. Only where the wheel runs
+                                // through the KINETIC-2 planner (K2_WEAPON).
+                                // OPENMW_RAGDOLL_K2_CLASH_OPEN = "units, seconds" (0 = off).
+                                {
+                                    static const auto clashOpen_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                                        std::array<float, 2> value{ 0.0f, 0.0f };
+                                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_CLASH_OPEN"))
+                                            std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                                        for (float& v : value)
+                                            v = std::isfinite(v) ? std::max(0.0f, v) : 0.0f;
+                                        return value;
+                                    });
+                                    const auto& clashOpen = clashOpen_tuned.get();
+                                    const bool struckIsDefender = mySpeed >= theirSpeed;
+                                    PassiveRagdollEntry& struck = struckIsDefender ? defender : *entry;
+                                    if (clashOpen[0] > 0.0f)
+                                    {
+                                        JPH::Vec3 away = struckIsDefender ? normal : -normal;
+                                        away.SetZ(0.0f);
+                                        const JPH::Vec3 throwTo
+                                            = (away.NormalizedOr(JPH::Vec3::sZero()) + JPH::Vec3(0.0f, 0.0f, 1.0f))
+                                                  .NormalizedOr(JPH::Vec3::sAxisZ())
+                                            * clashOpen[0];
+                                        struck.mWheel.beginKnock(
+                                            throwTo, true, false, struck.mWeaponControl * struck.armStrength());
+                                        struck.mWheel.openGuard(clashOpen[1] * k2LockoutShare());
+                                        Log(Debug::Info) << "RAGDOLL_K2_CLASH_OPEN struck="
+                                                         << struck.getPtr().getCellRef().getRefId()
+                                                         << " units=" << clashOpen[0] << " open=" << clashOpen[1];
+                                    }
+                                }
+                                continue;
+                            }
                             if (bladeOnBlade && roles[0] > 0.0f && defender.mLastParryStep == strike.physicsStep()
                                 && defender.mLastParryWith == entry->mSerial)
                                 continue; // the other side already handled this clash
@@ -10994,6 +12743,32 @@ namespace MWPhysics
                                 const float hard = std::min(1.0f, parryBounce[0]);
                                 myHardness = hard * (iAttack ? 1.0f : roles[0]);
                                 theirHardness = hard * (iAttack ? roles[0] : 1.0f);
+                            }
+                            // CLASH-SLIDE: a clash with a guard held - the
+                            // guard's grip and wrist decide how hard it is.
+                            if (bladeOnBlade && slide.mOn && slide.mGrip > 0.0f && roles[0] > 0.0f && defender.mWeapon
+                                && entry->mWeapon)
+                            {
+                                PassiveRagdollEntry& parrySide = iAttack ? defender : *entry;
+                                float grip = parrySide.mWeapon->mTwoHanded ? 1.4f : 1.0f;
+                                if (parrySide.mWeapon->mHandBody < parrySide.mRagdoll->getBodyCount())
+                                    if (const auto hand = parrySide.mRagdoll->getWorldBodyPosition(
+                                            parrySide.mCurrentPhysicsPose, parrySide.mWeapon->mHandBody))
+                                    {
+                                        const float reach = std::max(10.0f, parrySide.mWeapon->tipDistanceFromHand());
+                                        grip *= 1.0f - 0.5f * std::clamp(
+                                            static_cast<float>((strike.point() - *hand).Length()) / reach, 0.0f, 1.0f);
+                                    }
+                                grip *= parrySide.armStrength(); // K2_ARM_STRAIN
+                                // 0.75: one hand, struck mid-blade, Strength 50, fresh.
+                                const float firm = std::clamp(
+                                    std::pow(grip * clashArmFactor(parrySide.getPtr(), true) / 0.75f, slide.mGrip),
+                                    0.5f, 1.5f);
+                                (iAttack ? myImpulse : theirImpulse) *= firm;
+                                (iAttack ? theirImpulse : myImpulse) /= firm;
+                                Log(Debug::Info) << "RAGDOLL_CLASH_GRIP parry=" << parrySide.getPtr().getCellRef().getRefId()
+                                                 << " grip=" << grip << " firm=" << firm
+                                                 << " guard=" << parrySide.mGuardActive;
                             }
                             spawnSparks(strike.point(), strike.normal(), approach);
                             // Weight in the clash (C1, build 59 bookmarks 10/13: a chop
@@ -11112,6 +12887,8 @@ namespace MWPhysics
                                     input.mAttackMomentum *= clashArmFactor(attackSide.getPtr(), false);
                                     input.mGuardFirmness *= clashArmFactor(parrySide.getPtr(), true);
                                 }
+                                // K2_ARM_STRAIN: a guard held by a strained arm gives.
+                                input.mGuardFirmness *= parrySide.armStrength();
                                 input.mBladeAlignment
                                     = attackBlade && parryBlade ? std::abs(attackBlade->Dot(*parryBlade)) : 0.0f;
                                 input.mActiveParry = active;
@@ -11133,7 +12910,7 @@ namespace MWPhysics
                                         {
                                             attackKick *= 1.5f;
                                             attackSide.mClashLockout = std::max(attackSide.mClashLockout,
-                                                std::max(clash.mAttackerLockout, 0.4f));
+                                                std::max(clash.mAttackerLockout, 0.4f) * k2LockoutShare());
                                             // AI-02 item 5: the parry won - a riposte window.
                                             if (!clash.mDefenderDisarmed)
                                                 parrySide.mAiSinceParryWon = 0.0f;
@@ -11144,7 +12921,8 @@ namespace MWPhysics
                                             pushThrough = std::max(pushThrough, clash.mRatio);
                                             parryKick *= 1.5f;
                                             parrySide.mGuardActive = false;
-                                            parrySide.mClashLockout = std::max(parrySide.mClashLockout, 0.55f);
+                                            parrySide.mClashLockout
+                                                = std::max(parrySide.mClashLockout, 0.55f * k2LockoutShare());
                                         }
                                         break;
                                     case RagdollCore::ClashOutcome::BrokenGuard:
@@ -11152,8 +12930,8 @@ namespace MWPhysics
                                         pushThrough = std::max(pushThrough, clash.mRatio);
                                         parryKick *= 1.5f;
                                         parrySide.mGuardActive = false;
-                                        parrySide.mClashLockout
-                                            = std::max(parrySide.mClashLockout, clash.mDefenderLockout);
+                                        parrySide.mClashLockout = std::max(
+                                            parrySide.mClashLockout, clash.mDefenderLockout * k2LockoutShare());
                                         break;
                                     case RagdollCore::ClashOutcome::Bounce:
                                         // The blow stopped on the guard: a parry won
@@ -11164,6 +12942,22 @@ namespace MWPhysics
                                         if (!parrySide.blowVictimState().mAttacking)
                                             parrySide.mAiSinceParryWon = 0.0f;
                                         break;
+                                }
+                                // K2_ARM_STRAIN: the parrying arm takes the clash; spent,
+                                // its guard drops (and stays down while it is).
+                                if (const auto& strain = PassiveRagdollEntry::armStrainSettings(); strain.on())
+                                {
+                                    const bool player = parrySide.getPtr() == MWMechanics::getPlayer();
+                                    const float before = parrySide.armStrength();
+                                    const bool spentNow = parrySide.mArmStrain.takeClash(
+                                        clash.mRatio, player ? strain.mPlayer : 1.0f, strain);
+                                    if (spentNow)
+                                        parrySide.mGuardActive = false;
+                                    Log(Debug::Info) << "RAGDOLL_K2_ARM_STRAIN actor="
+                                                     << parrySide.getPtr().getCellRef().getRefId()
+                                                     << " ratio=" << clash.mRatio << " strain=" << parrySide.mArmStrain.strain()
+                                                     << " strength=" << before << "->" << parrySide.armStrength()
+                                                     << (spentNow ? " spent" : "");
                                 }
                                 Log(Debug::Info) << "RAGDOLL_CLASH attacker=" << attackSide.getPtr().getCellRef().getRefId()
                                                  << " parry=" << parrySide.getPtr().getCellRef().getRefId()
@@ -11461,6 +13255,44 @@ namespace MWPhysics
                         guardCover = target->second->guardCoverDistance(strike.point());
                         guardCovers = guardCover <= guardCoverRadius;
                     }
+                    // FIST-08 (K2_PALM_PARRY): a weapon against the player's
+                    // bare-handed guard. The blow is turned by the palm that is
+                    // out - it struck that arm, or landed within the cover of
+                    // its hand - and lands otherwise (before the palm, after
+                    // it, away from it): bare hands held up do not stop a cut,
+                    // only a blade that comes onto them slowly.
+                    RagdollCore::PalmContactResult palm;
+                    if (!unarmedStrike && target->second->palmParryUp())
+                    {
+                        PassiveRagdollEntry& guardSide = *target->second;
+                        RagdollCore::PalmContactInput palmInput;
+                        palmInput.mPhase = guardSide.mPalmParry.phase();
+                        palmInput.mLive = guardSide.mPalmParry.live();
+                        palmInput.mCommitted = guardSide.mPalmParry.committed();
+                        palmInput.mSkill = guardSide.mPalmSkill;
+                        const auto& arm = guardSide.mPalmParry.palm() == 0 ? guardSide.mLeftArm : guardSide.mRightArm;
+                        if (guardSide.mPalmParry.palm() >= 0 && arm)
+                        {
+                            const std::uint32_t struck = strike.targetBodyIndex();
+                            palmInput.mOnPalmArm
+                                = struck == arm->mHand || struck == arm->mElbow || struck == arm->mShoulder;
+                            if (const auto hand
+                                = guardSide.mRagdoll->getWorldBodyPosition(guardSide.mCurrentPhysicsPose, arm->mHand))
+                                palmInput.mDistance = static_cast<float>((strike.point() - *hand).Length());
+                        }
+                        if (entry->mWeapon)
+                        {
+                            palmInput.mWeaponWeight = entry->mWeapon->mItemWeight;
+                            palmInput.mTwoHanded = entry->mWeapon->mTwoHanded;
+                        }
+                        palmInput.mSpeed = std::max(strike.damageSpeed(), strike.relativeNormalSpeed());
+                        palmInput.mCovered = guardCovers;
+                        palm = RagdollCore::resolvePalmContact(palmInput, PassiveRagdollEntry::palmParrySettings());
+                        // (a slow blade on the raised hands keeps the guard's cover)
+                        if (palm.mOutcome != RagdollCore::PalmContactOutcome::None
+                            && palm.mOutcome != RagdollCore::PalmContactOutcome::Covered)
+                            guardCovers = false;
+                    }
                     const RagdollCore::PhysicalDefenseInput defenseInput{
                         strike.valid(), MWMechanics::isFriendlyPhysicalContact(attacker, victim),
                         guardCovers, strike.physicsStep(), target->second->mGuardStartPhysicsStep,
@@ -11507,7 +13339,38 @@ namespace MWPhysics
                             continue;
                         }
                     }
-                    const auto defense = RagdollCore::classifyPhysicalDefense(defenseInput, defenseProfile);
+                    // K2_HELD_NOT_BODY (registry): a blow on the victim's own
+                    // weapon or shield is a meeting of arms, not a wound (11-07
+                    // play: the guard's hand on the player's claymore, body 20,
+                    // region unknown, counted as a hit for 19.6 fatigue and
+                    // knocked the exhausted player out).
+                    static const auto heldNotBody_tuned = RagdollCore::tuned<bool>([] {
+                        const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HELD_NOT_BODY");
+                        return text && std::atoi(text) != 0;
+                    });
+                    if (heldNotBody_tuned.get())
+                    {
+                        const auto& victimEntry = *target->second;
+                        const std::uint32_t struck = strike.targetBodyIndex();
+                        const bool onWeapon = victimEntry.mWeapon && struck == victimEntry.mWeapon->mWeaponBody;
+                        const bool onShield = victimEntry.mShield && struck == victimEntry.mShield->mShieldBody;
+                        if (onWeapon || onShield)
+                        {
+                            if (mJoltStepSerial - entry->mHeldBlowLogged >= 60)
+                            {
+                                entry->mHeldBlowLogged = mJoltStepSerial;
+                                Log(Debug::Info) << "RAGDOLL_HELD_NOT_BODY attacker=" << attacker.getCellRef().getRefId()
+                                                 << " victim=" << victim.getCellRef().getRefId()
+                                                 << " on=" << (onWeapon ? "weapon" : "shield")
+                                                 << " speed=" << strike.damageSpeed();
+                            }
+                            continue;
+                        }
+                    }
+                    auto defense = RagdollCore::classifyPhysicalDefense(defenseInput, defenseProfile);
+                    // FIST-08: what the palm did not turn is still paid by the arm.
+                    if (palm.mOutcome == RagdollCore::PalmContactOutcome::Deflect)
+                        defense.mDamageScale *= palm.mDamageScale;
                     entry->mLastPhysicalDefense = defense;
                     entry->mLastWeaponRedirectImpulse = 0.0f;
                     if (!defense.emitsOutcome())
@@ -11516,7 +13379,19 @@ namespace MWPhysics
                                      << " guard=" << target->second->mGuardActive << " cover=" << guardCover
                                      << " facing=" << guardFacingAlignment
                                      << " damage_speed=" << strike.damageSpeed() << " relative_speed=" << strike.relativeSpeed()
-                                     << " tip=" << entry->mTip.mActive << " ai=" << entry->mAiStrikeActive;
+                                     << " tip=" << entry->mTip.mActive << " ai=" << entry->mAiStrikeActive
+                                     << " body=" << strike.targetBodyIndex() << " at=" << [&] {
+                                            std::ostringstream o;
+                                            o << std::fixed << std::setprecision(1);
+                                            if (target->second->mTorsoBodyIndex)
+                                                if (const auto chest = target->second->mRagdoll->getWorldBodyPosition(
+                                                        target->second->mCurrentPhysicsPose, *target->second->mTorsoBodyIndex))
+                                                {
+                                                    const JPH::Vec3 d(strike.point() - *chest);
+                                                    o << d.GetX() << "," << d.GetY() << "," << d.GetZ();
+                                                }
+                                            return o.str();
+                                        }();
                     ++entry->mConsumedWeaponDefenseOutcomeCount;
                     // The struck NPC learns (updateAiGuard): a blow taken, by the
                     // attacker's wheel line.
@@ -11625,6 +13500,72 @@ namespace MWPhysics
                     {
                         ++entry->mConsumedWeaponCooldownSuppressedCount;
                         continue;
+                    }
+                    // FIST-08 (K2_PALM_PARRY), once a blow: the deflected weapon is
+                    // thrown off its line - out to the side it came from, up and
+                    // back along its travel - the attacker's stroke ends, it cannot
+                    // cut again for the opening, and the palm pays vanilla's block
+                    // fatigue and uses Hand-to-hand.
+                    if (palm.mOutcome != RagdollCore::PalmContactOutcome::None)
+                    {
+                        PassiveRagdollEntry& guardSide = *target->second;
+                        const bool deflected = palm.mOutcome == RagdollCore::PalmContactOutcome::Deflect;
+                        float impulse = 0.0f;
+                        if (deflected && strike.physicsStep() - guardSide.mPalmDeflectStep > 20)
+                        {
+                            guardSide.mPalmDeflectStep = strike.physicsStep();
+                            ++guardSide.mPalmParries;
+                            guardSide.mPalmParry.met();
+                            JPH::BodyInterface& palmBodies = mPhysicsSystem.GetBodyInterface();
+                            JPH::Vec3 right = defenderForward.Cross(JPH::Vec3::sAxisZ()).NormalizedOr(JPH::Vec3::sAxisX());
+                            const JPH::Vec3 outward = (contactOffset.Dot(right) < 0.0f ? -1.0f : 1.0f) * right;
+                            JPH::Vec3 travel = JPH::Vec3::sZero();
+                            if (entry->mWeapon && entry->mWeapon->mAttached
+                                && entry->mWeapon->mWeaponBody < entry->mRagdoll->getBodyCount())
+                                travel = palmBodies.GetPointVelocity(
+                                    entry->mRagdoll->getBodyId(entry->mWeapon->mWeaponBody), strike.point());
+                            const JPH::Vec3 aside = (outward * 0.7f + JPH::Vec3(0.0f, 0.0f, 0.25f)
+                                - travel.NormalizedOr(JPH::Vec3::sZero()) * 0.6f).NormalizedOr(outward);
+                            if (entry->mWeapon && entry->mWeapon->mAttached)
+                            {
+                                impulse = std::clamp(strike.effectiveMass()
+                                    * std::max(strike.relativeNormalSpeed(), strike.damageSpeed())
+                                    * (1.0f + palm.mImpulseScale), 0.0f, 80.0f);
+                                palmBodies.AddImpulse(entry->mRagdoll->getBodyId(entry->mWeapon->mWeaponBody),
+                                    aside * impulse, strike.point());
+                                entry->mLastWeaponRedirectImpulse = impulse;
+                            }
+                            entry->beginHscKnock(aside * palm.mKnock, true);
+                            entry->mClashLockout = std::max(entry->mClashLockout, palm.mOpen);
+                            payBlockFatigue(victim, attacker, std::clamp(strike.damageSpeed() / 1000.0f, 0.1f, 1.0f));
+                            if (victim == MWMechanics::getPlayer())
+                                victim.getClass().skillUsageSucceeded(
+                                    victim, ESM::Skill::HandToHand, ESM::Skill::Weapon_SuccessfulHit);
+                            static const ESM::RefId slap = ESM::RefId::stringRefId("Hand To Hand Hit");
+                            MWBase::Environment::get().getSoundManager()->playSound3D(victim, slap, 1.0f, 1.3f);
+                        }
+                        if (deflected || strike.physicsStep() - guardSide.mPalmLogStep > 20)
+                        {
+                            guardSide.mPalmLogStep = strike.physicsStep();
+                            Log(Debug::Info) << "RAGDOLL_PALM_PARRY attacker=" << attacker.getCellRef().getRefId()
+                                             << " outcome=" << RagdollCore::palmContactOutcomeName(palm.mOutcome)
+                                             << " phase=" << RagdollCore::palmPhaseName(guardSide.mPalmParry.phase())
+                                             << " hand=" << (guardSide.mPalmParry.palm() == 0 ? "left"
+                                                     : guardSide.mPalmParry.palm() == 1 ? "right" : "none")
+                                             << " committed=" << guardSide.mPalmParry.committed()
+                                             << " since=" << guardSide.mPalmParry.sinceLaunch()
+                                             << " skill=" << guardSide.mPalmSkill << " body=" << strike.targetBodyIndex()
+                                             << " speed=" << strike.damageSpeed() << " pays=" << palm.mDamageScale
+                                             << " knock=" << palm.mKnock << " open=" << palm.mOpen
+                                             << " impulse=" << impulse;
+                        }
+                        // All of it turned: nothing to pay, and this blow's other
+                        // contacts do not ask again.
+                        if (deflected && defense.mDamageScale <= 0.0f)
+                        {
+                            entry->mStrikeCooldown.commit(*strike.targetActorIdentity(), strike.physicsStep());
+                            continue;
+                        }
                     }
                     // Alpha 1.0 skill parity: vanilla's hit roll, once per blow
                     // per target. A failed roll is a glancing blow - the
@@ -11746,6 +13687,32 @@ namespace MWPhysics
                         return text && std::atoi(text) != 0;
                     });
                     static const auto& contactOutcomes = contactOutcomes_tuned.get();
+                    // The mass the blow carries (kg): the weapon's - and under
+                    // K2_BLOW_PRESS the attacker's body riding with it, by how much
+                    // of the blade's closing speed is the body moving along the blow
+                    // (a jumping chop, a step into the cut).
+                    float blowMass = unarmedStrike
+                        ? 1.0f
+                        : std::clamp((entry->mWeapon ? entry->mWeapon->mItemWeight : 0.0f) * 0.08f, 0.4f, 4.0f);
+                    if (!unarmedStrike && k2BlowPress().mOn && k2BlowPress().mBodyShare > 0.0f && entry->mRagdoll)
+                    {
+                        RagdollCore::RagdollMomentum momentum;
+                        JPH::Vec3 along = strike.normal();
+                        if (along.LengthSq() > 1e-6f && entry->mRagdoll->captureMomentum(momentum)
+                            && momentum.mTotalMass > 0.0f)
+                        {
+                            along /= along.Length();
+                            const float bodyAlong = (momentum.mLinearMomentum / momentum.mTotalMass).Dot(along);
+                            const float riding = RagdollCore::pressCarriedMass(blowMass, momentum.mTotalMass, bodyAlong,
+                                std::max(strike.relativeNormalSpeed(), strike.damageSpeed()), k2BlowPress());
+                            if (riding > blowMass + 0.25f)
+                                Log(Debug::Info) << "RAGDOLL_K2_BLOW_PRESS attacker=" << attacker.getCellRef().getRefId()
+                                                 << " weapon_mass=" << blowMass << " carried=" << riding
+                                                 << " body_along=" << bodyAlong << " approach="
+                                                 << strike.relativeNormalSpeed();
+                            blowMass = riding;
+                        }
+                    }
                     std::optional<RagdollCore::BodyContactResult> bodyOutcome;
                     if (contactOutcomes && defense.mOutcome == RagdollCore::PhysicalDefenseOutcome::Hit)
                     {
@@ -11768,9 +13735,7 @@ namespace MWPhysics
                             ? 0.0f : (relative - contactNormal * relative.Dot(contactNormal)).Length();
                         // The flat (a bruise from an edged weapon) meets the body square-on.
                         input.mEdgeAlignment = strike.wound().mKind == RagdollCore::WoundKind::Bruise ? 0.2f : 1.0f;
-                        input.mEffectiveMass = unarmedStrike
-                            ? 1.0f
-                            : std::clamp((entry->mWeapon ? entry->mWeapon->mItemWeight : 0.0f) * 0.08f, 0.4f, 4.0f);
+                        input.mEffectiveMass = blowMass;
                         input.mHardness = armorHardnessAt(victim, targetRegion);
                         // GRIP-05: a half-sword point is aimed at the gaps, so it
                         // meets the armour at `armour share` of its hardness.
@@ -11778,7 +13743,9 @@ namespace MWPhysics
                             input.mHardness *= PassiveRagdollEntry::gripHalfSettings()[3];
                         input.mSoftPart = RagdollCore::regionIsArm(targetRegion) || RagdollCore::regionIsLeg(targetRegion)
                             || targetRegion == RagdollCore::AnatomicalRegion::Neck;
-                        bodyOutcome = RagdollCore::classifyBodyContact(input);
+                        RagdollCore::BodyContactSettings contactSettings;
+                        contactSettings.mEdgeStick = PassiveRagdollEntry::k2EdgeBite()[1];
+                        bodyOutcome = RagdollCore::classifyBodyContact(input, contactSettings);
                         Log(Debug::Info) << "RAGDOLL_CONTACT_OUTCOME attacker=" << attacker.getCellRef().getRefId()
                                          << " victim=" << victim.getCellRef().getRefId()
                                          << " region=" << RagdollCore::regionName(targetRegion)
@@ -11795,7 +13762,9 @@ namespace MWPhysics
                     float woundDamageScale = (localizedWound ? defense.mDamageScale * contactBluntScale
                                                              : effectiveDamageScale) * glanceScale * contactScale
                         * (murderStroke ? PassiveRagdollEntry::gripMurderSettings()[3] : 1.0f);
-                    if (defense.mOutcome == RagdollCore::PhysicalDefenseOutcome::Hit && woundDamageScale > 0.0f)
+                    // (not what a palm turned: FIST-08, a deflected cut paid the floor, 15 a blow)
+                    if (defense.mOutcome == RagdollCore::PhysicalDefenseOutcome::Hit && woundDamageScale > 0.0f
+                        && palm.mOutcome != RagdollCore::PalmContactOutcome::Deflect)
                         woundDamageScale = std::max(woundDamageScale, partialPaySettings()[2]);
                     const auto contactPhase = entry->contactAttackPhase();
                     const bool nativeRelease = contactPhase == MWMechanics::RagdollAttackPhase::Release
@@ -11810,7 +13779,8 @@ namespace MWPhysics
                     const auto damage = unarmedStrike
                         ? MWMechanics::applyPhysicalHandStrike(attacker, victim,
                             Misc::Convert::toOsg(strike.point()), strike.damageSpeed(), woundDamageScale,
-                            defense.mOutcome, regionImpact, physicalHitId, blowShare)
+                            defense.mOutcome, regionImpact, physicalHitId, blowShare,
+                            entry->fistStrikeStrength(strike.weaponBodyIdentity()))
                         : MWMechanics::applyPhysicalWeaponStrike(attacker, victim, *equipped,
                             Misc::Convert::toOsg(strike.point()), strike.damageSpeed(), woundDamageScale,
                             defense.mOutcome, regionImpact, physicalHitId, woundAttackType, blowShare,
@@ -11877,9 +13847,7 @@ namespace MWPhysics
                             - attacker.getRefData().getPosition().asVec3();
                         blow.mAttackerToVictim = JPH::Vec3(toVictim.x(), toVictim.y(), 0.0f);
                         blow.mApproachSpeed = std::max(0.0f, strike.relativeNormalSpeed());
-                        blow.mCarriedMass = unarmedStrike
-                            ? 1.0f
-                            : std::clamp((entry->mWeapon ? entry->mWeapon->mItemWeight : 0.0f) * 0.08f, 0.4f, 4.0f);
+                        blow.mCarriedMass = blowMass;
                         blow.mDamage = damage->mFinalDamage; // paid; a beaten guard pays a share
                         // The region-scaled reaction impulse the banding reads.
                         blow.mReactionImpulse = damage->mReactionImpulse * regionReaction;
@@ -11931,8 +13899,99 @@ namespace MWPhysics
                                     recoil = 0.0f;
                                     break;
                                 case RagdollCore::BodyContactOutcome::Stop:
+                                    // K2_EDGE_BITE: an edge stuck in armour holds, no throw.
+                                    if (bodyOutcome->mHoldTime > 0.0f)
+                                    {
+                                        freeze = bodyOutcome->mHoldTime;
+                                        recoil = 0.0f;
+                                    }
                                     break;
                             }
+                        // K2_BLOW_PRESS: on flesh the blade presses on (no hit-stop,
+                        // no throw-back) and its contact drives the body away.
+                        if (bodyOutcome && k2BlowPress().mOn)
+                        {
+                            const RagdollCore::ImpactHold held = RagdollCore::pressImpact(bodyOutcome->mOutcome,
+                                hardness, bodyOutcome->mHoldTime, { freeze, recoil }, k2BlowPress());
+                            freeze = held.mFreeze;
+                            recoil = held.mRecoil;
+                        }
+                        // K2_LODGE: a paid point goes in and is pinned on its
+                        // line, a square edge lodges, a drawn or cleaving one
+                        // goes through and drags the part (ragdollcore lodge).
+                        if (bodyOutcome && !unarmedStrike && !murderStroke && !damage->mBlocked && entry->mWeapon
+                            && entry->mWeapon->mAttached && entry->mWeapon->mWeaponBody < entry->mRagdoll->getBodyCount()
+                            && target->second->mRagdoll && !isNetPuppetEntry(*target->second)
+                            && strike.targetBodyIndex() < target->second->mRagdoll->getBodyCount()
+                            && normal.LengthSq() > 0.5f)
+                        {
+                            const JPH::Vec3 relative = strike.wound().mRelativeVelocity;
+                            const JPH::Vec3 sliding = relative - normal * relative.Dot(normal);
+                            RagdollCore::LodgeInput lodgeInput;
+                            lodgeInput.mKind = blow.mKind;
+                            lodgeInput.mOutcome = bodyOutcome->mOutcome;
+                            lodgeInput.mDamage = damage->mFinalDamage;
+                            lodgeInput.mHardness = armor;
+                            lodgeInput.mNormalSpeed = approach;
+                            lodgeInput.mTangentSpeed = sliding.Length();
+                            lodgeInput.mCarriedMass = blowMass;
+                            const RagdollCore::LodgePlan plan = RagdollCore::planLodge(lodgeInput, k2Lodge());
+                            if (plan.mKind != RagdollCore::LodgeKind::None)
+                            {
+                                JPH::BodyInterface& lodgeBodies = mPhysicsSystem.GetBodyInterface();
+                                const auto& weapon = *entry->mWeapon;
+                                const JPH::BodyID weaponId = entry->mRagdoll->getBodyId(weapon.mWeaponBody);
+                                const JPH::BodyID bodyId = target->second->mRagdoll->getBodyId(strike.targetBodyIndex());
+                                const JPH::Quat weaponTurn = lodgeBodies.GetRotation(weaponId);
+                                const JPH::Quat bodyTurn = lodgeBodies.GetRotation(bodyId);
+                                const JPH::RVec3 weaponCentre = lodgeBodies.GetCenterOfMassPosition(weaponId);
+                                JPH::RVec3 entryPoint = strike.point();
+                                if (plan.mKind == RagdollCore::LodgeKind::Stab)
+                                {
+                                    // On the blade's own line: the pin starts true.
+                                    const JPH::Vec3 blade = weaponTurn * weapon.mBladeAxis;
+                                    const JPH::RVec3 tip
+                                        = weaponCentre + weaponTurn * (weapon.mBladeAxis * (0.5f * weapon.mLength));
+                                    entryPoint = tip - blade * std::max(0.0f, JPH::Vec3(tip - entryPoint).Dot(blade));
+                                }
+                                endLodge(*entry, "replaced");
+                                PassiveRagdollEntry::Lodge lodge;
+                                lodge.mKind = plan.mKind;
+                                lodge.mVictimSerial = target->second->mSerial;
+                                lodge.mVictimBody = strike.targetBodyIndex();
+                                lodge.mVictimPoint = bodyTurn.Conjugated()
+                                    * JPH::Vec3(entryPoint - lodgeBodies.GetCenterOfMassPosition(bodyId));
+                                lodge.mVictimAxis = bodyTurn.Conjugated() * normal;
+                                lodge.mWeaponPoint = weaponTurn.Conjugated() * JPH::Vec3(strike.point() - weaponCentre);
+                                lodge.mDepthMax = plan.mDepth;
+                                lodge.mHold = plan.mHold;
+                                entry->mLodge = lodge;
+                                ++entry->mLodgeCount;
+                                entry->mLastLodgeKind = plan.mKind;
+                                entry->mLastLodgeRelease = RagdollCore::LodgeRelease::Held;
+                                entry->mLastLodgeDeepest = entry->mLastLodgeHeld = 0.0f;
+                                entry->mContactLodgeVictim.store(lodgeBodies.GetUserData(bodyId), std::memory_order_relaxed);
+                                // A pass drags the part along the stroke, once.
+                                if (plan.mDragImpulse > 0.0f && sliding.LengthSq() > 1.0f)
+                                    lodgeBodies.AddImpulse(bodyId, sliding.Normalized() * plan.mDragImpulse, strike.point());
+                                // The lodge is the hold: no hit-stop, no throw-back.
+                                freeze = recoil = 0.0f;
+                                // A held weapon's stroke is spent: it comes back to
+                                // the guard from in the body, as after a clash
+                                // (LODGE-01 11-16: driven on, the follow-through swept
+                                // the point 25-40 u off its line in 0.03-0.12 s).
+                                if (plan.mKind != RagdollCore::LodgeKind::Pass)
+                                    entry->beginHscKnock(normal * 3.0f, true);
+                                Log(Debug::Info) << "RAGDOLL_LODGE begin attacker=" << attacker.getCellRef().getRefId()
+                                                 << " victim=" << victim.getCellRef().getRefId() << " kind="
+                                                 << RagdollCore::lodgeKindName(plan.mKind) << " region="
+                                                 << RagdollCore::regionName(targetRegion) << " damage="
+                                                 << damage->mFinalDamage << " depth_max=" << plan.mDepth << " hold="
+                                                 << plan.mHold << " vn=" << approach << " vt=" << sliding.Length()
+                                                 << " drag=" << plan.mDragImpulse << " outcome="
+                                                 << RagdollCore::bodyContactOutcomeName(bodyOutcome->mOutcome);
+                            }
+                        }
                         if (freeze > 0.0f || recoil > 0.0f)
                             entry->beginWeaponImpact(freeze, -normal * recoil, hardness, strike.point());
                         // Medium or heavy armour is metal enough to spark.
@@ -12253,6 +14312,7 @@ namespace MWPhysics
                         {
                             const auto& soft = entry.mRagdoll->getSoftRootTelemetry();
                             body << " sr=" << entry.mRagdoll->getSoftRootStrength() << " srF=" << soft.mForce.Length()
+                                 << " srH=" << std::hypot(soft.mForce.GetX(), soft.mForce.GetY())
                                  << " srErr=" << soft.mPositionError << " srAng=" << soft.mAngleError
                                  << " kin=" << entry.mRagdoll->isRootKinematic();
                         }
@@ -12288,6 +14348,11 @@ namespace MWPhysics
                             if (const auto pelvis = nearest->mRagdoll->getWorldBodyPosition(
                                     nearest->mCurrentPhysicsPose, *nearest->mPelvisBodyIndex))
                                 npc << " pelvis=" << pelvis->GetX() << ',' << pelvis->GetY() << ',' << pelvis->GetZ();
+                            // Its capsule (user 11-09: the sling away from it).
+                            {
+                                const auto capsule = nearest->getPtr().getRefData().getPosition().asVec3();
+                                npc << " cap=" << capsule.x() << ',' << capsule.y();
+                            }
                             float deepest = -1.0e9f;
                             for (std::size_t i = 0; nearest->mSurfaceQuery
                                  && i < nearest->mCurrentPhysicsPose.mBodyTransforms.size(); ++i)
@@ -12317,6 +14382,42 @@ namespace MWPhysics
                                 }
                                 npc << " atk=" << static_cast<int>(nearest->mAnimationAttack.mPhase)
                                     << " strike=" << nearest->mAiStrikeActive << " tipc=" << nearest->mTip.mActive;
+                            }
+                            // Its arms and what they were told (user bookmark
+                            // 11-16, "my enemy has his arms all crossed up":
+                            // the duelist's spear lay across its body for
+                            // 12 s and the row had only the physical tip, so
+                            // a trapped weapon could not be told from a wrong
+                            // command): hands and elbows (physical), the
+                            // commanded grip and blade line, the wheel's
+                            // stage, who owns each arm, the support grip and
+                            // the arm route.
+                            {
+                                const auto point = [&](const char* key, std::size_t body) {
+                                    if (const auto at
+                                        = nearest->mRagdoll->getWorldBodyPosition(nearest->mCurrentPhysicsPose, body))
+                                        npc << ' ' << key << '=' << at->GetX() << ',' << at->GetY() << ',' << at->GetZ();
+                                };
+                                if (nearest->mLeftArm)
+                                {
+                                    point("lh", nearest->mLeftArm->mHand);
+                                    point("le", nearest->mLeftArm->mElbow);
+                                }
+                                if (nearest->mRightArm)
+                                {
+                                    point("rh", nearest->mRightArm->mHand);
+                                    point("re", nearest->mRightArm->mElbow);
+                                }
+                                npc << " hsc=" << nearest->mHscActive
+                                    << " stage=" << static_cast<int>(nearest->mAttackStage)
+                                    << " own=" << static_cast<int>(nearest->mArmOwner[0])
+                                    << static_cast<int>(nearest->mArmOwner[1])
+                                    << " sup=" << nearest->mWeaponSupportActive << " route=" << nearest->mArmRouting;
+                                if (nearest->mHscActive)
+                                    npc << " cgrip=" << nearest->mHscGrip.GetX() << ',' << nearest->mHscGrip.GetY() << ','
+                                        << nearest->mHscGrip.GetZ() << " cblade=" << std::setprecision(2)
+                                        << nearest->mHscBlade.GetX() << ',' << nearest->mHscBlade.GetY() << ','
+                                        << nearest->mHscBlade.GetZ();
                             }
                             frame.npc = npc.str();
                         }

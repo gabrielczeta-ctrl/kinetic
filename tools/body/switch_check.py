@@ -73,8 +73,11 @@ def reads():
 
 
 def values():
-    """name -> [(where, field count)] from the play launcher and settings files."""
+    """name -> [(where, field count)] from the play defaults, the play launcher and settings files."""
     found = {}
+    defaults = SOURCE / 'components/ragdollcore/src/playdefaults.cpp'
+    for m in re.finditer(r'\{ "(OPENMW_[A-Z0-9_]+)", "([^"]*)" \}', defaults.read_text(encoding='utf-8')):
+        found.setdefault(m.group(1), []).append((defaults.name, len(m.group(2).split(','))))
     sources = [ROOT / 'Run-Game-MotionBricks.cmd', SOURCE / 'files/data/ragdoll/ragdoll.cfg']
     for src in sources:
         if not src.exists():

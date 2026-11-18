@@ -31,6 +31,11 @@
         // crossed feet and a stuck gait only with the battle axe sheathed).
         // It touches nothing until drawn.
         std::atomic<bool> mContactWeaponSheathed{ false };
+        // The guard held this step, for the blade contacts (CLASH-SLIDE).
+        std::atomic<bool> mContactGuard{ false };
+        // K2_LODGE: the bodies' user data of the fighter this weapon is in (0
+        // none): its contacts with them pass through (onContactSettings).
+        std::atomic<JPH::uint64> mContactLodgeVictim{ 0 };
         // A sheathed weapon also weighs (nearly) nothing: its full mass left
         // on the swinging hand twisted the upper spine +-22 degrees while
         // walking, against +-8.5 drawn (2026-09-24 play test Q1).
@@ -104,6 +109,7 @@
                 mContactBodyWeight.store(std::clamp(weight, 0.5f, 2.0f), std::memory_order_relaxed);
             }
             mContactSwinging.store(mSwing.mSwinging, std::memory_order_relaxed);
+            mContactGuard.store(mGuardActive, std::memory_order_relaxed);
             mContactWeaponSheathed.store(mWeapon && mWeapon->mAttached && !getPtr().isEmpty()
                     && getPtr().getClass().isActor()
                     && getPtr().getClass().getCreatureStats(getPtr()).getDrawState() != MWMechanics::DrawState::Weapon,
@@ -126,6 +132,13 @@
             if (selfBody.GetID().GetIndexAndSequenceNumber() != mContactWeaponBody.load(std::memory_order_relaxed)
                 || !withBody.IsDynamic())
                 return;
+            // K2_LODGE: a weapon in a body goes through it (the pin holds it).
+            if (const JPH::uint64 lodged = mContactLodgeVictim.load(std::memory_order_relaxed);
+                lodged != 0 && withBody.GetUserData() == lodged)
+            {
+                ioSettings.mIsSensor = true;
+                return;
+            }
             static const auto trace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_EMBED_TRACE") != nullptr; });
             static const auto& trace = trace_tuned.get();
             if (trace)
@@ -155,6 +168,37 @@
             const JPH::ContactManifold& manifold, JPH::ContactSettings& ioSettings, bool selfIsFirst) override
         {
             onContactSettings(selfBody, withBody, manifold, ioSettings);
+            // CLASH-SLIDE: two blades meeting with no guard held on either
+            // side slide off each other - no friction, no bounce, and the
+            // slower blade gives way (its inverse mass x `yield`), so the
+            // faster keeps its line (clashSlideSettings).
+            if (!ioSettings.mIsSensor && withBody.IsDynamic() && clashSlideSettings().mOn
+                && selfBody.GetID().GetIndexAndSequenceNumber() == mContactWeaponBody.load(std::memory_order_relaxed)
+                && !mContactGuard.load(std::memory_order_relaxed))
+            {
+                PtrHolder* other = Misc::Convert::toPointerFromUserData<PtrHolder>(withBody.GetUserData());
+                const auto* otherEntry
+                    = other != nullptr && other != this ? dynamic_cast<const PassiveRagdollEntry*>(other) : nullptr;
+                if (otherEntry != nullptr && !otherEntry->mContactGuard.load(std::memory_order_relaxed)
+                    && withBody.GetID().GetIndexAndSequenceNumber()
+                        == otherEntry->mContactWeaponBody.load(std::memory_order_relaxed))
+                {
+                    ioSettings.mCombinedFriction = 0.0f;
+                    ioSettings.mCombinedRestitution = 0.0f;
+                    if (!manifold.mRelativeContactPointsOn1.empty() && !manifold.mRelativeContactPointsOn2.empty())
+                    {
+                        const JPH::RVec3 point = selfIsFirst ? manifold.GetWorldSpaceContactPointOn1(0)
+                                                             : manifold.GetWorldSpaceContactPointOn2(0);
+                        if (selfBody.GetPointVelocity(point).LengthSq() < withBody.GetPointVelocity(point).LengthSq())
+                        {
+                            const float yield = clashSlideSettings().mYield;
+                            (selfIsFirst ? ioSettings.mInvMassScale1 : ioSettings.mInvMassScale2) = yield;
+                            (selfIsFirst ? ioSettings.mInvInertiaScale1 : ioSettings.mInvInertiaScale2) = yield;
+                        }
+                    }
+                    return;
+                }
+            }
             static const auto enabled_tuned = RagdollCore::tuned<bool>([] {
                 // On: BODYPUSH-01 x2 - strong into weak shoves it 284-298 u in
                 // 3 s (83-85 with equal masses), weak into strong 3-5 u (79-83).
@@ -422,9 +466,18 @@
             const bool weaponStrike
                 = mWeapon && mWeapon->mCallbackArmed && *bodyIndex == mWeapon->mWeaponBody;
             std::optional<std::size_t> strikeHand;
-            if ((mAiStrikeActive || mHscFistStrike) && mRightArm)
+            // K2_ARMED_HANDS (registry): a fighter with a weapon in hand strikes
+            // with the weapon, never with the hand round its hilt (11-07 play:
+            // a guard's sword hand on the player's claymore counted as a punch,
+            // 19.6 fatigue at 0 left, and knocked the player out).
+            static const auto armedHands_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_ARMED_HANDS");
+                return text && std::atoi(text) != 0;
+            });
+            const bool handsFree = !armedHands_tuned.get() || !mWeapon || (mHscStriker && mHscStriker->mFist);
+            if ((mAiStrikeActive || mHscFistStrike) && mRightArm && handsFree)
                 strikeHand = mRightArm->mHand;
-            else if (mPlayerStrikeActive)
+            else if (mPlayerStrikeActive && handsFree)
             {
                 const auto& arm = mSwingArmIsRight ? mRightArm : mLeftArm;
                 if (arm)
@@ -514,6 +567,14 @@
                         RagdollCore::WoundProfile woundProfile = mWeapon->mWoundProfile;
                         if (shape && woundProfile.mClass == RagdollCore::WoundClass::Axe)
                             woundProfile.mStrikeStart = shape->mStrikeStart;
+                        woundProfile.mEdgeLead = k2EdgeBite()[0];
+                        if (woundProfile.mClass == RagdollCore::WoundClass::Spear && k2PointLead()[0] > 0.0f
+                            && mSwing.mSwinging && mPlayerAttackType == "thrust")
+                        {
+                            woundProfile.mPointLead = k2PointLead()[0];
+                            if (k2PointLead()[1] > 0.0f)
+                                woundProfile.mTipStart = k2PointLead()[1];
+                        }
                         const JPH::Vec3 local = inverse * JPH::Vec3(weaponPoint - selfBody.GetCenterOfMassPosition())
                             + mWeapon->mCenterFromHand;
                         const JPH::Vec3 n = inverse * normal;
@@ -521,7 +582,8 @@
                         wound.mKind = std::isfinite(gripToTip) && gripToTip > 0.0f
                             ? RagdollCore::classifyWeaponContact({ local.Dot(bladeAxis) / gripToTip,
                                   n.Dot(bladeAxis), n.Dot(edgeAxis), n.Dot(flatAxis),
-                                  v.Dot(bladeAxis), relativeVelocity.Length(), relativeVelocity.Dot(normal) },
+                                  v.Dot(bladeAxis), relativeVelocity.Length(), relativeVelocity.Dot(normal),
+                                  v.Dot(edgeAxis) },
                                 woundProfile)
                             : RagdollCore::WoundKind::None;
 #ifdef OPENMW_RAGDOLL_DEV_API
@@ -529,7 +591,10 @@
                             Log(Debug::Info) << "RAGDOLL_WOUND_CLASS weapon=" << mWeapon->mRecordId
                                              << " along=" << local.Dot(bladeAxis) / gripToTip
                                              << " n_tip=" << n.Dot(bladeAxis) << " n_edge=" << n.Dot(edgeAxis)
-                                             << " n_flat=" << n.Dot(flatAxis) << " kind="
+                                             << " n_flat=" << n.Dot(flatAxis) << " v_tip=" << v.Dot(bladeAxis)
+                                             << " speed=" << relativeVelocity.Length() << " approach="
+                                             << relativeVelocity.Dot(normal) << " swinging=" << mSwing.mSwinging
+                                             << " line=" << mPlayerAttackType << " kind="
                                              << RagdollCore::woundKindName(wound.mKind);
 #endif
                         if (tangent.LengthSq() < 1e-4f)
@@ -545,6 +610,21 @@
                     wound.mTargetLocalTangent = targetInverse * tangent.Normalized();
                     wound.mRelativeVelocity = relativeVelocity;
                 }
+                // K2_LEFT_FIST_HITS (registry): the left fist's punch is a
+                // swing of its own. Its contacts were published with the
+                // wheel's swing state - not swinging, between the right
+                // fist's punches - and the strike selection drops a contact
+                // outside a swing: FIST-09's left taps met the head at 80-170
+                // u/s, eligible, and none was selected; in the user's 11-16
+                // sessions 31 of 136 left punches touched, about 8 dealt
+                // anything.
+                static const auto leftFistHits_tuned = RagdollCore::tuned<bool>([] {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_LEFT_FIST_HITS");
+                    return text && std::atoi(text) != 0;
+                });
+                const bool jabSwing = leftFistHits_tuned.get() && jabStrike && !weaponStrike
+                    && !(strikeHand && *bodyIndex == *strikeHand);
+                const std::uint64_t swingIdentity = jabSwing ? (std::uint64_t(1) << 62) + mJabCount : mSwingIdentity;
                 const auto contactIdentity = ++mWeaponContactIdentity;
                 mStepWeaponResponses.emplace(contactIdentity, std::pair{
                     JPH::SubShapeIDPair(firstBody ? selfBody.GetID() : withBody.GetID(), manifold.mSubShapeID1,
@@ -554,13 +634,36 @@
                 mPendingWeaponContacts.publish(RagdollCore::WeaponContactEvent(contactIdentity,
                     mSerial, targetIdentity, weaponStrike ? mWeapon->mRecordId : std::string(),
                     selfBody.GetID().GetIndexAndSequenceNumber(),
-                    withBody.GetID().GetIndexAndSequenceNumber(), mCurrentContactPhysicsStep, mSwingIdentity,
-                    mSwing.mSwinging || hasPhysicalFollowThrough(), point, normal, relativeVelocity.Dot(normal),
+                    withBody.GetID().GetIndexAndSequenceNumber(), mCurrentContactPhysicsStep, swingIdentity,
+                    jabSwing || mSwing.mSwinging || hasPhysicalFollowThrough(), point, normal,
+                    relativeVelocity.Dot(normal),
                     relativeVelocity.Length(),
                     contactAxisEffectiveMass(selfBody, withBody, point, normal),
                     targetBodyIndex, targetRegion, targetActor ? targetActor->mSerial : 0, wound));
             }
             observeBalanceContact(*bodyIndex, selfBody, withBody, manifold, firstBody, friction);
+            // K2_HELD_NOT_GROUND (registry): a contact of this body's weapon
+            // or shield, or with another fighter's, is never ground.
+            static const auto heldNotGround_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HELD_NOT_GROUND");
+                return text && std::atoi(text) != 0;
+            });
+            const bool selfHeld = heldItemBody(*bodyIndex);
+            bool otherHeld = false;
+            if (const auto* other = dynamic_cast<const PassiveRagdollEntry*>(
+                    Misc::Convert::toPointerFromUserData<PtrHolder>(withBody.GetUserData()));
+                other && other != this && other->mRagdoll)
+                for (std::size_t i = 0; i < other->mRagdoll->getBodyCount(); ++i)
+                    if (other->mRagdoll->getBodyId(i) == withBody.GetID())
+                    {
+                        otherHeld = other->heldItemBody(i);
+                        break;
+                    }
+            if (!RagdollCore::countsAsGroundContact(selfHeld, otherHeld, heldNotGround_tuned.get()))
+            {
+                ++mHeldGroundContactsDropped;
+                return;
+            }
             RagdollCore::appendGroundContactObservations(mStepContacts, *bodyIndex,
                 firstBody ? selfBody : withBody, firstBody ? withBody : selfBody, manifold, firstBody, friction);
         }
@@ -763,6 +866,65 @@
             std::span<const std::size_t> disabled = {})
         {
             const bool applied = mRagdoll->driveToPoseUsingMotors(pose, disabled);
+            // MOVE-01 S1: what the leg motors are given, for the actors the
+            // footfall trace covers (OPENMW_RAGDOLL_FOOTFALL_TRACE): the
+            // target foot height against the physical one, masked motors,
+            // spring and torque cap of hip and knee.
+            if (footfallTraced())
+                for (std::size_t side = 0; side < 2; ++side)
+                {
+                    const auto& leg = side == 0 ? mLeftLeg : mRightLeg;
+                    if (!leg)
+                        continue;
+                    const auto target = mRagdoll->getWorldBodyPosition(pose, leg->mFoot);
+                    const auto physical = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, leg->mFoot);
+                    std::ostringstream line;
+                    line << std::fixed << std::setprecision(1) << "RAGDOLL_LEG_DRIVE side=" << side << " source=" << source
+                         << " applied=" << applied << " targetZ=" << (target ? target->GetZ() : 0.0)
+                         << " footZ=" << (physical ? physical->GetZ() : 0.0);
+                    // The floor straight under the physical foot (the ground ray's).
+                    if (physical && mSurfaceQuery)
+                        if (const auto under = mSurfaceQuery(
+                                JPH::RVec3(physical->GetX(), physical->GetY(), physical->GetZ() + 30.0),
+                                -JPH::Vec3::sAxisZ(), 80.0f))
+                            line << " floorZ=" << under->first.GetZ();
+                    if (mSupportEstimate)
+                        line << " support="
+                             << (side == 0 ? mSupportEstimate->mLeftFootSupported : mSupportEstimate->mRightFootSupported);
+                    if (mPelvisBodyIndex)
+                    {
+                        const auto pelvisTarget = mRagdoll->getWorldBodyPosition(pose, *mPelvisBodyIndex);
+                        const auto pelvis = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex);
+                        line << " pelvisTargetZ=" << (pelvisTarget ? pelvisTarget->GetZ() : 0.0)
+                             << " pelvisZ=" << (pelvis ? pelvis->GetZ() : 0.0);
+                    }
+                    if (mRagdoll->getSoftRoot().mEnabled)
+                        line << " sr=" << std::setprecision(2) << mRagdoll->getSoftRootStrength() << std::setprecision(0)
+                             << " srZ=" << mRagdoll->getSoftRootTelemetry().mForce.GetZ() << std::setprecision(1)
+                             << " kin=" << mRagdoll->isRootKinematic();
+                    line << " mode=" << (mControllerOutput ? static_cast<int>(mControllerOutput->mMode) : -1)
+                         << " pinned=" << footfallPinnedAt(side) << " swing=" << footfallSwingingAt(side);
+                    for (const std::size_t body : { leg->mHip, leg->mKnee })
+                    {
+                        RagdollCore::MotorTargetTelemetry motor;
+                        mRagdoll->captureMotorTargetTelemetry(body, motor);
+                        const bool masked = std::find(disabled.begin(), disabled.end(), body) != disabled.end();
+                        line << (body == leg->mHip ? " hip=" : " knee=") << masked << ","
+                             << (motor.mDrive ? motor.mDrive->mSwingOrHingeSpring.mFrequencyOrStiffness : -1.0f) << ","
+                             << (motor.mDrive ? motor.mDrive->mMaximumTorque.GetX() : -1.0f) << ","
+                             << (motor.mDrive ? motor.mDrive->mSwingOrHingeSpring.mDamping : -1.0f);
+                        // The hip's tracking error and the knee's angle and
+                        // target (degrees; W1 parity: StrideSim's RAGDOLL_LOAD
+                        // prints the same).
+                        if (body == leg->mHip && motor.mCurrentOrientation && motor.mTargetOrientation)
+                            line << " hipE=" << osg::RadiansToDegrees(2.0f * std::acos(std::clamp(
+                                std::abs(motor.mCurrentOrientation->Dot(*motor.mTargetOrientation)), 0.0f, 1.0f)));
+                        if (body == leg->mKnee && motor.mCurrentHingeAngle && motor.mTargetHingeAngle)
+                            line << " kneeA=" << osg::RadiansToDegrees(*motor.mCurrentHingeAngle) << ","
+                                 << osg::RadiansToDegrees(*motor.mTargetHingeAngle);
+                    }
+                    Log(Debug::Info) << line.str() << " actor=" << getPtr().getCellRef().getRefId();
+                }
 #ifdef OPENMW_RAGDOLL_DEV_API
             // OPENMW_RAGDOLL_ARM_TRACE: the player's left arm motors every 15
             // drives, with the drive source and the masked bodies.
@@ -770,6 +932,8 @@
             static const auto& armTrace = armTrace_tuned.get();
             if (armTrace && mLeftArm && getPtr() == MWMechanics::getPlayer() && ++mArmTraceTick % 15 == 0)
                 for (const std::size_t body : { mLeftArm->mShoulder, mLeftArm->mElbow,
+                         mRightArm ? mRightArm->mShoulder : mLeftArm->mShoulder,
+                         mRightArm ? mRightArm->mElbow : mLeftArm->mElbow,
                          mLeftLeg ? mLeftLeg->mHip : mLeftArm->mShoulder, mLeftLeg ? mLeftLeg->mKnee : mLeftArm->mElbow })
                 {
                     RagdollCore::MotorTargetTelemetry motor;
@@ -1619,9 +1783,14 @@
         {
             const auto& hips = swingHipsSettings();
             const bool standing = mControllerOutput && RagdollCore::isDrivenControllerMode(mControllerOutput->mMode);
-            const float wantTurn = standing && mTip.mActive ? hips[0] * mTip.mBodyTwist
+            // On the KINETIC-2 wheel the planner gives the hips their turn
+            // (K2_HIP_TURN), already smooth and taken out of the spine's: it is
+            // followed closely (30/s), so the chest's sum stays the keys'.
+            const bool wheelHips = mHscActive;
+            const float wantTurn = standing && wheelHips ? mWheel.trunk().mHipTurn
+                : standing && mTip.mActive ? hips[0] * mTip.mBodyTwist
                 : standing ? hips[0] * mFistTwist : 0.0f;
-            mSwingHipTurn += (wantTurn - mSwingHipTurn) * std::clamp(duration * 8.0f, 0.0f, 1.0f);
+            mSwingHipTurn += (wantTurn - mSwingHipTurn) * std::clamp(duration * (wheelHips ? 30.0f : 8.0f), 0.0f, 1.0f);
             // Armed and not travelling: with fists on the running course the
             // shift left the body leaning 23 degrees at the end (sentinel).
             const JPH::Vec3 travel(mTargetHorizontalVelocity.GetX(), mTargetHorizontalVelocity.GetY(), 0.0f);
@@ -1661,7 +1830,14 @@
                 : 0.0f;
             const bool lunging = lunge > 0.0f
                 && (mAttackStage == AttackStage::Cut || (mAttackStage == AttackStage::Wind && mAttackWind > 0.5f));
-            const float lungeWanted = lunging ? lunge : 0.0f;
+            // K2_FIST_STEP: a punch at a foe out of reach lunges the gap,
+            // either hand (asking the body to walk there instead left the
+            // chest 1-5 u nearer in the punch's 0.25 s and took this lunge
+            // away: FIST-09, 0 of 16 taps landed).
+            const float fistLunge = mFistStepping && standing && mHscActive && travel.Length() < 60.0f
+                ? std::clamp(mFistStepGap, 0.0f, k2FistStep()[0])
+                : 0.0f;
+            const float lungeWanted = std::max(lunging ? lunge : 0.0f, fistLunge);
             mHscLungeShift += (lungeWanted - mHscLungeShift)
                 * std::clamp(duration * (lungeWanted > mHscLungeShift ? 10.0f : 4.0f), 0.0f, 1.0f);
             // The thrust's lunge (THRUST-02): the weight back in its wind-up and
@@ -1669,6 +1845,10 @@
             const float thrustShift = standing && mHscActive && travel.Length() < 60.0f
                 ? mThrustDrive * thrustLungeSettings()[0]
                 : 0.0f;
+            // K2_THRUST_PLANT: the legs' standing rules read the body without it.
+            const JPH::Vec3 planted = thrustPlant() ? forward * thrustShift : JPH::Vec3::sZero();
+            mPlantedShiftVelocity = duration > 0.0f ? (planted - mPlantedShift) / duration : JPH::Vec3::sZero();
+            mPlantedShift = planted;
             return { mSwingHipTurn,
                 forward * (hips[1] * w + mFistShift + mHscLungeShift + thrustShift) - JPH::Vec3(0.0f, 0.0f, mLimpDip) };
         }
@@ -1708,9 +1888,30 @@
         // The thrust's drive (-draw back .. 1) as the body takes it, and the
         // route's wish this step.
         float mThrustDrive = 0.0f, mThrustDriveWant = 0.0f;
+        // OPENMW_RAGDOLL_K2_THRUST_PLANT (registry, experiment): 1 = a standing
+        // thrust keeps its feet - the thrust's own shift of the body (the
+        // weight back, then HSC_THRUST_LUNGE's units forward) is given to
+        // Footfall and the standing catch as a planted shift
+        // (FootfallInput::mPlantedShift), which they take out of the body's
+        // place and speed before judging a step; 0 = they read the lunge as
+        // the body leaving its stance and step after it.
+        static bool thrustPlant()
+        {
+            static const auto value_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_THRUST_PLANT");
+                return text && std::atof(text) > 0.0;
+            });
+            return value_tuned.get();
+        }
+        // The thrust's shift of the root this step (world) and its rate.
+        JPH::Vec3 mPlantedShift = JPH::Vec3::sZero(), mPlantedShiftVelocity = JPH::Vec3::sZero();
         // TRAJ-01: the committed attack's cut, the commanded tip (world), for
         // the reticle; empty out of a committed attack.
         std::vector<JPH::RVec3> mHscPreview;
+        // Where that cut meets the foe (K2_AIM_PREVIEW), world; hit or the closest pass.
+        std::optional<JPH::RVec3> mHscMark;
+        bool mHscMarkHit = false;
+        float mHscMarkGap = 0.0f; // its depth into the body (negative) or the pass's gap
         float mFistShift = 0.0f;
         float mHscLungeShift = 0.0f;
         float mHscLungeGap = -1.0f; // the foe beyond the blade's sweet reach (units; -1 unknown)
@@ -2093,6 +2294,22 @@
                 }
                 else if (const char* settings = RagdollCore::tuningText("OPENMW_RAGDOLL_SETTINGS"))
                     path = std::filesystem::path(settings).parent_path() / "footfall-gaits.cfg";
+                // Without a settings file, the game's own data file (MOVE-01 W1:
+                // only the launcher named it, so the scripted tests walked
+                // without the reference gaits the player walks with).
+                // OPENMW_RAGDOLL_DATA_FILES=1.
+                else if (const char* data = RagdollCore::tuningText("OPENMW_RAGDOLL_DATA_FILES");
+                         data && std::atoi(data) != 0 && sRagdollDataFiles && footfallEnabled()
+                         && sRagdollDataFiles->exists(VFS::Path::NormalizedView("ragdoll/footfall-gaits.cfg")))
+                {
+                    Files::IStreamPtr stream = sRagdollDataFiles->get(VFS::Path::NormalizedView("ragdoll/footfall-gaits.cfg"));
+                    std::stringstream text;
+                    text << stream->rdbuf();
+                    auto parsed = RagdollCore::FootfallGaitTable::parse(text.str());
+                    Log(Debug::Info) << "Footfall reference gaits: the data files (ragdoll/footfall-gaits.cfg)"
+                                     << (parsed ? "" : " - not parsed");
+                    return parsed;
+                }
                 if (path.empty() || !footfallEnabled())
                     return std::nullopt;
                 auto loaded = RagdollCore::FootfallGaitTable::load(path);
@@ -2413,34 +2630,6 @@
             static const auto& value = value_tuned.get();
             return value;
         }
-        // PGC-03 C9b, stair drop: walking down stairs the capsule rides a riser
-        // above the ground under the centre of mass (tall stairs: one 24-unit
-        // riser) and the body floated on straight legs (centre of mass p90
-        // 93-110 over the ground descending, 78-83 flat). While descending the
-        // body sinks by that excess less `margin` (at most `max` units, `rate`
-        // u/s) on bent stance legs. OPENMW_RAGDOLL_STAIR_DROP = "margin u,
-        // max u, rate u/s, hold s" (unset = off).
-        struct StairDrop
-        {
-            bool mOn = false;
-            float mMargin = 4.0f, mMaximum = 24.0f, mRate = 150.0f, mHold = 0.5f;
-        };
-        static const StairDrop& stairDropSettings()
-        {
-            static const auto value_tuned = RagdollCore::tuned<StairDrop>([] {
-                StairDrop v;
-                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_STAIR_DROP"))
-                    v.mOn = std::sscanf(text, "%f,%f,%f,%f", &v.mMargin, &v.mMaximum, &v.mRate, &v.mHold) >= 1
-                        && v.mMaximum > 0.0f && v.mRate > 0.0f && v.mHold > 0.0f;
-                return v;
-            });
-            static const auto& value = value_tuned.get();
-            return value;
-        }
-        float mStairDrop = 0.0f; // units, the pelvis sinks this much more
-        float mStairDescentHold = 0.0f; // seconds left of the last descent
-        float mStairAscentHold = 0.0f; // seconds left of the last climb
-        unsigned mStairDropSteps = 0; // physics steps of the current drop
         float mSlopeStance = 0.0f; // 0..1
         JPH::Vec3 mSlopeDownhill = JPH::Vec3::sZero();
         float mTeeter = 0.0f; // 0..1
@@ -2498,49 +2687,6 @@
                     mTeeterStepped = false;
                 mTeeter += std::clamp(wanted - mTeeter, -dt / 0.6f, dt / 0.15f);
                 mTeeterPhase += dt * te.mHz * 6.2831853f;
-            }
-            // Stair drop.
-            if (const auto& sd = stairDropSettings(); sd.mOn)
-            {
-                // Descending or climbing: the root's vertical speed beyond
-                // 25 u/s, held `hold` s past the last such step. The holds run
-                // down only while walking (standing on the stairs keeps them).
-                const float vertical = mKinematicRootActualVerticalVelocity;
-                const bool walking = pgcRequestSpeed() >= 15.0f;
-                if (vertical < -25.0f)
-                    mStairDescentHold = sd.mHold;
-                else if (walking)
-                    mStairDescentHold = std::max(0.0f, mStairDescentHold - dt);
-                if (vertical > 25.0f)
-                    mStairAscentHold = sd.mHold;
-                else if (walking)
-                    mStairAscentHold = std::max(0.0f, mStairAscentHold - dt);
-                MWBase::World* world = MWBase::Environment::get().getWorld();
-                float wanted = 0.0f;
-                float excess = 0.0f;
-                if (standing && mSituationKnown && mSituation.mGroundUnderBody && world->isOnGround(getPtr())
-                    && !mJumpAirborne && !(mSoftRootJumpWindow > 0.0f) && !mantling() && mStairDescentHold > 0.0f
-                    && mStairAscentHold <= 0.0f)
-                {
-                    // The capsule's height over the ground under the centre of
-                    // mass; beyond a step's height it is a ledge, not a stair.
-                    excess = static_cast<float>(getPtr().getRefData().getPosition().pos[2]) - mSituation.mGroundHeight;
-                    wanted = excess <= 34.0f ? std::clamp(excess - sd.mMargin, 0.0f, sd.mMaximum) : 0.0f;
-                }
-                const bool was = mStairDrop > 0.0f;
-                mStairDrop += std::clamp(wanted - mStairDrop, -sd.mRate * dt, sd.mRate * dt);
-                if (mStairDrop < 0.01f && wanted <= 0.0f)
-                    mStairDrop = 0.0f;
-                if (mStairDrop > 0.0f)
-                    ++mStairDropSteps;
-                if (was != (mStairDrop > 0.0f))
-                {
-                    Log(Debug::Info) << "RAGDOLL_STAIR_DROP actor=" << getPtr().getCellRef().getRefId()
-                                     << (was ? " off" : " on") << " excess=" << excess << " wanted=" << wanted
-                                     << " vz=" << vertical << " steps=" << mStairDropSteps;
-                    if (was)
-                        mStairDropSteps = 0;
-                }
             }
         }
         // The balance behaviours' posture over the reflex: the stagger, the
@@ -2835,6 +2981,51 @@
             const JPH::Vec3 e = mRollAxis.Cross(JPH::Vec3::sAxisZ()).NormalizedOr(JPH::Vec3::sAxisY());
             return std::atan2(v.Dot(e), v.Dot(JPH::Vec3::sAxisZ()));
         }
+        RagdollCore::DropRollState dropRollState() const
+        {
+            RagdollCore::DropRollState r;
+            r.mPhase = rootRollPhase();
+            r.mPhaseTime = mRollPhaseTime;
+            r.mTotal = mRollTotal;
+            r.mTheta = mRollTheta;
+            r.mThetaRawLast = mRollThetaRawLast;
+            r.mRate = mRollRate;
+            r.mTarget = mRollTarget;
+            r.mTwistTime = mRollTwistTime;
+            r.mStallTime = mRollStallTime;
+            r.mTuck = mRollTuck;
+            r.mPosture = mRollPosture;
+            r.mHandsReleased = mRollHandsReleased;
+            return r;
+        }
+        void storeDropRollState(const RagdollCore::DropRollState& r)
+        {
+            switch (r.mPhase)
+            {
+                case RagdollCore::RootRollPhase::Absorb:
+                    mRollPhase = RollPhase::Absorb;
+                    break;
+                case RagdollCore::RootRollPhase::Roll:
+                    mRollPhase = RollPhase::Roll;
+                    break;
+                case RagdollCore::RootRollPhase::Rise:
+                    mRollPhase = RollPhase::Rise;
+                    break;
+                default:
+                    break; // None and Armed are the integration's
+            }
+            mRollPhaseTime = r.mPhaseTime;
+            mRollTotal = r.mTotal;
+            mRollTheta = r.mTheta;
+            mRollThetaRawLast = r.mThetaRawLast;
+            mRollRate = r.mRate;
+            mRollTarget = r.mTarget;
+            mRollTwistTime = r.mTwistTime;
+            mRollStallTime = r.mStallTime;
+            mRollTuck = r.mTuck;
+            mRollPosture = r.mPosture;
+            mRollHandsReleased = r.mHandsReleased;
+        }
         void resetDropRoll(const char* why)
         {
             if (mRollPhase != RollPhase::None && dropRollTrace())
@@ -3092,58 +3283,53 @@
                 resetDropRoll("pose");
                 return;
             }
-            // The measured angle, unwrapped (a body vector's atan2: no drift).
-            const float raw = rollTheta(*pelvisUp);
-            float delta = raw - mRollThetaRawLast;
-            delta = std::remainder(delta, 6.2831853f);
-            mRollThetaRawLast = raw;
-            mRollTheta += delta;
-            mRollRate = 0.5f * mRollRate + 0.5f * (dt > 0.0f ? delta / dt : 0.0f);
-            mRollTwistTime = std::abs(torsoUp->Dot(mRollAxis)) > s.mTwist ? mRollTwistTime + dt : 0.0f;
-            mRollStallTime = mRollPhase == RollPhase::Roll && mRollRate < 1.5f && mRollTheta < 4.4f
-                ? mRollStallTime + dt : 0.0f;
-            // The target turns at a rolling ball's rate, never more than
-            // `lead` ahead of the measured angle and never behind it.
-            const float along = std::max(0.0f, JPH::Vec3(mSituationVelocity.GetX(), mSituationVelocity.GetY(), 0.0f).Dot(mRollTravel));
-            // At most 8 rad/s: at 9-10 the spin flung the tucked legs out
-            // straight (~5 g at the feet) - a handspring, not a roll (10-13).
-            // ACRO-01: the cap by skill (the reference rolls turn 7.9-9.3).
+            // The roll's step through ragdollcore droproll.
+            RagdollCore::DropRollState k2Roll = dropRollState();
+            RagdollCore::DropRollInput in;
+            in.mDt = dt;
+            in.mAxis = mRollAxis;
+            in.mPelvisUp = *pelvisUp;
+            in.mTorsoUp = *torsoUp;
+            in.mAlong = std::max(
+                0.0f, JPH::Vec3(mSituationVelocity.GetX(), mSituationVelocity.GetY(), 0.0f).Dot(mRollTravel));
+            in.mImpact = mRollImpact;
+            in.mToBack = mRollToBack;
             const auto& acro = acroRollSettings();
-            const float rateCap = mRollSkill >= 0.0f ? acro.mRateLow + (acro.mRateHigh - acro.mRateLow) * mRollSkill : 8.0f;
-            const float rate = std::clamp((along + 0.15f * std::max(0.0f, mRollImpact - 300.0f)) / std::max(s.mRadius, 1.0f),
-                std::min(5.0f, rateCap), rateCap);
-            const float lead = s.mLeadDeg * 3.14159265f / 180.0f;
-            const float leadShare = mRollPhase == RollPhase::Absorb ? std::clamp(mRollPhaseTime / 0.12f, 0.0f, 1.0f) : 1.0f;
-            float target = std::clamp(mRollTarget + rate * dt, mRollTheta, mRollTheta + lead * leadShare);
-            if (mRollToBack)
-                target = std::min(target, 2.62f);
-            if (mRollPhase == RollPhase::Rise)
-                target = std::min(target, 6.2831853f);
-            mRollTarget = target;
-            // The fades.
-            if (mRollPhase == RollPhase::Rise)
+            in.mRateCap = mRollSkill >= 0.0f ? acro.mRateLow + (acro.mRateHigh - acro.mRateLow) * mRollSkill : 8.0f;
+            in.mFootSupported = mSupportEstimate
+                && (mSupportEstimate->mLeftFootSupported || mSupportEstimate->mRightFootSupported);
+            const RagdollCore::DropRollStep k2RollStep
+                = RagdollCore::stepDropRoll(k2Roll, in, { s.mRadius, s.mLeadDeg, s.mTimeout, s.mTwist });
+            storeDropRollState(k2Roll);
+            if (k2RollStep.mReleaseHands)
+                releaseRollHands();
+            else if (k2RollStep.mPlantHands)
+                plantRollHands(profile);
+            if (dropRollTrace())
+                Log(Debug::Info) << "RAGDOLL_ROLL_STEP phase=" << static_cast<int>(mRollPhase)
+                                 << " t=" << mRollPhaseTime << " theta=" << mRollTheta
+                                 << " target=" << mRollTarget << " rate=" << mRollRate
+                                 << " twist=" << torsoUp->Dot(mRollAxis) << " strength=" << mRollLastStrength;
+            if (k2RollStep.mToRise)
             {
-                ease(mRollTuck, 0.0f, 0.2f);
-                ease(mRollPosture, 0.0f, 0.3f);
+                const auto pelvis = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex);
+                mRollRiseZ = pelvis ? static_cast<float>(pelvis->GetZ()) : 0.0f;
             }
-            else
+            if (k2RollStep.mEnd)
+                endDropRoll(k2RollStep.mEnd, k2RollStep.mFall);
+        }
+        void releaseRollHands()
+        {
+            const std::array<std::optional<RagdollArmRequest>*, 2> requests{ &mLeftArmTarget, &mRightArmTarget };
+            for (std::size_t side = 0; side < 2; ++side)
             {
-                ease(mRollTuck, 1.0f, 0.1f);
-                mRollPosture = 1.0f;
+                if (mRollHands[side] && *requests[side] && (*requests[side])->mBrace)
+                    (*requests[side])->mReleasing = true;
+                mRollHands[side] = false;
             }
-            // The hands to the ground ahead until 70 deg, then let go.
-            if (!mRollHandsReleased && mRollTheta >= 1.22f)
-            {
-                mRollHandsReleased = true;
-                const std::array<std::optional<RagdollArmRequest>*, 2> requests{ &mLeftArmTarget, &mRightArmTarget };
-                for (std::size_t side = 0; side < 2; ++side)
-                {
-                    if (mRollHands[side] && *requests[side] && (*requests[side])->mBrace)
-                        (*requests[side])->mReleasing = true;
-                    mRollHands[side] = false;
-                }
-            }
-            else if (!mRollHandsReleased && mRollPhase != RollPhase::Rise)
+        }
+        void plantRollHands(const RagdollCore::ActiveControllerProfile& profile)
+        {
             {
                 const auto pelvisWorld = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex);
                 const JPH::Vec3 right = mRollTravel.Cross(JPH::Vec3::sAxisZ());
@@ -3183,57 +3369,6 @@
                 plant(0, mLeftArmTarget, mLeftArm);
                 plant(1, mRightArmTarget, mRightArm);
             }
-            if (dropRollTrace())
-                Log(Debug::Info) << "RAGDOLL_ROLL_STEP phase=" << static_cast<int>(mRollPhase) << " t=" << mRollPhaseTime
-                                 << " theta=" << mRollTheta << " target=" << mRollTarget << " rate=" << mRollRate
-                                 << " twist=" << torsoUp->Dot(mRollAxis) << " strength=" << mRollLastStrength;
-            // Transitions.
-            switch (mRollPhase)
-            {
-                case RollPhase::Absorb:
-                    if (mRollPhaseTime >= 0.12f || mRollTheta >= 0.52f)
-                    {
-                        mRollPhase = RollPhase::Roll;
-                        mRollPhaseTime = 0.0f;
-                    }
-                    break;
-                case RollPhase::Roll:
-                    if (mRollToBack && (mRollTheta >= 2.44f || mRollPhaseTime > 0.6f))
-                        endDropRoll("back", true);
-                    else if (mRollStallTime >= 0.25f)
-                        endDropRoll("stalled", true);
-                    else if (mRollTwistTime >= 0.25f)
-                        endDropRoll("twist", true);
-                    else if (mRollTotal > s.mTimeout)
-                        endDropRoll("timeout", true);
-                    else if (mRollTheta >= 5.06f)
-                    {
-                        if (along >= 50.0f)
-                        {
-                            mRollPhase = RollPhase::Rise;
-                            mRollPhaseTime = 0.0f;
-                            const auto pelvis = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex);
-                            mRollRiseZ = pelvis ? static_cast<float>(pelvis->GetZ()) : 0.0f;
-                        }
-                        else
-                            endDropRoll("slow", true);
-                    }
-                    break;
-                case RollPhase::Rise:
-                {
-                    const bool foot = mSupportEstimate
-                        && (mSupportEstimate->mLeftFootSupported || mSupportEstimate->mRightFootSupported);
-                    if (mRollPhaseTime >= 0.2f && torsoUp->GetZ() >= 0.8f && foot)
-                        endDropRoll("stand", false);
-                    else if (mRollPhaseTime >= 0.6f)
-                        endDropRoll(torsoUp->GetZ() >= 0.6f ? "stand" : "rise", torsoUp->GetZ() < 0.6f);
-                    else if (mRollTotal > s.mTimeout + 0.6f)
-                        endDropRoll("timeout", true);
-                    break;
-                }
-                default:
-                    break;
-            }
         }
         // The root during the roll: pitched about the roll axis to the
         // target from the yaw at the touchdown, lowered on the absorb, at the
@@ -3247,27 +3382,23 @@
                 mRollBaseSet = true;
             }
             const JPH::Quat base = mRollBase;
-            if (mRollPhase == RollPhase::Rise && mRollTarget >= 6.28f)
-                rotation = base;
-            else
-                rotation = (JPH::Quat::sRotation(mRollAxis, mRollTarget) * base).Normalized();
-            const auto smooth = [](float t) { t = std::clamp(t, 0.0f, 1.0f); return t * t * (3.0f - 2.0f * t); };
-            const auto pelvis = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex);
-            if (mRollPhase == RollPhase::Absorb)
-                position.SetZ(position.GetZ() - std::min(30.0f, 0.04f * mRollImpact) * smooth(mRollPhaseTime / 0.12f));
-            else if (mRollPhase == RollPhase::Roll && pelvis)
-                position.SetZ(pelvis->GetZ());
-            else if (mRollPhase == RollPhase::Rise)
-                position.SetZ(mRollRiseZ + (position.GetZ() - mRollRiseZ) * smooth(mRollPhaseTime / 0.4f));
-            // ACRO-01: the run carried through the roll by skill.
+            RagdollCore::DropRollRootInput in;
+            in.mPhase = rootRollPhase();
+            in.mPhaseTime = mRollPhaseTime;
+            in.mTarget = mRollTarget;
+            in.mAxis = mRollAxis;
+            in.mBase = base;
+            in.mImpact = mRollImpact;
+            if (const auto pelvis = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex))
+                in.mPelvisZ = pelvis->GetZ();
+            in.mRiseZ = mRollRiseZ;
             const auto& acro = acroRollSettings();
-            if (mRollSkill >= 0.0f && acro.mKeepHigh > 0.0f && (mRollPhase == RollPhase::Roll || (mRollPhase == RollPhase::Rise && mRollPhaseTime < 0.3f)))
-            {
-                const float keep = acro.mKeepLow + (acro.mKeepHigh - acro.mKeepLow) * mRollSkill;
-                const float along = JPH::Vec3(mSituationVelocity.GetX(), mSituationVelocity.GetY(), 0.0f).Dot(mRollTravel);
-                const float lack = std::max(0.0f, keep * mRollEntrySpeed - along);
-                position += JPH::RVec3(mRollTravel * (0.15f * lack));
-            }
+            if (mRollSkill >= 0.0f && acro.mKeepHigh > 0.0f)
+                in.mKeep = acro.mKeepLow + (acro.mKeepHigh - acro.mKeepLow) * mRollSkill;
+            in.mEntrySpeed = mRollEntrySpeed;
+            in.mAlong = JPH::Vec3(mSituationVelocity.GetX(), mSituationVelocity.GetY(), 0.0f).Dot(mRollTravel);
+            in.mTravel = mRollTravel;
+            RagdollCore::dropRollRootPose(in, position, rotation);
         }
         void onSmartTouchdown(float impact)
         {
@@ -3458,17 +3589,6 @@
                 mRagdoll->setMotorSpring(leg->mFoot, motor.mFrequency * (stiff ? 2.0f : 1.0f), motor.mDamping);
             }
         }
-        void resetFootfall()
-        {
-            // The library's reset sets its leg springs back to the profile's.
-            if (mFootfallLibrary)
-            {
-                mFootfallLibraryOutput = {};
-                mFootfallLibrary->reset(mFootfallLibraryOutput);
-                applyFootfallLibrarySprings();
-                mFootfallLibraryOutput = {};
-            }
-        }
         // Anchor yield (synchronizePoweredRoot): time standing still off the
         // anchor, and whether the anchor is easing to the body.
         float mAnchorYieldTimer = 0.0f;
@@ -3523,6 +3643,7 @@
         float mPgcSinceRecovery = 100.0f; // seconds since a get-up owned the root
         bool mWasFallingForRefall = false;
         bool mHadRecovery = false;
+        std::vector<std::uint64_t> mRefallSteps; // the fixed steps of the last re-falls (K2_NPC_REFALL)
         unsigned mPgcReleases = 0;
         // An "uncatchable" verdict releases the body only after this many
         // steps of the catch were tried (PGC 3bd04bdd0d: every fall from a
@@ -3855,6 +3976,155 @@
                              << (source ? RagdollCore::stepSourceName(*source) : "gait") << " why="
                              << (source ? mStepWhy : "-") << " step=" << mFixedSteps;
         }
+        // KINETIC-2 phase 2 (PLAN.md): the legs' decisions through ragdollcore
+        // stride - the balance catches, the step planner's aim, the legs lead,
+        // the legs' health, the swing spring and the braced legs - on the
+        // entry's own members copied in and out.
+        // The catches' switches.
+        static const RagdollCore::StrideCatchSettings& strideCatchSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<RagdollCore::StrideCatchSettings>([] {
+                RagdollCore::StrideCatchSettings s;
+                s.mCatchSteps = catchStepsEnabled();
+                {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CATCH_ON_HIT");
+                    s.mCatchOnHit = text && std::atoi(text) != 0;
+                }
+                s.mStandingCatch = pgcKnobs()[1];
+                s.mHover = pgcKnobs()[3];
+                s.mLanding = weaponDriveSetting("OPENMW_RAGDOLL_PGC_LANDING", 1.0f) > 0.0f;
+                s.mLandingRelative = weaponDriveSetting("OPENMW_RAGDOLL_PGC_LANDING_RELATIVE", 0.0f) > 0.0f;
+                s.mMovingGain = weaponDriveSetting("OPENMW_RAGDOLL_PGC_MOVING_CATCH", 0.0f);
+                {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PGC_CONTACT_SUPPORT");
+                    s.mContactSupport = !(text && std::atoi(text) == 0);
+                }
+                s.mRealCom = weaponDriveSetting("OPENMW_RAGDOLL_PGC_REAL_COM", 0.0f) > 0.0f;
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PGC_STUCK"))
+                    std::sscanf(text, "%f,%f,%f", &s.mStuck[0], &s.mStuck[1], &s.mStuck[2]);
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CATCH_VETO"))
+                    std::sscanf(text, "%f,%f", &s.mVeto[0], &s.mVeto[1]);
+                s.mReleaseAfterSteps = pgcReleaseAfterSteps();
+                s.mStumbleSpeed = stumbleSettings().mSpeed;
+                s.mOrder = stepOrder();
+                return s;
+            });
+            return value_tuned.get();
+        }
+        RagdollCore::StrideCatchInput strideCatchInput(const RagdollCore::FootfallInput& input) const
+        {
+            RagdollCore::StrideCatchInput in;
+            in.mFootfall = mFootfallLibrary ? &input : nullptr;
+            if (mFootfallLibrary)
+                in.mFeet = mFootfallLibrary->feet();
+            in.mPinned = mFootfallLibraryOutput.mPinned;
+            in.mPelvisKnown = mPelvisBodyIndex.has_value();
+            if (mRagdoll && mPelvisBodyIndex)
+                in.mPelvis = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex);
+            for (std::size_t side = 0; side < 2; ++side)
+                if (mRagdoll && input.mLegs[side])
+                    in.mFootWorld[side] = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, input.mLegs[side]->mFoot);
+            in.mHaveBody = mControllerInput.has_value();
+            if (mControllerInput)
+            {
+                in.mBodyVelocity = mControllerInput->mCenterOfMassVelocity;
+                in.mTorsoUpDot = mControllerInput->mTorsoUpDot;
+            }
+            if (mSupportEstimate)
+                in.mFootContact
+                    = std::array<bool, 2>{ mSupportEstimate->mLeftFootSupported, mSupportEstimate->mRightFootSupported };
+            if (mSituationKnown)
+                in.mSituationCom = mSituationCom;
+            in.mRequestSpeed = pgcRequestSpeed();
+            in.mRawRequest = mRawTargetHorizontalVelocity;
+            in.mHitWeakened = mSoftRootStrength < 0.98f || mHitStun.active() || bearingsStumble() > 0.0f;
+            in.mSwingFootwork = swingFootworkActive();
+            in.mArmDriven = mTip.mActive;
+            in.mCapability = pgcCapability();
+            return in;
+        }
+        RagdollCore::StrideCatchState strideCatchState() const
+        {
+            RagdollCore::StrideCatchState s;
+            s.mStanding = mPgcCatch;
+            s.mMoving = mPgcMovingCatch;
+            s.mLanding = mPgcLanding;
+            s.mStage = mCatchStage;
+            s.mStageTime = mCatchStageTime;
+            s.mRecoveryTime = mCatchRecoveryTime;
+            s.mHeld = mCatchHeld;
+            s.mRecovering = mCatchRecovering;
+            s.mStuckLeanTime = mStuckLeanTime;
+            s.mStuckStepped = mStuckStepped;
+            s.mLandingRootFloor = mLandingRootFloor;
+            s.mLandingTouchdown = mLandingTouchdown;
+            s.mLandingImpactSpeed = mLandingImpactSpeed;
+            s.mStumbleLeft = mStumbleLeft;
+            s.mStepCount = mCatchStepCount;
+            s.mStuckSteps = mStuckSteps;
+            s.mStuckFalls = mStuckFalls;
+            s.mMovingTrails = mPgcMovingTrails;
+            s.mVetoes = mCatchVetoes;
+            s.mReleases = mPgcReleases;
+            s.mStumbleSteps = mStumbleSteps;
+            return s;
+        }
+        void storeStrideCatchState(const RagdollCore::StrideCatchState& s)
+        {
+            mPgcCatch = s.mStanding;
+            mPgcMovingCatch = s.mMoving;
+            mPgcLanding = s.mLanding;
+            mCatchStage = s.mStage;
+            mCatchStageTime = s.mStageTime;
+            mCatchRecoveryTime = s.mRecoveryTime;
+            mCatchHeld = s.mHeld;
+            mCatchRecovering = s.mRecovering;
+            mStuckLeanTime = s.mStuckLeanTime;
+            mStuckStepped = s.mStuckStepped;
+            mLandingRootFloor = s.mLandingRootFloor;
+            mLandingTouchdown = s.mLandingTouchdown;
+            mLandingImpactSpeed = s.mLandingImpactSpeed;
+            mStumbleLeft = s.mStumbleLeft;
+            mCatchStepCount = s.mStepCount;
+            mStuckSteps = s.mStuckSteps;
+            mStuckFalls = s.mStuckFalls;
+            mPgcMovingTrails = s.mMovingTrails;
+            mCatchVetoes = s.mVetoes;
+            mPgcReleases = s.mReleases;
+            mStumbleSteps = s.mStumbleSteps;
+        }
+        std::optional<RagdollCore::StepSource> catchStepsModule(const RagdollCore::FootfallInput& input)
+        {
+            RagdollCore::StrideCatchState state = strideCatchState();
+            const RagdollCore::StrideCatchResult result
+                = RagdollCore::stepStrideCatches(strideCatchInput(input), strideCatchSettings(), state);
+            storeStrideCatchState(state);
+            for (const auto& t : result.mTraces)
+                pgcTrace(t.mBranch, input.mDt, t.mState, t.mFeet, t.mSupported, t.mStage, t.mSteps, t.mSwingNow,
+                    t.mRelease);
+            if (result.mStuckStepFoot)
+                Log(Debug::Info) << "RAGDOLL_PGC_STUCK step actor=" << getPtr().getCellRef().getRefId()
+                                 << " foot=" << *result.mStuckStepFoot << " up="
+                                 << (mControllerInput ? mControllerInput->mTorsoUpDot : 1.0f);
+            if (result.mVetoed && (mCatchVetoes <= 20 || mCatchVetoes % 100 == 0))
+                Log(Debug::Info) << "RAGDOLL_CATCH_VETO actor=" << getPtr().getCellRef().getRefId()
+                                 << " up=" << (mControllerInput ? mControllerInput->mTorsoUpDot : 1.0f)
+                                 << " speed=" << result.mVetoSpeed << " count=" << mCatchVetoes;
+            if (result.mFall)
+                decideFall(result.mFall->mCause, result.mFall->mDirection);
+            if (result.mCommand)
+                commandFootfall(*result.mCommand);
+    #ifdef OPENMW_RAGDOLL_DEV_API
+            static const auto trace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_HELPER_TRACE") != nullptr; });
+            if (result.mStageCapture && trace_tuned.get() && getPtr() == MWMechanics::getPlayer())
+                Log(Debug::Info) << "RAGDOLL_CATCH stage=" << static_cast<int>(mCatchStage) << " cp="
+                                 << result.mStageCapture->mX << ',' << result.mStageCapture->mY
+                                 << " v=" << result.mStageVelocity.mX << ',' << result.mStageVelocity.mY << " now="
+                                 << (result.mCommand && result.mCommand->mSwingNow ? static_cast<int>(*result.mCommand->mSwingNow) : -1)
+                                 << " steps=" << mCatchStepCount;
+    #endif
+            return result.mSource;
+        }
         void updateCatchSteps(const RagdollCore::FootfallInput& input)
         {
             using namespace RagdollCore;
@@ -3897,578 +4167,21 @@
                 claimStep(StepSource::Dodge);
                 return;
             }
-            // On hits (user 2026-09-28: "what triggers PGC? shouldn't we be
-            // triggering it on every hit?"): while a hit has weakened the balance
-            // helper, and until the recovery it started ends, the catch steps run
-            // even when not enabled for all time. OPENMW_RAGDOLL_CATCH_ON_HIT=1.
-            // Off by default: with Footfall and the full helper, the push and
-            // knockdown cases were the same either way (52/52, drift and
-            // recovery equal; 94 catch steps taken) and the helper saturated
-            // more on some standing warhammer pushes - it pays only with a
-            // weaker helper (offline level 2), which is a feel decision.
-            static const auto catchOnHit_tuned = RagdollCore::tuned<bool>([] {
-                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CATCH_ON_HIT");
-                return text && std::atoi(text) != 0;
+            if (const std::optional<StepSource> taken = catchStepsModule(input))
+                claimStep(*taken);
+        }
+
+        // This actor's legs are traced: OPENMW_RAGDOLL_FOOTFALL_TRACE = 1 the
+        // player, "npc" the NPCs (RAMP-01), "all" both (MOVE-01 S1).
+        bool footfallTraced() const
+        {
+            static const auto traceLibrary_tuned = RagdollCore::tuned<int>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_FOOTFALL_TRACE");
+                return !text ? 0 : text[0] == 'n' ? 2 : text[0] == 'a' ? 3 : 1;
             });
-            static const auto& catchOnHit = catchOnHit_tuned.get();
-            // While the player asks to move, the gait keeps stepping after a
-            // hit (user bookmarks 1-3, 2026-09-30: "after getting hit while
-            // running the legs stay straight"; recording: both feet pinned
-            // 1.7 s at full root force - the catch held Footfall's clock until
-            // the body counted as caught, which a running body never does).
-            // Pushes while walking/running (CATCH_ON_HIT=1): longest
-            // both-feet-down stretch, mean 0.32 -> 0.23 s, walk side 0.9-1.1 ->
-            // 0.43-0.48 s.
-            const bool requestMoving = pgcRequestSpeed() >= 15.0f;
-            // The hit part only: landing catches and swing footwork keep
-            // their steps while moving (excluding them too broke the walk
-            // course, stepT 9 -> 40, stepL 6 -> 45). Narrowed: course walk
-            // stepT 28.5/30.5 against 28.5/30.0 with the old hold (noise
-            // around the bar); pushes both-feet-down mean 0.32 -> 0.23 s.
-            const bool hitWindow = (catchOnHit
-                                       && (mSoftRootStrength < 0.98f || mHitStun.active() || mCatchRecovering
-                                           || bearingsStumble() > 0.0f)
-                                       && !requestMoving)
-                || swingFootworkActive();
-            const bool pgcCatch = pgcKnobs()[1] && pgcRequestSpeed() < 15.0f;
-            if (!pgcCatch)
-                mPgcCatch.reset();
-            // Moving catch (alpha 0.6 item 3, PGC session 7be4106892): catch
-            // steps while walking or running, beside Footfall's gait - the
-            // swing in flight lands to turn an overspeed or sideways error
-            // around, and a stance foot left far behind the body steps now
-            // (user bookmarks 1/14/16: running backward the body "almost falls
-            // on its butt but won't fall", "the backstep should be quicker";
-            // the recording sat on a stance foot 60 units behind for 1.3 s).
-            // OPENMW_RAGDOLL_PGC_MOVING_CATCH = gain (0 = off; 0.5 offline).
-            static const auto landingEnabled_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_PGC_LANDING", 1.0f) > 0.0f; });
-            static const auto& landingEnabled = landingEnabled_tuned.get();
-            const bool pgcLanding = landingEnabled && (mLandingTouchdown || mPgcLanding.active());
-            if (!pgcLanding)
-                mLandingRootFloor = 0.0f;
-            static const auto movingGain_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_PGC_MOVING_CATCH", 0.0f); });
-            static const auto& movingGain = movingGain_tuned.get();
-            const bool pgcMoving = movingGain > 0.0f && pgcKnobs()[1] && !pgcCatch && !hitWindow;
-            if (!pgcMoving)
-                mPgcMovingCatch.reset();
-            if (!(catchStepsEnabled() || hitWindow || pgcCatch || pgcMoving || pgcLanding) || !mFootfallLibrary || !input.mEligible || !mControllerInput
-                || !input.mGround || !input.mLegs[0] || !input.mLegs[1] || !mPelvisBodyIndex)
-            {
-                mCatchRecovering = false;
-                return;
-            }
-            const float dt = input.mDt;
-            const auto pelvis = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex);
-            if (!pelvis || !(dt > 0.0f))
-                return;
-            std::array<JPH::RVec3, 2> footWorld;
-            std::array<BalanceVec2, 2> feet;
-            std::array<bool, 2> supported{ false, false };
-            float legReach = 0.0f;
-            for (std::size_t side = 0; side < 2; ++side)
-            {
-                const auto foot = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, input.mLegs[side]->mFoot);
-                if (!foot)
-                    return;
-                footWorld[side] = *foot;
-                feet[side] = { static_cast<float>(foot->GetX()), static_cast<float>(foot->GetY()) };
-                const auto ground = input.mGround(*foot, input.mActorZ);
-                supported[side] = ground && foot->GetZ() - *ground < 12.0;
-                // A foot in contact with supporting ground stands, whatever
-                // the probe says: the probe looks in a window around the
-                // capsule's height, and a body sagging under the capsule on a
-                // slope read both planted feet as floating, so the catch could
-                // step neither and released (Balmora hill stop, about 1 run in
-                // 3; the contacts held both feet). OPENMW_RAGDOLL_PGC_CONTACT_SUPPORT=0 = off.
-                static const auto contactSupport_tuned = RagdollCore::tuned<bool>([] {
-                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PGC_CONTACT_SUPPORT");
-                    return !(text && std::atoi(text) == 0);
-                });
-                if (contactSupport_tuned.get() && mSupportEstimate
-                    && (side == 0 ? mSupportEstimate->mLeftFootSupported : mSupportEstimate->mRightFootSupported))
-                    supported[side] = true;
-                if (const auto& geometry = input.mLegs[side]->mGeometry)
-                    legReach = std::max(legReach,
-                        (geometry->mUpperOffset.Length() + geometry->mLowerOffset.Length())
-                            / std::max(input.mFrame.mInverseUniformScale, 1e-3f));
-            }
-            if (!(legReach > 0.0f))
-                legReach = 70.0f;
-            const auto ground = input.mGround(*pelvis, input.mActorZ);
-            const double floorZ = ground ? *ground : input.mActorZ;
-            JPH::Vec3 disturbance = mControllerInput->mCenterOfMassVelocity - input.mCommandVelocity;
-            disturbance.SetZ(0.0f);
-            BalanceState state;
-            state.mCenterOfMass = { static_cast<float>(pelvis->GetX()), static_cast<float>(pelvis->GetY()) };
-            state.mVelocity = { disturbance.GetX(), disturbance.GetY() };
-            state.mHeight = static_cast<float>(pelvis->GetZ() - floorZ) + 15.0f;
-            // The body's mass-weighted centre (the situation's, held weapon
-            // included) instead of the pelvis + 15 u (STEPPING audit 11-01,
-            // item 14: a two-hander held out or a crouch moves it).
-            // OPENMW_RAGDOLL_PGC_REAL_COM=1 (0 = the pelvis, the old).
-            static const auto realCom_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_PGC_REAL_COM", 0.0f) > 0.0f; });
-            if (realCom_tuned.get() && mSituationKnown)
-            {
-                state.mCenterOfMass = { static_cast<float>(mSituationCom.GetX()), static_cast<float>(mSituationCom.GetY()) };
-                state.mHeight = std::max(20.0f, static_cast<float>(mSituationCom.GetZ() - floorZ));
-            }
-            state.mGravity = RagdollCore::UnitModel::GravityUnitsPerSecondSquared;
-            const auto capture = capturePoint(state);
-            if (!capture)
-                return;
-            const auto stuckStep = [&]() -> bool {
-                // Stuck lean (10-10 PGC matrix: ~1 in 24 near pushes of 8000 ended
-                // 37-52 deg over for 5-6 s - feet together 47 u beside the pelvis,
-                // the root holding the pelvis, the lean short of the topple line
-                // (up 0.5), so nothing stepped and nothing fell; user bookmark 5:
-                // "PGC trying to stand itself up ... if not found, it should fall").
-                // Still and leaning past `upDot` for `stepAfter` s: the foot
-                // farthest from the pelvis steps under it; still leaning at
-                // `fallAfter` s: PGC decides a fall.
-                // OPENMW_RAGDOLL_PGC_STUCK = "upDot,stepAfter,fallAfter" (unset = off).
-                {
-                    static const auto stuck_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
-                        std::array<float, 3> value{ 0.0f, 0.8f, 2.0f };
-                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PGC_STUCK"))
-                            std::sscanf(text, "%f,%f,%f", &value[0], &value[1], &value[2]);
-                        return value;
-                    });
-                    static const auto& stuck = stuck_tuned.get();
-                    const auto& feetNow = mFootfallLibrary->feet();
-                    const bool leaning = stuck[0] > 0.0f && mControllerInput->mTorsoUpDot < stuck[0]
-                        && std::hypot(state.mVelocity.mX, state.mVelocity.mY) < 20.0f && pgcRequestSpeed() < 15.0f
-                        && !feetNow[0].mSwinging && !feetNow[1].mSwinging && (supported[0] || supported[1]);
-                    mStuckLeanTime = leaning ? mStuckLeanTime + dt : 0.0f;
-                    if (!leaning)
-                        mStuckStepped = false;
-                    if (leaning && mStuckLeanTime >= stuck[2])
-                    {
-                        decideFall("stuck", { state.mCenterOfMass.mX - 0.5f * (feet[0].mX + feet[1].mX),
-                                                state.mCenterOfMass.mY - 0.5f * (feet[0].mY + feet[1].mY) });
-                        ++mStuckFalls;
-                        mStuckLeanTime = 0.0f;
-                        return true;
-                    }
-                    if (leaning && mStuckLeanTime >= stuck[1] && !mStuckStepped && supported[0] && supported[1])
-                    {
-                        const std::size_t swing
-                            = std::hypot(feet[0].mX - state.mCenterOfMass.mX, feet[0].mY - state.mCenterOfMass.mY)
-                                >= std::hypot(feet[1].mX - state.mCenterOfMass.mX, feet[1].mY - state.mCenterOfMass.mY)
-                            ? 0
-                            : 1;
-                        // Under the pelvis, kept a half stance width to its own side
-                        // of the line from the other foot to the pelvis.
-                        const JPH::Vec3 other(feet[1 - swing].mX, feet[1 - swing].mY, 0.0f);
-                        const JPH::Vec3 body(state.mCenterOfMass.mX, state.mCenterOfMass.mY, 0.0f);
-                        const JPH::Vec3 toBody = body - other;
-                        const JPH::Vec3 across = JPH::Vec3(-toBody.GetY(), toBody.GetX(), 0.0f).NormalizedOr(JPH::Vec3::sAxisX());
-                        const JPH::Vec3 own(feet[swing].mX - other.GetX(), feet[swing].mY - other.GetY(), 0.0f);
-                        const float sign = own.Dot(across) >= 0.0f ? 1.0f : -1.0f;
-                        const JPH::Vec3 point = body + across * (sign * 6.0f);
-                        const JPH::RVec3 at(point.GetX(), point.GetY(), floorZ);
-                        const auto landingGround = input.mGround(at, input.mActorZ);
-                        FootfallCommand command;
-                        command.mHoldClock = true;
-                        command.mSwingNow = swing;
-                        command.mSwingTime = 0.3f;
-                        command.mLanding[swing] = JPH::RVec3(at.GetX(), at.GetY(), landingGround ? *landingGround : floorZ);
-                        commandFootfall(command);
-                        mStuckStepped = true;
-                        ++mStuckSteps;
-                        ++mCatchStepCount;
-                        Log(Debug::Info) << "RAGDOLL_PGC_STUCK step actor=" << getPtr().getCellRef().getRefId()
-                                         << " foot=" << swing << " up=" << mControllerInput->mTorsoUpDot;
-                        return true;
-                    }
-                }
-                return false;
-            };
-            const auto landingStep = [&]() -> bool {
-                // (Skid steps live in the stagger plan now - STAGGER_PLAN's skid
-                // speed, PGC-03 B5; the old SKID_STEP was removed 10-12.)
-                if (pgcLanding)
-                {
-                    const auto& footState = mFootfallLibrary->feet();
-                    LandingInput landing;
-                    landing.mState = state;
-                    // Relative landing (10-09 PGC trace, SAVE-01 push landing: the
-                    // landing walked on at 170 u/s with the request, its capture
-                    // point from the absolute speed sat 100 u past the feet and the
-                    // run-out released a walking body into a fall, 2 of 2): while
-                    // the player asks to move, the run-out reads the body's speed
-                    // against the request (state.mVelocity, like the catches).
-                    // OPENMW_RAGDOLL_PGC_LANDING_RELATIVE=1 (0 = absolute, the old).
-                    static const auto landingRelative_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_PGC_LANDING_RELATIVE", 0.0f) > 0.0f; });
-                    static const auto& landingRelative = landingRelative_tuned.get();
-                    if (!(landingRelative && requestMoving))
-                        landing.mState.mVelocity = { mControllerInput->mCenterOfMassVelocity.GetX(),
-                            mControllerInput->mCenterOfMassVelocity.GetY() };
-                    for (std::size_t side = 0; side < 2; ++side)
-                    {
-                        auto& foot = landing.mFeet[side];
-                        foot.mPosition = feet[side];
-                        foot.mSupported = supported[side];
-                        foot.mPinned = mFootfallLibraryOutput.mPinned[side];
-                        foot.mSwinging = footState[side].mSwinging;
-                        foot.mTarget = { static_cast<float>(footState[side].mTarget.GetX()),
-                            static_cast<float>(footState[side].mTarget.GetY()) };
-                        foot.mPhase = footState[side].mPhase;
-                        foot.mDuration = footState[side].mDuration;
-                    }
-                    const CaptureStepLimits limits = catchStepLimits(pgcCapability(), legReach);
-                    landing.mDt = dt;
-                    landing.mReach = limits.mMaximumReach;
-                    landing.mMinimumSwingTime = limits.mMinimumSwingTime;
-                    landing.mTouchdown = mLandingTouchdown;
-                    landing.mImpactSpeed = mLandingImpactSpeed;
-                    mLandingTouchdown = false;
-                    const auto landingResult = mPgcLanding.update(landing);
-                    pgcTrace("landing", dt, landing.mState, feet, supported, -1, landingResult ? landingResult->mSteps : -1,
-                        landingResult && landingResult->mSwingNow, landingResult && landingResult->mRelease);
-                    if (const auto& result = landingResult)
-                    {
-                        mLandingRootFloor = result->mRootStrengthFloor;
-                        if (result->mRelease)
-                        {
-                            decideFall("landing", {});
-                            mPgcLanding.reset();
-                            mLandingRootFloor = 0.0f;
-                            return true;
-                        }
-                        FootfallCommand command;
-                        command.mHoldClock = result->mHoldClock;
-                        command.mSwingNow = result->mSwingNow;
-                        command.mSwingTime = result->mSwingTime;
-                        for (std::size_t side = 0; side < 2; ++side)
-                            if (result->mLanding[side])
-                            {
-                                const JPH::RVec3 point(result->mLanding[side]->mX, result->mLanding[side]->mY, floorZ);
-                                const auto landingGround = input.mGround(point, input.mActorZ);
-                                command.mLanding[side]
-                                    = JPH::RVec3(point.GetX(), point.GetY(), landingGround ? *landingGround : floorZ);
-                            }
-                        if (result->mSwingNow)
-                            ++mCatchStepCount;
-                        commandFootfall(command);
-                    }
-                    else
-                        mLandingRootFloor = 0.0f;
-                    return true;
-                }
-                return false;
-            };
-            const auto movingStep = [&]() -> bool {
-                if (pgcMoving)
-                {
-                    const auto& footState = mFootfallLibrary->feet();
-                    MovingCatchInput moving;
-                    moving.mState = state;
-                    moving.mState.mVelocity = { mControllerInput->mCenterOfMassVelocity.GetX(),
-                        mControllerInput->mCenterOfMassVelocity.GetY() };
-                    moving.mCommandedVelocity = { input.mCommandVelocity.GetX(), input.mCommandVelocity.GetY() };
-                    for (std::size_t side = 0; side < 2; ++side)
-                    {
-                        auto& foot = moving.mFeet[side];
-                        foot.mPosition = feet[side];
-                        foot.mSupported = supported[side];
-                        foot.mPinned = mFootfallLibraryOutput.mPinned[side];
-                        foot.mSwinging = footState[side].mSwinging;
-                        foot.mTarget = { static_cast<float>(footState[side].mTarget.GetX()),
-                            static_cast<float>(footState[side].mTarget.GetY()) };
-                        foot.mPhase = footState[side].mPhase;
-                        foot.mDuration = footState[side].mDuration;
-                    }
-                    moving.mDt = dt;
-                    moving.mReach = catchStepLimits(pgcCapability(), legReach).mMaximumReach;
-                    moving.mSettings.mGain = movingGain;
-                    // No release in the game yet (PGC session: start with it off).
-                    moving.mSettings.mRelease = false;
-                    const auto movingResult = mPgcMovingCatch.update(moving);
-                    pgcTrace("moving", dt, moving.mState, feet, supported, -1, -1, movingResult && movingResult->mSwingNow,
-                        movingResult && movingResult->mRelease);
-                    if (const auto& result = movingResult)
-                    {
-                        FootfallCommand command;
-                        command.mSwingNow = result->mSwingNow;
-                        command.mSwingTime = result->mSwingTime;
-                        bool any = result->mSwingNow.has_value();
-                        for (std::size_t side = 0; side < 2; ++side)
-                            if (result->mLanding[side])
-                            {
-                                const JPH::RVec3 point(result->mLanding[side]->mX, result->mLanding[side]->mY, floorZ);
-                                const auto landingGround = input.mGround(point, input.mActorZ);
-                                command.mLanding[side]
-                                    = JPH::RVec3(point.GetX(), point.GetY(), landingGround ? *landingGround : floorZ);
-                                any = true;
-                            }
-                        if (result->mTrail)
-                            ++mPgcMovingTrails;
-                        if (result->mSwingNow)
-                            ++mCatchStepCount;
-                        if (any)
-                            commandFootfall(command);
-                    }
-                    return true;
-                }
-                return false;
-            };
-            const auto catchStep = [&]() -> bool {
-                if (pgcCatch)
-                {
-                    const auto& footState = mFootfallLibrary->feet();
-                    const RagdollCore::CatchCapability capability = pgcCapability();
-                    CatchStepInput catchInput;
-                    catchInput.mState = state;
-                    catchInput.mState.mVelocity = { mControllerInput->mCenterOfMassVelocity.GetX(),
-                        mControllerInput->mCenterOfMassVelocity.GetY() };
-                    catchInput.mReferenceVelocity = { input.mCommandVelocity.GetX(), input.mCommandVelocity.GetY() };
-                    catchInput.mBodyForward = { std::sin(input.mYaw), std::cos(input.mYaw) };
-                    for (std::size_t side = 0; side < 2; ++side)
-                    {
-                        auto& foot = catchInput.mFeet[side];
-                        foot.mPosition = feet[side];
-                        foot.mSupported = supported[side];
-                        foot.mSwinging = footState[side].mSwinging;
-                        foot.mTargetHeld = footState[side].mTargetHeld;
-                        foot.mPhase = footState[side].mPhase;
-                        foot.mDuration = footState[side].mDuration;
-                    }
-                    catchInput.mDt = dt;
-                    catchInput.mLimits = catchStepLimits(capability, legReach);
-                    catchInput.mReactionDelay = capability.mReactionDelay;
-                    if (pgcKnobs()[3])
-                    {
-                        catchInput.mStepFreeFoot = true;
-                        catchInput.mReleaseWhenUncatchable = true;
-                        catchInput.mReleaseAfterSteps = pgcReleaseAfterSteps();
-                        catchInput.mArmDriven = mTip.mActive;
-                        catchInput.mMaximumHoverTime = 0.5f;
-                        const JPH::Vec3 request(mRawTargetHorizontalVelocity.GetX(), mRawTargetHorizontalVelocity.GetY(), 0.0f);
-                        if (request.Length() > 1.0f)
-                            catchInput.mDirectionBias = { request.GetX() / request.Length(), request.GetY() / request.Length() };
-                    }
-                    applyStumble(catchInput);
-                    const auto result = mPgcCatch.update(catchInput);
-                    countStumble(result);
-                    pgcTrace("catch", dt, catchInput.mState, feet, supported, result ? static_cast<int>(result->mStage) : -1,
-                        static_cast<int>(mPgcCatch.stepsStarted()), result && result->mSwingNow, result && result->mRelease);
-                    if (result && result->mRelease)
-                    {
-                        // An upright body that is not moving off its request is
-                        // not falling: the hover release (no step for 0.5 s)
-                        // dropped two NPCs every 0.6 s for minutes while they stood
-                        // at up 0.999 (10-30 play, Zainsipilu: 108 and 86 "catch"
-                        // falls; the root let go each time and they flailed). The
-                        // catch ends instead. OPENMW_RAGDOLL_CATCH_VETO = "least up,
-                        // most speed u/s" (0 = off).
-                        static const auto veto_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                            std::array<float, 2> v{ 0.93f, 40.0f };
-                            if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CATCH_VETO"))
-                                std::sscanf(text, "%f,%f", &v[0], &v[1]);
-                            return v;
-                        });
-                        const auto& veto = veto_tuned.get();
-                        const JPH::Vec3 off(mControllerInput->mCenterOfMassVelocity.GetX() - input.mCommandVelocity.GetX(),
-                            mControllerInput->mCenterOfMassVelocity.GetY() - input.mCommandVelocity.GetY(), 0.0f);
-                        if (veto[0] > 0.0f && mControllerInput->mTorsoUpDot >= veto[0] && off.Length() <= veto[1])
-                        {
-                            if (++mCatchVetoes <= 20 || mCatchVetoes % 100 == 0)
-                                Log(Debug::Info) << "RAGDOLL_CATCH_VETO actor=" << getPtr().getCellRef().getRefId()
-                                                 << " up=" << mControllerInput->mTorsoUpDot << " speed=" << off.Length()
-                                                 << " count=" << mCatchVetoes;
-                            mPgcCatch.reset();
-                            return true;
-                        }
-                        // No step can catch it: fall now, as a topple does.
-                        decideFall("catch", result->mFallDirection);
-                        ++mPgcReleases;
-                        mPgcCatch.reset();
-                        return true;
-                    }
-                    if (result && result->mHoldClock)
-                    {
-                        FootfallCommand command;
-                        command.mHoldClock = true;
-                        command.mSwingNow = result->mSwingNow;
-                        command.mSwingTime = result->mSwingTime;
-                        for (std::size_t side = 0; side < 2; ++side)
-                            if (result->mLanding[side])
-                            {
-                                const JPH::RVec3 point(result->mLanding[side]->mX, result->mLanding[side]->mY, floorZ);
-                                const auto landingGround = input.mGround(point, input.mActorZ);
-                                command.mLanding[side]
-                                    = JPH::RVec3(point.GetX(), point.GetY(), landingGround ? *landingGround : floorZ);
-                            }
-                        if (result->mSwingNow)
-                            ++mCatchStepCount;
-                        commandFootfall(command);
-                    }
-                    return true;
-                }
-                return false;
-            };
-            const auto stageStep = [&]() -> bool {
-                BalanceStageInput stageInput;
-                stageInput.mCapturePoint = *capture;
-                stageInput.mLeftFoot = feet[0];
-                stageInput.mRightFoot = feet[1];
-                stageInput.mLeftSupported = supported[0];
-                stageInput.mRightSupported = supported[1];
-                stageInput.mPrevious = mCatchStage;
-                stageInput.mTimeInPrevious = mCatchStageTime;
-                stageInput.mLimits = { 6.0f, 8.0f, 1.5f, 0.3f };
-                if (const auto decision = classifyBalanceStage(stageInput))
-                {
-                    mCatchStageTime = decision->mStage == mCatchStage ? mCatchStageTime + dt : 0.0f;
-                    mCatchStage = decision->mStage;
-                }
-                if (!mCatchRecovering && mCatchStage == BalanceStage::Step)
-                {
-                    mCatchRecovering = true;
-                    mCatchRecoveryTime = 0.0f;
-                    mCatchHeld = 0.0f;
-                }
-                pgcTrace("hitcatch", dt, state, feet, supported, static_cast<int>(mCatchStage), mCatchRecovering ? 1 : 0,
-                    false, false);
-                if (!mCatchRecovering)
-                    return false;
-                mCatchRecoveryTime += dt;
-                const auto& footState = mFootfallLibrary->feet();
-                RecoveryEndInput endInput;
-                endInput.mCapturePoint = *capture;
-                endInput.mVelocity = state.mVelocity;
-                endInput.mLeftFoot = feet[0];
-                endInput.mRightFoot = feet[1];
-                endInput.mLeftSupported = supported[0];
-                endInput.mRightSupported = supported[1];
-                endInput.mHeld = mCatchHeld;
-                endInput.mDt = dt;
-                endInput.mLimits = { 6.0f, 2.0f, 25.0f, 0.2f };
-                const auto end = evaluateRecoveryEnd(endInput);
-                mCatchHeld = end ? end->mHeld : 0.0f;
-                const bool swinging = footState[0].mSwinging || footState[1].mSwinging;
-                if ((end && end->mCaught && !swinging) || mCatchRecoveryTime > 3.0f)
-                {
-                    mCatchRecovering = false;
-                    return false;
-                }
-                FootfallCommand command;
-                command.mHoldClock = true;
-                CaptureStepLimits limits;
-                limits.mFootRadius = 6.0f;
-                limits.mMaximumReach = 0.8f * legReach;
-                limits.mMinimumWidth = 8.0f;
-                limits.mMinimumSwingTime = 0.2f;
-                limits.mMaximumSwingTime = 0.45f;
-                limits.mSwingFootSpeed = 400.0f;
-                limits.mCrossoverClearance = 0.0f;
-                limits.mBrakeMargin = 0.0f;
-                const float yaw = input.mYaw;
-                const BalanceVec2 forward{ std::sin(yaw), std::cos(yaw) };
-                const auto planFor = [&](std::size_t swing, std::optional<float> timeToTouchdown) {
-                    CaptureStepInput stepInput;
-                    stepInput.mState = state;
-                    stepInput.mStanceFoot = feet[1 - swing];
-                    stepInput.mSwingFoot = feet[swing];
-                    stepInput.mBodyForward = forward;
-                    stepInput.mSwingIsLeft = swing == 0;
-                    stepInput.mTimeToTouchdown = timeToTouchdown;
-                    stepInput.mLimits = limits;
-                    return planRecoverySteps(stepInput, 3);
-                };
-                const auto landingAt = [&](BalanceVec2 at) {
-                    const JPH::RVec3 point(at.mX, at.mY, floorZ);
-                    const auto landingGround = input.mGround(point, input.mActorZ);
-                    return JPH::RVec3(at.mX, at.mY, landingGround ? *landingGround : floorZ);
-                };
-                std::optional<std::size_t> inFlight;
-                for (std::size_t side = 0; side < 2; ++side)
-                    if (footState[side].mSwinging)
-                        inFlight = side;
-                if (inFlight)
-                {
-                    if (!footState[*inFlight].mTargetHeld && supported[1 - *inFlight])
-                    {
-                        const float remaining = std::max(
-                            0.05f, (1.0f - footState[*inFlight].mPhase) * footState[*inFlight].mDuration);
-                        if (const auto plan = planFor(*inFlight, remaining); plan && plan->mCount > 0)
-                            command.mLanding[*inFlight] = landingAt(plan->mSteps[0].mLanding);
-                    }
-                }
-                else if (supported[0] && supported[1] && mCatchStage == BalanceStage::Step)
-                {
-                    std::optional<RecoveryPlan> best;
-                    std::size_t bestSide = 0;
-                    for (std::size_t side = 0; side < 2; ++side)
-                    {
-                        const auto plan = planFor(side, std::nullopt);
-                        if (!plan || plan->mCount == 0)
-                            continue;
-                        const auto better = [](const RecoveryPlan& a, const RecoveryPlan& b) {
-                            if (a.mCaptured != b.mCaptured)
-                                return a.mCaptured;
-                            if (a.mCount != b.mCount)
-                                return a.mCount < b.mCount;
-                            return a.mSteps[a.mCount - 1].mResidual < b.mSteps[b.mCount - 1].mResidual;
-                        };
-                        if (!best || better(*plan, *best))
-                        {
-                            best = plan;
-                            bestSide = side;
-                        }
-                    }
-                    if (best)
-                    {
-                        command.mSwingNow = bestSide;
-                        command.mSwingTime = best->mSteps[0].mSwingTime;
-                        command.mLanding[bestSide] = landingAt(best->mSteps[0].mLanding);
-                        ++mCatchStepCount;
-                    }
-                }
-                commandFootfall(command);
-    #ifdef OPENMW_RAGDOLL_DEV_API
-                static const auto trace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_HELPER_TRACE") != nullptr; });
-                static const auto& trace = trace_tuned.get();
-                if (trace && getPtr() == MWMechanics::getPlayer())
-                    Log(Debug::Info) << "RAGDOLL_CATCH stage=" << static_cast<int>(mCatchStage) << " cp=" << capture->mX << ','
-                                     << capture->mY << " pelvis=" << pelvis->GetX() << ',' << pelvis->GetY()
-                                     << " v=" << state.mVelocity.mX << ',' << state.mVelocity.mY
-                                     << " now=" << (command.mSwingNow ? static_cast<int>(*command.mSwingNow) : -1)
-                                     << " steps=" << mCatchStepCount;
-    #endif
-                return true;
-            };
-            // The balance catches in their declared order; the first that takes
-            // the step owns it (OPENMW_RAGDOLL_STEP_ORDER, default the old code order).
-            for (const StepSource source : stepOrder())
-            {
-                bool took = false;
-                switch (source)
-                {
-                    case StepSource::Stuck:
-                        took = stuckStep();
-                        break;
-                    case StepSource::Landing:
-                        took = landingStep();
-                        break;
-                    case StepSource::MovingCatch:
-                        took = movingStep();
-                        break;
-                    case StepSource::StandingCatch:
-                        took = catchStep();
-                        break;
-                    case StepSource::StageCatch:
-                        took = stageStep();
-                        break;
-                    default:
-                        break;
-                }
-                if (took)
-                {
-                    claimStep(source);
-                    return;
-                }
-            }
+            const int traceLibrary = traceLibrary_tuned.get();
+            return traceLibrary == 3
+                || (traceLibrary != 0 && (getPtr() == MWMechanics::getPlayer()) == (traceLibrary == 1));
         }
 
         // The library's inputs.
@@ -4510,6 +4223,32 @@
             in.mFeet = { *left, *right };
             if (mSupportEstimate)
                 in.mFootContact = { mSupportEstimate->mLeftFootSupported, mSupportEstimate->mRightFootSupported };
+            {
+                const bool planted = mSupportEstimate && mSupportEstimate->mLeftFootSupported
+                    && mSupportEstimate->mRightFootSupported && footfallPinnedAt(0) && footfallPinnedAt(1);
+                // K2_STAIR_STRAFE (registry): side steps on stairs slow down.
+                static const auto strafe_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                    std::array<float, 3> v{ 0.0f, 8.0f, 0.8f };
+                    RagdollCore::tuningList("OPENMW_RAGDOLL_K2_STAIR_STRAFE", v);
+                    return v;
+                });
+                const auto& strafe = strafe_tuned.get();
+                float wanted = 1.0f;
+                if (strafe[0] > 0.0f && strafe[0] < 1.0f)
+                {
+                    if (planted && std::abs(left->GetZ() - right->GetZ()) > strafe[1])
+                        mStairTreads = strafe[2];
+                    else
+                        mStairTreads = std::max(0.0f, mStairTreads - dt);
+                    const float yaw = getPtr().getRefData().getPosition().rot[2];
+                    const JPH::Vec3 right(std::cos(yaw), -std::sin(yaw), 0.0f);
+                    const JPH::Vec3 asked(mRawTargetHorizontalVelocity.GetX(), mRawTargetHorizontalVelocity.GetY(), 0.0f);
+                    const float speed = asked.Length();
+                    if (mStairTreads > 0.0f && speed > 15.0f && std::abs(asked.Dot(right)) > 0.5f * speed)
+                        wanted = strafe[0];
+                }
+                mMoveScale += (wanted - mMoveScale) * std::min(1.0f, dt / 0.15f);
+            }
             // The centre of mass from the pose and the body masses.
             const auto& masses = mRagdoll->getBodyMasses();
             double mass = 0.0;
@@ -4577,13 +4316,8 @@
             input.mDt = dt;
             // The library's own trace (landings, lifts, per-step feet with
             // pin and target heights) for the player: OPENMW_RAGDOLL_FOOTFALL_TRACE
-            // ("npc": the NPCs' instead, RAMP-01).
-            static const auto traceLibrary_tuned = RagdollCore::tuned<int>([] {
-                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_FOOTFALL_TRACE");
-                return !text ? 0 : text[0] == 'n' ? 2 : 1;
-            });
-            static const auto& traceLibrary = traceLibrary_tuned.get();
-            if (traceLibrary != 0 && (getPtr() == MWMechanics::getPlayer()) == (traceLibrary == 1))
+            // ("npc": the NPCs' instead, RAMP-01; "all": both, MOVE-01 S1).
+            if (footfallTraced())
             {
                 input.mTrace = [id = getPtr().getCellRef().getRefId().toDebugString()](const std::string& line) {
                     Log(Debug::Info) << line << " actor=" << id;
@@ -4593,6 +4327,12 @@
                 if (mSupportEstimate)
                     Log(Debug::Info) << "RAGDOLL_FOOTFALL_CONTACT left=" << mSupportEstimate->mLeftFootSupported
                                      << " right=" << mSupportEstimate->mRightFootSupported;
+            }
+            // The thrust's shift is the held root's (updateKinematicRoot).
+            if (mRagdoll && mRagdoll->isRootKinematic())
+            {
+                input.mPlantedShift = mPlantedShift;
+                input.mPlantedShiftVelocity = mPlantedShiftVelocity;
             }
             input.mEligible = footfallEnabled() && mLeftLeg && mRightLeg && mPelvisBodyIndex
                 && mCurrentPhysicsPoseCaptured && mSurfaceQuery && mRagdoll->getSoftRoot().mEnabled
@@ -4604,7 +4344,22 @@
                 // jump window held open past a landing, 10 of 16 with the
                 // capsule airborne). OPENMW_RAGDOLL_PGC_BRACE_AIR=0 = old rule.
                 && ((!(mSoftRootJumpWindow > 0.0f) && world->isOnGround(getPtr())) || (mBracingPgcActive && braceAir()))
-                && !world->isSwimming(getPtr()) && !world->isFlying(getPtr()) && dt > 0.0f && !rollOwnsLegs();
+                && !world->isSwimming(getPtr()) && !world->isFlying(getPtr()) && dt > 0.0f && !rollOwnsLegs()
+                && !mCalm.mLegsOnClip; // K2_CALM: a held NPC's legs follow the animation
+            // Why the legs stopped stepping (MOVE-01 W0, the user's "stuck in
+            // a frame": 13% of moving time with no foot pinned or swinging,
+            // up to 13.7 s): each time eligibility flips, which terms fail.
+            if (footfallTraced() && input.mEligible != mFootfallTracedEligible)
+            {
+                mFootfallTracedEligible = input.mEligible;
+                Log(Debug::Info) << "RAGDOLL_FOOTFALL_ELIGIBLE on=" << input.mEligible
+                                 << " kin=" << mRagdoll->isRootKinematic() << " brace=" << mBracingPgcActive
+                                 << " mode=" << (mControllerOutput ? static_cast<int>(mControllerOutput->mMode) : -1)
+                                 << " jumpWindow=" << mSoftRootJumpWindow << " onGround=" << world->isOnGround(getPtr())
+                                 << " swim=" << world->isSwimming(getPtr()) << " fly=" << world->isFlying(getPtr())
+                                 << " roll=" << rollOwnsLegs() << " pose=" << mCurrentPhysicsPoseCaptured
+                                 << " actor=" << getPtr().getCellRef().getRefId().toDebugString();
+            }
             if (!mPelvisBodyIndex || !mLeftLeg || !mRightLeg)
             {
                 input.mEligible = false;
@@ -4619,27 +4374,6 @@
             const float slopeCrouch = mSlopeStance * slopeStanceSettings().mCrouch;
             input.mExtraCrouch = (mHscActive ? mHscLow * hscLowStance()[1] * 0.3f : 0.0f) + mLandingCrouch + slopeCrouch;
             input.mExtraKnee = (mHscActive ? mHscLow * hscLowStance()[1] : 0.0f) + (mLandingCrouch + slopeCrouch) * 2.0f;
-            // The stair drop reaches the root only through the library's pelvis
-            // drop (not again at the root target). Its knee bend shortens the
-            // stance legs by the whole drop (the hinge leg's law of cosines; 2
-            // deg/u as above gave only ~6 of 24 units).
-            if (mStairDrop > 0.0f)
-            {
-                input.mExtraCrouch += mStairDrop;
-                if (const auto& geometry = input.mLegs[0]->mGeometry)
-                {
-                    const float a = geometry->mUpperOffset.Length();
-                    const float b = geometry->mLowerOffset.Length();
-                    if (a > 0.0f && b > 0.0f)
-                    {
-                        // The legs are posed in model units.
-                        const float length = std::max(a + b - mStairDrop * mRagdoll->getInverseUniformScale(), 0.0f);
-                        const float cosine
-                            = std::clamp((length * length - a * a - b * b) / (2.0f * a * b), -1.0f, 1.0f);
-                        input.mExtraKnee += std::min(std::acos(cosine) * 180.0f / 3.14159265f, 100.0f);
-                    }
-                }
-            }
             input.mChestCarried = mChestCarried;
             input.mPhysicsPose = &mCurrentPhysicsPose;
             input.mClipPose = &clipPose;
@@ -4653,17 +4387,46 @@
             if (mSurfaceQuery)
             {
                 const SurfaceQuery query = mSurfaceQuery;
-                input.mGround = [query](const JPH::RVec3& point, double reference) -> std::optional<double> {
+                // K2_GROUND_FOLLOW (registry): the ray reaches further down by
+                // how far the physical pelvis hangs under the clip's, and by
+                // how far the capsule comes down in a step's time.
+                static const auto follow_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                    std::array<float, 3> v{ 0.0f, 10.0f, 0.0f };
+                    RagdollCore::tuningList("OPENMW_RAGDOLL_K2_GROUND_FOLLOW", v);
+                    return v;
+                });
+                const auto& follow = follow_tuned.get();
+                float reach = 70.0f;
+                mPelvisSag = 0.0f;
+                {
+                    const auto wanted = mRagdoll->getWorldBodyPosition(clipPose, *mPelvisBodyIndex);
+                    const auto pelvis = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex);
+                    // Not the drop the legs themselves ask for (crouch, descent).
+                    if (wanted && pelvis)
+                    {
+                        mPelvisSag = static_cast<float>(wanted->GetZ() - pelvis->GetZ()) - footfallRootDrop();
+                        mPelvisOffX = static_cast<float>(pelvis->GetX() - wanted->GetX());
+                        mPelvisOffY = static_cast<float>(pelvis->GetY() - wanted->GetY());
+                        mPelvisOff = static_cast<float>(
+                            std::hypot(wanted->GetX() - pelvis->GetX(), wanted->GetY() - pelvis->GetY()));
+                    }
+                }
+                if (follow[0] > 0.0f)
+                    reach += std::clamp(std::max(mPelvisSag - follow[1], 0.0f)
+                            + std::max(-mKinematicRootActualVerticalVelocity, 0.0f) * follow[2],
+                        0.0f, follow[0]);
+                mGroundReach = reach;
+                input.mGround = [query, reach](const JPH::RVec3& point, double reference) -> std::optional<double> {
                     const auto hit = query(JPH::RVec3(point.GetX(), point.GetY(), reference + 30.0),
-                        -JPH::Vec3::sAxisZ(), 70.0f);
+                        -JPH::Vec3::sAxisZ(), reach);
                     if (!hit || hit->second.GetZ() < 0.7f)
                         return std::nullopt;
                     return hit->first.GetZ();
                 };
                 // The same probe's surface normal (WALK-02 slopes).
-                input.mGroundNormal = [query](const JPH::RVec3& point, double reference) -> std::optional<JPH::Vec3> {
+                input.mGroundNormal = [query, reach](const JPH::RVec3& point, double reference) -> std::optional<JPH::Vec3> {
                     const auto hit = query(JPH::RVec3(point.GetX(), point.GetY(), reference + 30.0),
-                        -JPH::Vec3::sAxisZ(), 70.0f);
+                        -JPH::Vec3::sAxisZ(), reach);
                     if (!hit || hit->second.GetZ() < 0.7f)
                         return std::nullopt;
                     return hit->second;
@@ -4729,23 +4492,345 @@
             }
         }
 
+        // MOVE-01 S3 (docs/ragdoll/designs/MOVE-01-movement-and-combat-controller.md):
+        // on a step no balance behaviour owns, the step planner aims each
+        // swing's landing from the whole body's momentum about the physical
+        // stance foot (ALIP), through Footfall's command; Footfall still times
+        // the steps. Offline (StrideSim) it walks and strafes without falls or
+        // crossings; whether it walks better is the game's to show.
+        // OPENMW_RAGDOLL_STRIDE_PLANNER = "on, reach u, minimum width u"
+        // (on 0 = off).
+        static const std::array<float, 3>& stridePlannerSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                std::array<float, 3> v{ 0.0f, 70.0f, 4.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_STRIDE_PLANNER", v);
+                return v;
+            });
+            return value_tuned.get();
+        }
+        // The step planner's aim (off in play: STRIDE_PLANNER 0).
+        RagdollCore::StrideAimInput strideAimInput(const RagdollCore::FootfallInput& input) const
+        {
+            RagdollCore::StrideAimInput in;
+            in.mSettings = stridePlannerSettings();
+            in.mEligible = input.mEligible && mFootfallLibrary && mRagdoll && mLeftLeg && mRightLeg;
+            in.mStepOwned = mStepArbiter.owner().has_value();
+            in.mYaw = input.mYaw;
+            in.mCommandVelocity = input.mCommandVelocity;
+            if (!(in.mSettings[0] > 0.0f) || !in.mEligible || in.mStepOwned || in.mCommandVelocity.Length() < 15.0f)
+                return in;
+            RagdollCore::RagdollMomentum momentum;
+            if (mRagdoll->captureMomentum(momentum))
+                in.mMomentum = momentum;
+            in.mFeet = mFootfallLibrary->feet();
+            in.mFootWorld[0] = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mLeftLeg->mFoot);
+            in.mFootWorld[1] = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightLeg->mFoot);
+            return in;
+        }
+        void applyStridePlanner(const RagdollCore::FootfallInput& input)
+        {
+            const std::optional<RagdollCore::FootfallCommand> k2
+                = RagdollCore::aimStrideLandings(strideAimInput(input));
+            if (k2)
+                commandFootfall(*k2);
+        }
+
+        // The legs lead.
+        static const RagdollCore::StrideLeadSettings& strideLeadSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<RagdollCore::StrideLeadSettings>([] {
+                RagdollCore::StrideLeadSettings s;
+                s.mLead = legsLeadSettings();
+                s.mGrip = legsLeadGripSettings();
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_STRIDE_GRIP");
+                s.mPlantedGrip = text && std::atoi(text) != 0;
+                s.mDodgeTime = dodgeSettings()[4];
+                return s;
+            });
+            return value_tuned.get();
+        }
+        RagdollCore::StrideLeadInput strideLeadInput(
+            const RagdollCore::FootfallInput& input, RagdollCore::RagdollTelemetry& telemetry) const
+        {
+            RagdollCore::StrideLeadInput in;
+            in.mEligible = input.mEligible;
+            in.mDodging = mDodgeTime > 0.0f && mDodgeLength > 0.0f;
+            const bool closed = !mControllerOutput || !mControllerInput || !mRagdoll
+                || mControllerOutput->mMode != RagdollCore::ActiveControllerMode::Standing || mJumpAirborne
+                || mSoftRootStrength < 0.98f || mStaggerPlan.active() || mHitStun.active() || !mLeftLeg || !mRightLeg
+                || !mSituationKnown || mSituation.mAirborne
+                // Not on uneven ground: the push is horizontal and
+                // friction-capped (11-01: the ship ramp).
+                || mSituation.mSlopeDegrees > 10.0f || mSlopeStance > 0.0f
+                || std::abs(mKinematicRootActualVerticalVelocity) > 25.0f
+                || (unevenSettings()[3] > 0.0f && groundUneven());
+            in.mGateOpen = !closed;
+            if (closed)
+                return in;
+            in.mDodgeDirection = mDodgeDirection;
+            in.mDodgeLength = mDodgeLength;
+            in.mRequest = mRawTargetHorizontalVelocity;
+            in.mBodyVelocity = mControllerInput->mCenterOfMassVelocity;
+            in.mCenterOfMass = { static_cast<float>(mSituationCom.GetX()), static_cast<float>(mSituationCom.GetY()) };
+            const std::array<std::size_t, 2> footBodies{ mLeftLeg->mFoot, mRightLeg->mFoot };
+            for (std::size_t side = 0; side < 2; ++side)
+            {
+                const bool supported = mSupportEstimate
+                    && (side == 0 ? mSupportEstimate->mLeftFootSupported : mSupportEstimate->mRightFootSupported);
+                if (supported && footfallPinnedAt(side))
+                    if (const auto foot = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, footBodies[side]))
+                        in.mPlantedFeet[side]
+                            = RagdollCore::BalanceVec2{ static_cast<float>(foot->GetX()), static_cast<float>(foot->GetY()) };
+            }
+            for (const auto& contact : mObservedGroundContacts)
+                for (std::size_t side = 0; side < 2; ++side)
+                    if (contact.mBodyIndex == footBodies[side] && contact.mNormalImpulse && input.mDt > 0.0f)
+                        in.mContacts.push_back(
+                            { side, *contact.mNormalImpulse * contact.mNormal.GetZ() / input.mDt, contact.mFriction });
+            const auto& s = legsLeadSettings();
+            if ((s[0] > 0.0f || in.mDodging) && input.mEligible)
+            {
+                in.mTelemetry = mRagdoll->captureTelemetry(telemetry);
+                in.mTotalMass = telemetry.mTotalMass;
+            }
+            return in;
+        }
+        // The push on the upper body by mass (it translates, not tips), the
+        // reaction on the planted feet.
+        void applyStrideLeadForce(const RagdollCore::StanceForceOutput& force,
+            const RagdollCore::RagdollTelemetry& telemetry,
+            const std::array<std::optional<RagdollCore::BalanceVec2>, 2>& planted)
+        {
+            std::vector<bool> leg(telemetry.mBodies.size(), false);
+            for (const auto* chain : { &*mLeftLeg, &*mRightLeg })
+                for (const std::size_t body : { chain->mHip, chain->mKnee, chain->mFoot })
+                    if (body < leg.size())
+                        leg[body] = true;
+            float upperMass = 0.0f;
+            for (std::size_t i = 0; i < telemetry.mBodies.size(); ++i)
+                if (!leg[i] && !isDetachedWeaponBody(i))
+                    upperMass += telemetry.mBodies[i].mMass;
+            if (!(upperMass > 0.0f))
+                return;
+            for (std::size_t i = 0; i < telemetry.mBodies.size(); ++i)
+                if (!leg[i] && !isDetachedWeaponBody(i))
+                {
+                    const float share = telemetry.mBodies[i].mMass / upperMass;
+                    mRagdoll->applyExternalBodyWrench(
+                        i, JPH::Vec3(force.mBodyForce.mX * share, force.mBodyForce.mY * share, 0.0f), JPH::Vec3::sZero());
+                }
+            const std::array<std::size_t, 2> footBodies{ mLeftLeg->mFoot, mRightLeg->mFoot };
+            for (std::size_t side = 0; side < 2; ++side)
+                if (planted[side])
+                    mRagdoll->applyExternalBodyWrench(footBodies[side],
+                        JPH::Vec3(force.mFootForce[side].mX, force.mFootForce[side].mY, 0.0f), JPH::Vec3::sZero());
+        }
+        void applyLegsLead(const RagdollCore::FootfallInput& input)
+        {
+            RagdollCore::RagdollTelemetry telemetry;
+            const RagdollCore::StrideLeadInput in = strideLeadInput(input, telemetry);
+            RagdollCore::StrideLeadState state{ mLegsLeading, mLegsCruising, mLegsLeadSteps };
+            const RagdollCore::StrideLeadResult r = RagdollCore::stepStrideLead(in, strideLeadSettings(), state);
+            mLegsLeading = state.mLeading;
+            mLegsCruising = state.mCruising;
+            mLegsLeadSteps = state.mSteps;
+            if (r.mChanged)
+                Log(Debug::Info) << "RAGDOLL_LEGS_LEAD actor=" << getPtr().getCellRef().getRefId()
+                                 << " on=" << (r.mLeading ? 1 : 0);
+            if (r.mForce)
+                applyStrideLeadForce(*r.mForce, telemetry, in.mPlantedFeet);
+        }
+
+        // The legs' health.
+        static const std::array<float, 2>& legsHealthSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> v{ 1.5f, 4.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_LEGS_HEALTH", v);
+                return v;
+            });
+            return value_tuned.get();
+        }
+        void checkLegsHealth(float dt)
+        {
+            RagdollCore::StrideHealthInput in;
+            in.mDt = dt;
+            in.mRequestSpeed = pgcRequestSpeed();
+            if (mControllerInput)
+            {
+                const auto& v = mControllerInput->mCenterOfMassVelocity;
+                in.mBodySpeed = std::hypot(v.GetX(), v.GetY());
+            }
+            in.mDisturbed = mHitStun.active() || mScopedEpisode;
+            in.mSwingStarted = mFootfallLibraryOutput.mSwingStarted;
+            RagdollCore::StrideHealthState state{ mLegsFailing, mLegsStillTime, mLegsStillSteps };
+            const bool failing = RagdollCore::stepStrideHealth(in, legsHealthSettings(), state);
+            mLegsFailing = state.mFailing;
+            mLegsStillTime = state.mStillTime;
+            mLegsStillSteps = state.mStillSteps;
+            if (failing)
+                Log(Debug::Info) << "RAGDOLL_LEGS_HEALTH failing actor=" << getPtr().getCellRef().getRefId()
+                                 << " still=" << mLegsStillTime << " steps=" << mLegsStillSteps;
+        }
+
+        // K2_UNEVEN (registry): slope, stairs or rough ground under the body,
+        // held for a moment after (a staircase reads level between risers).
+        static const std::array<float, 6>& unevenSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 6>>([] {
+                std::array<float, 6> v{ 0.0f, 0.5f, 1.0f, 1.0f, 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_UNEVEN", v);
+                return v;
+            });
+            return value_tuned.get();
+        }
+        std::uint64_t mUnevenUntilStep = 0;
+        float mGroundReach = 70.0f; // the ground ray's length this step (K2_GROUND_FOLLOW)
+        float mPelvisSag = 0.0f; // the physical pelvis under the clip's, u (footfallLibraryInput)
+        void updateUneven()
+        {
+            const auto& u = unevenSettings();
+            if (!(u[0] > 0.0f))
+                return;
+            const bool now = (mSituationKnown && !mSituation.mAirborne && mSituation.mSlopeDegrees > u[0])
+                || mSlopeStance > 0.0f || std::abs(mKinematicRootActualVerticalVelocity) > 25.0f;
+            if (now)
+                mUnevenUntilStep = mFixedSteps + static_cast<std::uint64_t>(std::max(0.0f, u[1]) * 60.0f) + 1;
+        }
+        bool groundUneven() const
+        {
+            return unevenSettings()[0] > 0.0f && mFixedSteps < mUnevenUntilStep;
+        }
+        // K2_CALM (registry, ragdollcore calmhold): a calm NPC's body held to
+        // the animation, let go when bothered.
+        RagdollCore::CalmHoldState mCalmState;
+        RagdollCore::CalmHold mCalm;
+        float mPelvisOff = 0.0f; // the physical pelvis off the clip's, horizontal u (footfallLibraryInput)
+        float mPelvisOffX = 0.0f, mPelvisOffY = 0.0f;
+        const char* mCalmWhy = "";
+        // What bothers this body now (nullptr = nothing).
+        const char* calmBother(bool recoveryOwns) const
+        {
+            using Mode = RagdollCore::ActiveControllerMode;
+            const MWWorld::Ptr ptr = getPtr();
+            const auto& stats = ptr.getClass().getCreatureStats(ptr);
+            if (stats.isDead() || mDying)
+                return "dying";
+            if (stats.getAiSequence().isInCombat())
+                return "combat";
+            if (stats.getDrawState() != MWMechanics::DrawState::Nothing)
+                return "armed";
+            if (mHitStun.active() || mScopedEpisode || mSoftRootStrength < 0.98f)
+                return "hit";
+            if (mStaggerPlan.active() || bearingsStumble() > 0.0f || mCatchRecovering)
+                return "stagger";
+            if (recoveryOwns)
+                return "getting up";
+            if (!mRagdoll || !mRagdoll->isRootKinematic() || mSoftRootToppled || !mControllerOutput
+                || (mControllerOutput->mMode != Mode::Standing && mControllerOutput->mMode != Mode::Bracing))
+                return "falling";
+            if (mJumpAirborne || mSoftRootJumpWindow > 0.0f || rollOwnsLegs() || mDodgeTime > 0.0f)
+                return "air";
+            MWBase::World* world = MWBase::Environment::get().getWorld();
+            if (world->isSwimming(ptr) || world->isFlying(ptr))
+                return "swimming";
+            return nullptr;
+        }
+        void updateCalm(bool recoveryOwns, float dt)
+        {
+            static const auto settings_tuned = RagdollCore::tuned([] { return RagdollCore::calmHoldSettings(); });
+            const RagdollCore::CalmHoldSettings& settings = settings_tuned.get();
+            RagdollCore::CalmHoldInput in;
+            in.mAllowed = mPowered && getPtr() != MWMechanics::getPlayer();
+            if (!in.mAllowed || !(settings.mStrength > 0.0f))
+            {
+                mCalm = RagdollCore::updateCalmHold(in, settings, mCalmState, dt);
+                return;
+            }
+            const char* why = calmBother(recoveryOwns);
+            in.mBothered = why != nullptr;
+            in.mUpright = !mControllerInput || mControllerInput->mTorsoUpDot > 0.9f;
+            // A walking body trails its capsule (which starts and turns at
+            // once) by about a tenth of a second: not a bump.
+            in.mOffTarget = std::max(0.0f, mPelvisOff
+                - 0.1f * std::hypot(mKinematicRootActualVelocity.GetX(), mKinematicRootActualVelocity.GetY()));
+            const float before = mCalmState.mStarted ? mCalmState.mLevel : -1.0f;
+            mCalm = RagdollCore::updateCalmHold(in, settings, mCalmState, dt);
+            if (mCalm.mBumped)
+                why = "bump";
+            const bool letGo = before >= 1.0f && mCalm.mLevel < 1.0f;
+            const bool taken = before < 1.0f && mCalm.mLevel >= 1.0f;
+            if (letGo || taken)
+                Log(Debug::Info) << "RAGDOLL_CALM actor=" << getPtr().getCellRef().getRefId() << " held=" << taken
+                                 << " why=" << (taken ? (before < 0.0f ? "start" : "quiet") : (why ? why : "?"))
+                                 << " off=" << mPelvisOff << " sag=" << mPelvisSag;
+            if (footfallTraced() && (mFixedSteps % 12) == 0)
+            {
+                const osg::Vec3f at = getPtr().getRefData().getPosition().asVec3();
+                Log(Debug::Info) << "RAGDOLL_CALM_STATE actor=" << getPtr().getCellRef().getRefId()
+                                 << " level=" << mCalm.mLevel << " clip=" << mCalm.mLegsOnClip << " off=" << mPelvisOff
+                                 << " sag=" << mPelvisSag << " why=" << (why ? why : "-") << " offxy=" << mPelvisOffX
+                                 << ',' << mPelvisOffY << " at=" << at.x() << ',' << at.y() << ',' << at.z()
+                                 << " root=" << mRollLastStrength << " slope="
+                                 << (mSituationKnown ? mSituation.mSlopeDegrees : -1.0f)
+                                 << " feet=" << (mSupportEstimate && mSupportEstimate->mLeftFootSupported)
+                                 << (mSupportEstimate && mSupportEstimate->mRightFootSupported);
+            }
+        }
         void applyFootfall(RagdollCore::RagdollPose& drivePose, const RagdollCore::RagdollPose& clipPose, float dt)
         {
             claimBody(ChannelLegs, BodyOwner::Footfall);
+            updateUneven();
             if (!mFootfallLibrary)
                 mFootfallLibrary.emplace(footfallLibrarySettings());
             RagdollCore::FootfallInput input;
             footfallLibraryInput(input, clipPose, dt);
-            updateCatchSteps(input);
+            // K2_CALM: a held NPC's legs are the animation's - no steps, no
+            // balance catches, no legs' health count.
+            const bool held = mCalm.mLegsOnClip;
+            if (!held)
+            {
+                updateCatchSteps(input);
+                applyStridePlanner(input);
+            }
             mFootfallLibraryOutput = {};
             mFootfallLibrary->setFullSettle(mTip.mActive);
             mFootfallLibrary->setStanceHolds(stanceHoldsWanted());
             mFootfallLibrary->step(input, drivePose, mFootfallLibraryOutput);
             applyFootfallLibrarySprings();
-            applyScopedAnkles();
-            applyPgcSwingSpring();
+            if (!held)
+            {
+                applyScopedAnkles();
+                applyPgcSwingSpring();
+            }
             applyLegsLead(input);
+            if (held)
+            {
+                mLegsStillTime = 0.0f;
+                mLegsStillSteps = 0;
+                return;
+            }
             checkLegsHealth(dt);
+            // K2_ARM_STEP (ragdollcore roottarget): the clip's stride on the legs'.
+            static const auto armStep_tuned = RagdollCore::tuned([] { return RagdollCore::armStepSettings(); });
+            if (armStep_tuned.get().mOn && mLeftLeg && mRightLeg)
+            {
+                const auto left = mRagdoll->getWorldBodyPosition(clipPose, mLeftLeg->mFoot);
+                const auto right = mRagdoll->getWorldBodyPosition(clipPose, mRightLeg->mFoot);
+                const float leftAhead = left && right ? JPH::Vec3(*left - *right).Dot(reactionForward()) : 0.0f;
+                const float loop = RagdollCore::stepArmStep(mArmStep, leftAhead, mFootfallLibraryOutput.mGaitCycle,
+                    mFootfallLibraryOutput.mGaitClock, mFootfallLibraryOutput.mGaitDuty, armStep_tuned.get().mGain, dt);
+                if (auto* animation = MWBase::Environment::get().getWorld()->getAnimation(getPtr()))
+                    animation->setLocomotionLoop(loop);
+                if (footfallTraced() && mArmStep.mEvents != mArmStepTraced)
+                {
+                    mArmStepTraced = mArmStep.mEvents;
+                    Log(Debug::Info) << "RAGDOLL_ARM_STEP actor=" << getPtr().getCellRef().getRefId()
+                                     << " error=" << mArmStep.mError << " factor=" << mArmStep.mFactor
+                                     << " loop=" << loop << " cycle=" << mFootfallLibraryOutput.mGaitCycle;
+                }
+            }
         }
 
         // Legs that cannot settle (user 11-01: "go back to default if cant
@@ -4760,41 +4845,6 @@
         bool mLegsFailing = false;
         float mLegsStillTime = 0.0f;
         unsigned mLegsStillSteps = 0;
-        void checkLegsHealth(float dt)
-        {
-            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                std::array<float, 2> v{ 1.5f, 4.0f };
-                RagdollCore::tuningList("OPENMW_RAGDOLL_LEGS_HEALTH", v);
-                return v;
-            });
-            const auto& settings = value_tuned.get();
-            if (settings[0] <= 0.0f || mLegsFailing)
-                return;
-            float bodySpeed = 0.0f;
-            if (mControllerInput)
-            {
-                const auto& v = mControllerInput->mCenterOfMassVelocity;
-                bodySpeed = std::hypot(v.GetX(), v.GetY());
-            }
-            if (pgcRequestSpeed() > 10.0f || bodySpeed > 10.0f || mHitStun.active() || mScopedEpisode)
-            {
-                mLegsStillTime = 0.0f;
-                mLegsStillSteps = 0;
-                return;
-            }
-            mLegsStillTime += dt;
-            if (mLegsStillTime < settings[0])
-                return;
-            for (const bool started : mFootfallLibraryOutput.mSwingStarted)
-                mLegsStillSteps += started ? 1 : 0;
-            if (mLegsStillSteps >= static_cast<unsigned>(std::max(1.0f, settings[1])))
-            {
-                mLegsFailing = true;
-                Log(Debug::Info) << "RAGDOLL_LEGS_HEALTH failing actor=" << getPtr().getCellRef().getRefId()
-                                 << " still=" << mLegsStillTime << " steps=" << mLegsStillSteps;
-            }
-        }
-
         // The legs set the speed (STEPPING audit 11-01, item 16; a
         // body-led model): walking on the ground, calm and held, the capsule follows the
         // body (as BODY_LEADS does in the air), the root's horizontal pull drops
@@ -4816,85 +4866,31 @@
         }
         bool mLegsLeading = false;
         unsigned mLegsLeadSteps = 0;
-        void applyLegsLead(const RagdollCore::FootfallInput& input)
+        // MOVE-01 W4 (offline on the matched StrideSim, then the game): the
+        // stance force split by each planted foot's measured load and capped
+        // inside its grip (`margin` x friction x load), the capsule leading
+        // while the body is off the asked velocity by more than `cruise` of it
+        // (starts, stops, reversals stay immediate; the legs take over within
+        // it and give back past twice it), and only up to `speed` u/s (the runs
+        // fell). OPENMW_RAGDOLL_LEGS_LEAD_GRIP = "margin, cruise, speed"
+        // (0 = LEGS_LEAD as before). In play since 11-03 with LEGS_LEAD
+        // "1,0,0.45,10" (0.6, 0.25, 150): the fists course x2, the root's
+        // sideways pull walking 0.40-0.42 -> 0.14-0.16 body weights, slip
+        // 9.2-9.6 against 8.6-10.4 u/s, landing 1.6 u; the claymore run course
+        // walking 0.35 -> 0.15-0.21, running slip 6-9 against 5-6; the ship
+        // ramp, the armed running circle, the nine turn / stop / stairs
+        // cases and the NPC duels (A02 x2, L01, X01) as before.
+        static const std::array<float, 3>& legsLeadGripSettings()
         {
-            const auto& s = legsLeadSettings();
-            const bool was = mLegsLeading;
-            mLegsLeading = false;
-            // A dodge's burst rides on the same push (OPENMW_RAGDOLL_DODGE).
-            const bool dodging = mDodgeTime > 0.0f && mDodgeLength > 0.0f;
-            if (!(s[0] > 0.0f || dodging) || !input.mEligible || !mControllerOutput || !mControllerInput || !mRagdoll
-                || mControllerOutput->mMode != RagdollCore::ActiveControllerMode::Standing || mJumpAirborne
-                || mSoftRootStrength < 0.98f || mStaggerPlan.active() || mHitStun.active() || !mLeftLeg || !mRightLeg
-                || !mSituationKnown || mSituation.mAirborne
-                // Not on uneven ground: the push is horizontal and friction-capped,
-                // so slopes, stairs and climbs keep the capsule leading and the
-                // climb hold (11-01: with it on, the player could not walk up
-                // the ship ramp).
-                || mSituation.mSlopeDegrees > 10.0f || mSlopeStance > 0.0f || mStairDrop > 0.0f
-                || std::abs(mKinematicRootActualVerticalVelocity) > 25.0f)
-            {
-                if (was)
-                    Log(Debug::Info) << "RAGDOLL_LEGS_LEAD actor=" << getPtr().getCellRef().getRefId() << " on=0";
-                return;
-            }
-            const JPH::Vec3 request = dodging
-                ? mDodgeDirection * (mDodgeLength / std::max(0.05f, dodgeSettings()[4]))
-                : JPH::Vec3(mRawTargetHorizontalVelocity.GetX(), mRawTargetHorizontalVelocity.GetY(), 0.0f);
-            RagdollCore::RagdollTelemetry telemetry;
-            if (request.Length() < 15.0f || !mRagdoll->captureTelemetry(telemetry))
-                return;
-            RagdollCore::StanceForceInput stance;
-            stance.mCenterOfMass = { static_cast<float>(mSituationCom.GetX()), static_cast<float>(mSituationCom.GetY()) };
-            stance.mVelocity
-                = { mControllerInput->mCenterOfMassVelocity.GetX(), mControllerInput->mCenterOfMassVelocity.GetY() };
-            stance.mRequestVelocity = { request.GetX(), request.GetY() };
-            const std::array<std::size_t, 2> footBodies{ mLeftLeg->mFoot, mRightLeg->mFoot };
-            for (std::size_t side = 0; side < 2; ++side)
-            {
-                const bool supported = mSupportEstimate
-                    && (side == 0 ? mSupportEstimate->mLeftFootSupported : mSupportEstimate->mRightFootSupported);
-                if (supported && footfallPinnedAt(side))
-                    if (const auto foot = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, footBodies[side]))
-                        stance.mPlantedFeet[side]
-                            = RagdollCore::BalanceVec2{ static_cast<float>(foot->GetX()), static_cast<float>(foot->GetY()) };
-            }
-            stance.mTotalMass = telemetry.mTotalMass;
-            stance.mGravity = RagdollCore::UnitModel::GravityUnitsPerSecondSquared;
-            stance.mSettings.mFrictionShare = std::max(0.0f, dodging ? std::max(s[2], 0.6f) : s[2]);
-            stance.mSettings.mDamping = std::max(0.0f, s[3]);
-            // Between two planted steps the body coasts: the capsule still follows it.
-            mLegsLeading = true;
-            if (!was)
-                Log(Debug::Info) << "RAGDOLL_LEGS_LEAD actor=" << getPtr().getCellRef().getRefId() << " on=1";
-            const auto force = RagdollCore::computeStanceForce(stance);
-            if (!force || !force->mActive)
-                return;
-            ++mLegsLeadSteps;
-            std::vector<bool> leg(telemetry.mBodies.size(), false);
-            for (const auto* chain : { &*mLeftLeg, &*mRightLeg })
-                for (const std::size_t body : { chain->mHip, chain->mKnee, chain->mFoot })
-                    if (body < leg.size())
-                        leg[body] = true;
-            float upperMass = 0.0f;
-            for (std::size_t i = 0; i < telemetry.mBodies.size(); ++i)
-                if (!leg[i] && !isDetachedWeaponBody(i))
-                    upperMass += telemetry.mBodies[i].mMass;
-            if (!(upperMass > 0.0f))
-                return;
-            for (std::size_t i = 0; i < telemetry.mBodies.size(); ++i)
-                if (!leg[i] && !isDetachedWeaponBody(i))
-                {
-                    const float share = telemetry.mBodies[i].mMass / upperMass;
-                    mRagdoll->applyExternalBodyWrench(
-                        i, JPH::Vec3(force->mBodyForce.mX * share, force->mBodyForce.mY * share, 0.0f), JPH::Vec3::sZero());
-                }
-            for (std::size_t side = 0; side < 2; ++side)
-                if (stance.mPlantedFeet[side])
-                    mRagdoll->applyExternalBodyWrench(footBodies[side],
-                        JPH::Vec3(force->mFootForce[side].mX, force->mFootForce[side].mY, 0.0f), JPH::Vec3::sZero());
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                std::array<float, 3> v{ 0.0f, 0.25f, 150.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_LEGS_LEAD_GRIP", v);
+                return v;
+            });
+            return value_tuned.get();
         }
-
+        bool mLegsCruising = false;
+        float mRootWalkSupport = 1.0f; // ROOT_WALK_SUPPORT, eased
         // Bracing with the root released (user bookmark 5: "this falling
         // floating state ... should be the Physical Gait Controller trying to
         // stand itself up ... if not found, it should fall immediately"; PGC
@@ -4959,127 +4955,97 @@
                 }
                 return;
             }
+            RagdollCore::countPath(
+                RagdollCore::CountedPath::BracingPgc, getPtr() == MWMechanics::getPlayer());
             // The legs do not walk while bracing (offline: walking the capsule
             // away from an unsupported body felled it in 0.68 s).
             input.mCommandVelocity = JPH::Vec3::sZero();
-            RagdollCore::RagdollTelemetry telemetry;
+            applyBracingStride(input, drivePose, dt);
+        }
+
+        // The braced legs (stepStrideBrace, strideBraceStance).
+        static const RagdollCore::StrideBraceSettings& strideBraceSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<RagdollCore::StrideBraceSettings>([] {
+                RagdollCore::StrideBraceSettings s;
+                s.mNoAnchor = weaponDriveSetting("OPENMW_RAGDOLL_PGC_BRACE_NO_ANCHOR", 1.0f) > 0.0f;
+                s.mReleaseAfterSteps = pgcReleaseAfterSteps();
+                s.mStumbleSpeed = stumbleSettings().mSpeed;
+                return s;
+            });
+            return value_tuned.get();
+        }
+        // The braced body as the module reads it; false when the rig cannot
+        // be read (the old code returns there too).
+        bool strideBraceInput(const RagdollCore::FootfallInput& input, float dt,
+            RagdollCore::RagdollTelemetry& telemetry, RagdollCore::StrideBraceInput& in) const
+        {
             if (!mRagdoll->captureTelemetry(telemetry) || *mTorsoBodyIndex >= telemetry.mBodies.size())
-                return;
-            const JPH::Vec3 torsoUp = (telemetry.mBodies[*mTorsoBodyIndex].mRotation * mTorsoLocalUp).Normalized();
-            const RagdollCore::BalanceVec2 lean
-                = mBracingPosture.update(RagdollCore::uprightTilt(torsoUp.GetX(), torsoUp.GetY(), torsoUp.GetZ()), dt);
-            RagdollCore::FootfallCommand command;
-            command.mStanceHoldsPelvis = true;
-            // The root is let go while bracing: stepping toward the anchor
-            // walked the feet out from under the body (PGC viewer: 52-65 u
-            // backsteps). OPENMW_RAGDOLL_PGC_BRACE_NO_ANCHOR=1.
-            static const auto braceNoAnchor_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_PGC_BRACE_NO_ANCHOR", 1.0f) > 0.0f; });
-            static const auto& braceNoAnchor = braceNoAnchor_tuned.get();
-            command.mNoAnchorSettle = braceNoAnchor;
-            command.mPelvisLean = JPH::Vec3(lean.mX, lean.mY, 0.0f);
-            // Catch steps, stat scaled; release when nothing can catch it.
-            const auto& footState = mFootfallLibrary->feet();
-            std::array<bool, 2> supported{ mSupportEstimate && mSupportEstimate->mLeftFootSupported,
+                return false;
+            in.mFootfall = &input;
+            in.mFeet = mFootfallLibrary->feet();
+            in.mDt = dt;
+            in.mTorsoUp = (telemetry.mBodies[*mTorsoBodyIndex].mRotation * mTorsoLocalUp).Normalized();
+            in.mSupported = { mSupportEstimate && mSupportEstimate->mLeftFootSupported,
                 mSupportEstimate && mSupportEstimate->mRightFootSupported };
-            std::array<RagdollCore::BalanceVec2, 2> feet;
-            float legReach = 0.0f;
             for (std::size_t side = 0; side < 2; ++side)
             {
                 const auto& leg = side == 0 ? *mLeftLeg : *mRightLeg;
                 if (leg.mFoot >= telemetry.mBodies.size())
-                    return;
+                    return false;
                 const JPH::RVec3 foot = telemetry.mBodies[leg.mFoot].mCenterOfMass;
-                feet[side] = { static_cast<float>(foot.GetX()), static_cast<float>(foot.GetY()) };
-                if (const auto& geometry = input.mLegs[side] ? input.mLegs[side]->mGeometry : std::nullopt)
-                    legReach = std::max(legReach, (geometry->mUpperOffset.Length() + geometry->mLowerOffset.Length())
-                            / std::max(input.mFrame.mInverseUniformScale, 1e-3f));
+                in.mFeetCom[side] = { static_cast<float>(foot.GetX()), static_cast<float>(foot.GetY()) };
             }
-            if (!(legReach > 0.0f))
-                legReach = 70.0f;
-            const JPH::RVec3 com = telemetry.mCenterOfMass;
-            const auto ground = input.mGround(com, input.mActorZ);
-            const double floorZ = ground ? *ground : input.mActorZ;
-            RagdollCore::CatchStepInput catchInput;
-            catchInput.mState.mCenterOfMass = { static_cast<float>(com.GetX()), static_cast<float>(com.GetY()) };
-            const JPH::Vec3 comVelocity = mControllerInput ? mControllerInput->mCenterOfMassVelocity : JPH::Vec3::sZero();
-            catchInput.mState.mVelocity = { comVelocity.GetX(), comVelocity.GetY() };
-            catchInput.mState.mHeight = static_cast<float>(com.GetZ() - floorZ);
-            catchInput.mState.mGravity = RagdollCore::UnitModel::GravityUnitsPerSecondSquared;
-            catchInput.mBodyForward = { std::sin(input.mYaw), std::cos(input.mYaw) };
-            for (std::size_t side = 0; side < 2; ++side)
+            in.mCenterOfMass = telemetry.mCenterOfMass;
+            in.mBodyVelocity = mControllerInput ? mControllerInput->mCenterOfMassVelocity : JPH::Vec3::sZero();
+            in.mRawRequest = mRawTargetHorizontalVelocity;
+            in.mCapability = pgcCapability();
+            in.mArmDriven = mTip.mActive;
+            return true;
+        }
+        RagdollCore::StrideBraceState strideBraceState() const
+        {
+            RagdollCore::StrideBraceState s;
+            s.mPosture = mBracingPosture;
+            s.mCatch = mBracingCatch;
+            s.mReleases = mBracingReleases;
+            s.mStumbleLeft = mStumbleLeft;
+            s.mStumbleSteps = mStumbleSteps;
+            return s;
+        }
+        void applyBracingStride(RagdollCore::FootfallInput& input, RagdollCore::RagdollPose& drivePose, float dt)
+        {
+            RagdollCore::RagdollTelemetry telemetry;
+            RagdollCore::StrideBraceInput in;
+            if (!strideBraceInput(input, dt, telemetry, in))
+                return;
+            RagdollCore::StrideBraceState state = strideBraceState();
+            const RagdollCore::StrideBraceResult result = RagdollCore::stepStrideBrace(in, strideBraceSettings(), state);
+            mBracingPosture = state.mPosture;
+            mBracingCatch = state.mCatch;
+            mBracingReleases = state.mReleases;
+            mStumbleLeft = state.mStumbleLeft;
+            mStumbleSteps = state.mStumbleSteps;
+            const auto& t = result.mTrace;
+            pgcTrace(t.mBranch, dt, t.mState, t.mFeet, t.mSupported, t.mStage, t.mSteps, t.mSwingNow, t.mRelease);
+            if (result.mFall)
             {
-                auto& foot = catchInput.mFeet[side];
-                foot.mPosition = feet[side];
-                foot.mSupported = supported[side];
-                foot.mSwinging = footState[side].mSwinging;
-                foot.mTargetHeld = footState[side].mTargetHeld;
-                foot.mPhase = footState[side].mPhase;
-                foot.mDuration = footState[side].mDuration;
+                decideFall(result.mFall->mCause, result.mFall->mDirection);
+                Log(Debug::Info) << "RAGDOLL_PGC_BRACE release actor=" << getPtr().getCellRef().getRefId();
+                return;
             }
-            const RagdollCore::CatchCapability capability = pgcCapability();
-            catchInput.mDt = dt;
-            catchInput.mLimits = RagdollCore::catchStepLimits(capability, legReach);
-            catchInput.mReactionDelay = capability.mReactionDelay;
-            catchInput.mStepFreeFoot = true;
-            catchInput.mReleaseWhenUncatchable = true;
-            catchInput.mReleaseAfterSteps = pgcReleaseAfterSteps();
-            catchInput.mArmDriven = mTip.mActive;
-            catchInput.mMaximumHoverTime = 0.5f;
-            const JPH::Vec3 request(mRawTargetHorizontalVelocity.GetX(), mRawTargetHorizontalVelocity.GetY(), 0.0f);
-            if (request.Length() > 1.0f)
-                catchInput.mDirectionBias = { request.GetX() / request.Length(), request.GetY() / request.Length() };
-            applyStumble(catchInput);
-            const auto braceResult = mBracingCatch.update(catchInput);
-            countStumble(braceResult);
-            pgcTrace("brace", dt, catchInput.mState, feet, supported, braceResult ? static_cast<int>(braceResult->mStage) : -1,
-                static_cast<int>(mBracingCatch.stepsStarted()), braceResult && braceResult->mSwingNow,
-                braceResult && braceResult->mRelease);
-            if (const auto& result = braceResult)
-            {
-                if (result->mRelease)
-                {
-                    // Nothing can catch it: fall now, as a topple does.
-                    decideFall("brace", result->mFallDirection);
-                    ++mBracingReleases;
-                    Log(Debug::Info) << "RAGDOLL_PGC_BRACE release actor=" << getPtr().getCellRef().getRefId();
-                    mBracingCatch.reset();
-                    mBracingPosture.reset();
-                    return;
-                }
-                if (result->mHoldClock)
-                {
-                    command.mHoldClock = true;
-                    command.mSwingNow = result->mSwingNow;
-                    command.mSwingTime = result->mSwingTime;
-                    for (std::size_t side = 0; side < 2; ++side)
-                        if (result->mLanding[side])
-                        {
-                            const JPH::RVec3 point(result->mLanding[side]->mX, result->mLanding[side]->mY, floorZ);
-                            const auto landingGround = input.mGround(point, input.mActorZ);
-                            command.mLanding[side]
-                                = JPH::RVec3(point.GetX(), point.GetY(), landingGround ? *landingGround : floorZ);
-                        }
-                }
-            }
-            mFootfallLibrary->command(command);
+            mFootfallLibrary->command(*result.mCommand);
             mFootfallLibraryOutput = {};
             mFootfallLibrary->setFullSettle(mTip.mActive);
             mFootfallLibrary->step(input, drivePose, mFootfallLibraryOutput);
             applyFootfallLibrarySprings();
             applyScopedAnkles();
-            // The stance force: the upper body toward the middle of the
-            // planted feet, braked, capped inside the friction cone, with the
-            // opposite force on the planted feet (an internal pair).
-            RagdollCore::StanceForceInput stance;
-            stance.mCenterOfMass = catchInput.mState.mCenterOfMass;
-            stance.mVelocity = catchInput.mState.mVelocity;
-            for (std::size_t side = 0; side < 2; ++side)
-                if (supported[side] && !footState[side].mSwinging)
-                    stance.mPlantedFeet[side] = feet[side];
-            stance.mTotalMass = telemetry.mTotalMass;
-            stance.mGravity = RagdollCore::UnitModel::GravityUnitsPerSecondSquared;
-            if (const auto force = RagdollCore::computeStanceForce(stance); force && force->mActive)
+            const auto& feetAfter = mFootfallLibrary->feet();
+            if (const auto force = RagdollCore::strideBraceStance(
+                    result.mBody, in.mFeetCom, in.mSupported, feetAfter, telemetry.mTotalMass))
             {
+                // On the upper body by mass (it translates, not tips), the
+                // reaction on the planted feet.
                 std::vector<bool> leg(telemetry.mBodies.size(), false);
                 for (const auto* chain : { &*mLeftLeg, &*mRightLeg })
                     for (const std::size_t body : { chain->mHip, chain->mKnee, chain->mFoot })
@@ -5099,13 +5065,12 @@
                                 JPH::Vec3::sZero());
                         }
                 for (std::size_t side = 0; side < 2; ++side)
-                    if (stance.mPlantedFeet[side])
+                    if (in.mSupported[side] && !feetAfter[side].mSwinging)
                         mRagdoll->applyExternalBodyWrench(side == 0 ? mLeftLeg->mFoot : mRightLeg->mFoot,
                             JPH::Vec3(force->mFootForce[side].mX, force->mFootForce[side].mY, 0.0f), JPH::Vec3::sZero());
             }
             applyPgcSwingSpring(true);
         }
-
         // PGC knob D: a spring pulls each swinging foot along its swing (the
         // opposite force on the pelvis, so the pair is internal).
         void applyPgcSwingSpring(bool force = false)
@@ -5116,63 +5081,46 @@
             if (!mRagdoll->captureTelemetry(telemetry))
                 return;
             const auto& masses = mRagdoll->getBodyMasses();
-            const RagdollCore::CatchCapability capability = pgcCapability();
+            RagdollCore::StrideSpringInput in;
+            in.mFrequency = pgcCapability().mSwingSpringFrequency;
+            in.mScoped = mScopedEpisode;
+            in.mScopedDt = mScopedDt;
+            if (*mPelvisBodyIndex < masses.size())
+                in.mPelvisMass = masses[*mPelvisBodyIndex];
             const auto& feet = mFootfallLibrary->feet();
             for (std::size_t side = 0; side < 2; ++side)
             {
-                if (!feet[side].mSwinging)
-                    continue;
+                auto& f = in.mFeet[side];
+                f.mSwinging = feet[side].mSwinging;
                 const auto& leg = side == 0 ? *mLeftLeg : *mRightLeg;
-                if (leg.mFoot >= telemetry.mBodies.size() || leg.mFoot >= masses.size() || leg.mKnee >= masses.size()
-                    || leg.mHip >= masses.size())
+                f.mValid = leg.mFoot < telemetry.mBodies.size() && leg.mFoot < masses.size() && leg.mKnee < masses.size()
+                    && leg.mHip < masses.size();
+                if (!f.mValid)
                     continue;
                 const auto& foot = telemetry.mBodies[leg.mFoot];
-                RagdollCore::SwingSpringInput spring;
-                spring.mFoot = { static_cast<float>(foot.mCenterOfMass.GetX()), static_cast<float>(foot.mCenterOfMass.GetY()) };
-                spring.mFootVelocity = { foot.mMotion.mLinearVelocity.GetX(), foot.mMotion.mLinearVelocity.GetY() };
-                spring.mLiftOff = { static_cast<float>(feet[side].mPin.GetX()), static_cast<float>(feet[side].mPin.GetY()) };
-                spring.mLanding = { static_cast<float>(feet[side].mTarget.GetX()), static_cast<float>(feet[side].mTarget.GetY()) };
-                spring.mPhase = feet[side].mPhase;
-                spring.mDuration = feet[side].mDuration;
-                spring.mLegMass = masses[leg.mHip] + masses[leg.mKnee] + masses[leg.mFoot];
-                spring.mGravity = RagdollCore::UnitModel::GravityUnitsPerSecondSquared;
-                spring.mSettings = { capability.mSwingSpringFrequency, 1.0f, 3.0f };
-                // Scoped recovery: the spring follows the leg motors' foot goal
-                // (velocity filtered 0.03 s, at most 400 u/s, zero as a swing
-                // starts) and is implicit over the step.
-                const auto& goal = mFootfallLibraryOutput.mMotorFootGoal[side];
-                if (mScopedEpisode && goal && mScopedDt > 0.0f && *mPelvisBodyIndex < masses.size())
-                {
-                    JPH::Vec3& velocity = mScopedGoalVelocity[side];
-                    if (mFootfallLibraryOutput.mSwingStarted[side])
-                        velocity = JPH::Vec3::sZero();
-                    else
-                    {
-                        JPH::Vec3 raw = mFootfallLibraryOutput.mMotorFootVelocity[side];
-                        raw.SetZ(0.0f);
-                        velocity += (raw - velocity) * (1.0f - std::exp(-mScopedDt / 0.03f));
-                        if (velocity.Length() > 400.0f)
-                            velocity = velocity.Normalized() * 400.0f;
-                    }
-                    spring.mGoal = RagdollCore::BalanceVec2{ static_cast<float>(goal->GetX()),
-                        static_cast<float>(goal->GetY()) };
-                    spring.mGoalVelocity = RagdollCore::BalanceVec2{ velocity.GetX(), velocity.GetY() };
-                    const float footMass = masses[leg.mFoot], pelvisMass = masses[*mPelvisBodyIndex];
-                    spring.mImplicitDt = mScopedDt;
-                    spring.mEffectiveMass = footMass * pelvisMass / std::max(1e-3f, footMass + pelvisMass);
-                }
-                else
-                    mScopedGoalVelocity[side] = JPH::Vec3::sZero();
-                const auto out = RagdollCore::computeSwingSpring(spring);
-                if (!out)
-                    continue;
-                mRagdoll->applyExternalBodyWrench(
-                    leg.mFoot, JPH::Vec3(out->mFootForce.mX, out->mFootForce.mY, 0.0f), JPH::Vec3::sZero());
-                mRagdoll->applyExternalBodyWrench(*mPelvisBodyIndex,
-                    JPH::Vec3(out->mPelvisForce.mX, out->mPelvisForce.mY, 0.0f), JPH::Vec3::sZero());
+                f.mFoot = { static_cast<float>(foot.mCenterOfMass.GetX()), static_cast<float>(foot.mCenterOfMass.GetY()) };
+                f.mFootVelocity = { foot.mMotion.mLinearVelocity.GetX(), foot.mMotion.mLinearVelocity.GetY() };
+                f.mLiftOff = { static_cast<float>(feet[side].mPin.GetX()), static_cast<float>(feet[side].mPin.GetY()) };
+                f.mLanding = { static_cast<float>(feet[side].mTarget.GetX()), static_cast<float>(feet[side].mTarget.GetY()) };
+                f.mPhase = feet[side].mPhase;
+                f.mDuration = feet[side].mDuration;
+                f.mLegMass = masses[leg.mHip] + masses[leg.mKnee] + masses[leg.mFoot];
+                f.mFootMass = masses[leg.mFoot];
+                f.mSwingStarted = mFootfallLibraryOutput.mSwingStarted[side];
+                f.mGoal = mFootfallLibraryOutput.mMotorFootGoal[side];
+                f.mGoalVelocity = mFootfallLibraryOutput.mMotorFootVelocity[side];
             }
+            const auto out = RagdollCore::stepStrideSwingSpring(in, mScopedGoalVelocity);
+            for (std::size_t side = 0; side < 2; ++side)
+                if (out[side])
+                {
+                    const auto& leg = side == 0 ? *mLeftLeg : *mRightLeg;
+                    mRagdoll->applyExternalBodyWrench(leg.mFoot,
+                        JPH::Vec3(out[side]->mFootForce.mX, out[side]->mFootForce.mY, 0.0f), JPH::Vec3::sZero());
+                    mRagdoll->applyExternalBodyWrench(*mPelvisBodyIndex,
+                        JPH::Vec3(out[side]->mPelvisForce.mX, out[side]->mPelvisForce.mY, 0.0f), JPH::Vec3::sZero());
+                }
         }
-
         bool applyBalanceLegCorrection(RagdollCore::RagdollPose& drivePose,
             const RagdollCore::RagdollPose& animationPose,
             const RagdollCore::ActiveControllerProfile& profile)
@@ -5505,6 +5453,13 @@
 
         bool permitsNativeAttackContact(const RagdollCore::WeaponContactEvent& contact) const
         {
+            // FIST-02's jab: the left fist strikes beside the wheel's swing,
+            // which neither owns it nor opens its cut stage for it (FIX-08
+            // fists 11-05: with the jab-cross on every jab touched the target
+            // and none landed; all three landed with it off).
+            if (mHscActive && mLeftJabStriking && mLeftArm && contact.weaponRecordId().empty()
+                && contact.weaponBodyIdentity() == mRagdoll->getBodyId(mLeftArm->mHand).GetIndexAndSequenceNumber())
+                return true;
             // Hand control's own swings and cuts strike whatever phase
             // the native attack a click started is in.
             if (mHscActive)
@@ -5962,7 +5917,21 @@
             const bool wasActive = mStaggerPlan.active();
             const int taken = mStaggerPlan.stepsTaken();
             // The actor's own movement input (not the request the plan holds).
-            mStaggerPlan.holdGiveUp(mQueuedInputSpeed >= 15.0f);
+            // An upright, slow body does not give up either (user 11-03
+            // bookmarks 2-4, "stuck in falling mode after a jump": a teeter on
+            // a ledge ran its five steps out with the weight 20 units past the
+            // feet's line on a 12-unit step down, and fell the player at up
+            // 0.97, 15 u/s). OPENMW_RAGDOLL_STAGGER_UPRIGHT_HOLD = "up, speed"
+            // (torso up-dot over, body speed under; 0 = off).
+            static const auto uprightHold_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 30.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_STAGGER_UPRIGHT_HOLD", value);
+                return value;
+            });
+            const auto& uprightHold = uprightHold_tuned.get();
+            const bool upright = uprightHold[0] > 0.0f && mControllerInput
+                && mControllerInput->mTorsoUpDot > uprightHold[0] && speed < uprightHold[1];
+            mStaggerPlan.holdGiveUp(mQueuedInputSpeed >= 15.0f || upright);
             const auto next = mStaggerPlan.step(input.mDt, feet, mSituationCom, capture, speed);
             if (!mStaggerPlan.active())
             {
@@ -6105,7 +6074,7 @@
                 if (out.mBearings > mLastBearings + 0.05f)
                     Log(Debug::Info) << "RAGDOLL_RXN2_BEARINGS actor=" << getPtr().getCellRef().getRefId()
                                      << " seconds=" << out.mBearings;
-                mClashLockout = std::max(mClashLockout, out.mBearings);
+                mClashLockout = std::max(mClashLockout, out.mBearings * k2LockoutShare()); // K2_LOCKOUT
             }
             mLastBearings = out.mBearings;
             traceAiCut(dt);
@@ -6619,23 +6588,6 @@
             return !recovering && mLocomotionBasePose ? *mLocomotionBasePose : mMotorTargetPose;
         }
 
-        bool standingMotorPose(RagdollCore::RagdollPose& target) const
-        {
-            RagdollCore::RagdollPose standingPose = motorBasePose();
-            if (mStandingLegPose && mPelvisBodyIndex && mLeftLeg && mRightLeg)
-            {
-                const std::array<std::size_t, 6> legs{ mLeftLeg->mHip, mLeftLeg->mKnee, mLeftLeg->mFoot,
-                    mRightLeg->mHip, mRightLeg->mKnee, mRightLeg->mFoot };
-                if (!RagdollCore::applyGaitMeasuredLegTargets(standingPose.mBodyTransforms,
-                        mStandingLegPose->mBodyTransforms, *mPelvisBodyIndex, legs,
-                        RagdollCore::GaitMeasuredPoseFrame::Joint))
-                    return false;
-            }
-            target = standingPose;
-            return !mHandover.active()
-                || mHandover.blendPose(standingPose, mExperimentalReferenceProfile, target);
-        }
-
         bool capturePoweredTarget(std::uint64_t nextPhysicsStep)
         {
             mSupportGripReadySample = false;
@@ -6850,6 +6802,8 @@
             return value;
         }
         bool mBodyLeading = false;
+        float mBlowTrack = 0.0f;
+        unsigned mBlowTrackSteps = 0;
         bool bodyLeadsNow() const
         {
             const auto& on = bodyLeadsSettings();
@@ -6971,7 +6925,54 @@
                 else if (mStaggerSettleTime > mStaggerSettle)
                     mStaggerSettle = 0.0f;
             }
-            if (physicsOwnsHorizontalRoot || staggerFollow || bodyLeads)
+            // K2_CAPSULE_LEASH (user bookmark 11-05: "a lot of slingshotting the
+            // model with the capsule at least at high speed"; that session ran
+            // the capsule at 547 u/s with the pelvis 100-110 u behind it, then
+            // the body snapped up at ~770 u/s when the capsule stopped): the
+            // capsule waits for the body - more than `leash` units ahead of the
+            // physical pelvis, it is drawn back to that distance - only at a
+            // run (the asked speed over 250 u/s) with the feet supported: at a
+            // walk off a drop it pulled the stepping body over (the stairs
+            // drop-off fell 2 of 2). 0 = off.
+            double leashShare = 0.0;
+            {
+                static const auto leash_tuned = RagdollCore::tuned<float>([] {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_CAPSULE_LEASH");
+                    const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                    return std::isfinite(value) ? std::clamp(value, 0.0f, 500.0f) : 0.0f;
+                });
+                const float leash = leash_tuned.get();
+                const float asked = std::hypot(mRawTargetHorizontalVelocity.GetX(), mRawTargetHorizontalVelocity.GetY());
+                if (leash > 0.0f && !physicsOwnsHorizontalRoot && !staggerFollow && !bodyLeads && asked > 250.0f
+                    && mSituation.mSupported && !mSituation.mAirborne)
+                {
+                    const JPH::RVec3 lag = telemetry.mBodies[*mPelvisBodyIndex].mPosition - *targetPosition;
+                    const float gap = static_cast<float>(std::hypot(lag.GetX(), lag.GetY()));
+                    if (gap > leash)
+                        leashShare = (gap - leash) / gap;
+                }
+            }
+            // K2_BLOW_TRACE: the capsule against the body after a blow.
+            if (mBlowTrack > 0.0f)
+            {
+                mBlowTrack -= dt;
+                if (++mBlowTrackSteps % 4 == 0)
+                {
+                    const JPH::RVec3 pelvis = telemetry.mBodies[*mPelvisBodyIndex].mPosition;
+                    const JPH::Vec3 v = telemetry.mBodies[*mPelvisBodyIndex].mMotion.mLinearVelocity;
+                    Log(Debug::Info) << "RAGDOLL_BLOW_TRACK actor=" << getPtr().getCellRef().getRefId()
+                                     << " left=" << mBlowTrack << " capsule=" << actorPosition.x() << ','
+                                     << actorPosition.y() << " pelvis=" << pelvis.GetX() << ',' << pelvis.GetY()
+                                     << " gap=" << std::hypot(pelvis.GetX() - targetPosition->GetX(), pelvis.GetY() - targetPosition->GetY())
+                                     << " speed=" << std::hypot(v.GetX(), v.GetY()) << " asked="
+                                     << std::hypot(mRawTargetHorizontalVelocity.GetX(), mRawTargetHorizontalVelocity.GetY())
+                                     << " plan=" << mStaggerPlan.active() << " settle=" << staggerFollow
+                                     << " share=" << settleShare << " leash=" << leashShare << " leads=" << bodyLeads
+                                     << " owns=" << physicsOwnsHorizontalRoot
+                                     << " mode=" << static_cast<int>(mControllerOutput ? mControllerOutput->mMode : RagdollCore::ActiveControllerMode::Standing);
+                }
+            }
+            if (physicsOwnsHorizontalRoot || staggerFollow || bodyLeads || leashShare > 0.0)
             {
                 // While balance is relinquished or powered locomotion is
                 // active, let the physical pelvis carry the gameplay root.
@@ -6980,7 +6981,9 @@
                 // away from the ragdoll that is trying to realize it.
                 const JPH::RVec3 oldReference = mRagdoll->getReferencePosition();
                 const JPH::RVec3 pelvisDisplacement = telemetry.mBodies[*mPelvisBodyIndex].mPosition - *targetPosition;
-                const double share = physicsOwnsHorizontalRoot || bodyLeads ? 1.0 : settleShare;
+                const double share = physicsOwnsHorizontalRoot || bodyLeads ? 1.0
+                    : staggerFollow                                    ? settleShare
+                                                                       : leashShare;
                 newReference.SetX(oldReference.GetX() + pelvisDisplacement.GetX() * share);
                 newReference.SetY(oldReference.GetY() + pelvisDisplacement.GetY() * share);
             }
@@ -7074,8 +7077,9 @@
             // recovery 0.6-0.75 s -> 1.0-1.6 s).
             // OPENMW_RAGDOLL_FEET_LEASH = "base u, per speed, share" (unset = off).
             bool feetLeash = false;
-            mLeashUneven = std::abs(mKinematicRootActualVerticalVelocity) > 25.0f ? 0.5f
-                                                                                 : std::max(0.0f, mLeashUneven - dt);
+            mLeashUneven = std::abs(mKinematicRootActualVerticalVelocity) > 25.0f
+                ? 0.5f
+                : std::max(0.0f, mLeashUneven - dt);
             {
                 static const auto leash_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
                     std::array<float, 3> v{ 0.0f, 0.06f, 0.3f };
@@ -7187,6 +7191,13 @@
                         newReference -= JPH::RVec3(along * pull);
                         feetLeash = true;
                         ++mFeetLeashSteps;
+                        // K2_LEASH_GAIT (registry): the pull is no travel.
+                        static const auto leashGait_tuned = RagdollCore::tuned<bool>([] {
+                            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_LEASH_GAIT");
+                            return text && std::atoi(text) != 0;
+                        });
+                        if (leashGait_tuned.get())
+                            mLeashPullPending -= along * pull;
                     }
                 }
             }
@@ -7331,6 +7342,76 @@
                 || !mSupportEstimate->hasGroundContact())
                 mSupportEstimate = *estimate;
 
+            // Who carries the weight (MOVE-01 diagnosis, 11-03): each foot's
+            // vertical ground force and the soft root's force, in body
+            // weights, and how fast each foot's loaded contacts slide.
+            if (footfallTraced() && mPowered && telemetry.mTotalMass > 0.0f && duration > 0.0f)
+            {
+                const float weight = telemetry.mTotalMass * RagdollCore::UnitModel::GravityUnitsPerSecondSquared;
+                float load[2] = { 0.0f, 0.0f };
+                float slip[2] = { 0.0f, 0.0f };
+                int footContacts = 0, withImpulse = 0;
+                float otherLoad = 0.0f;
+                std::optional<std::size_t> otherBody;
+                for (const auto& contact : contacts)
+                {
+                    const int side = contact.mBodyIndex == *mLeftFootBodyIndex ? 0
+                        : contact.mBodyIndex == *mRightFootBodyIndex           ? 1
+                                                                               : -1;
+                    if (side >= 0)
+                    {
+                        ++footContacts;
+                        withImpulse += contact.mNormalImpulse ? 1 : 0;
+                    }
+                    // Weight carried through any other body (a knee, a hip, the
+                    // weapon) - the hold walker's legs and root carried 0.54.
+                    else if (contact.mNormalImpulse && *contact.mNormalImpulse > 0.0f)
+                    {
+                        otherLoad += *contact.mNormalImpulse * contact.mNormal.GetZ() / duration;
+                        if (contact.mBodyIndex < telemetry.mBodies.size())
+                            otherBody = contact.mBodyIndex;
+                    }
+                    if (side < 0 || !contact.mNormalImpulse || *contact.mNormalImpulse <= 0.0f)
+                        continue;
+                    const float up = *contact.mNormalImpulse * contact.mNormal.GetZ() / duration;
+                    load[side] += up;
+                    if (contact.mPointVelocity)
+                        slip[side] = std::max(slip[side],
+                            std::hypot(contact.mPointVelocity->GetX(), contact.mPointVelocity->GetY()));
+                }
+                float rootV = 0.0f;
+                float rootH = 0.0f;
+                if (mRagdoll->getSoftRoot().mEnabled)
+                {
+                    const JPH::Vec3 force = mRagdoll->getSoftRootTelemetry().mForce;
+                    rootV = force.GetZ() / weight;
+                    rootH = std::hypot(force.GetX(), force.GetY()) / weight;
+                }
+                // The pelvis over the lower foot (StrideSim writes the same, W1).
+                float pelvisHeight = -1.0f;
+                if (mPelvisBodyIndex && *mPelvisBodyIndex < telemetry.mBodies.size())
+                    pelvisHeight = static_cast<float>(telemetry.mBodies[*mPelvisBodyIndex].mPosition.GetZ()
+                        - std::min(telemetry.mBodies[*mLeftFootBodyIndex].mPosition.GetZ(),
+                            telemetry.mBodies[*mRightFootBodyIndex].mPosition.GetZ()));
+                // The pelvis's side tilt: the left thigh's origin over the right's (W1 parity).
+                float hipTilt = 0.0f;
+                if (mLeftLeg && mRightLeg && mLeftLeg->mHip < telemetry.mBodies.size()
+                    && mRightLeg->mHip < telemetry.mBodies.size())
+                    hipTilt = static_cast<float>(telemetry.mBodies[mLeftLeg->mHip].mPosition.GetZ()
+                        - telemetry.mBodies[mRightLeg->mHip].mPosition.GetZ());
+                Log(Debug::Info) << std::fixed << std::setprecision(3) << "RAGDOLL_LOAD hipDZ=" << hipTilt << " left=" << load[0] / weight
+                                 << " right=" << load[1] / weight << " rootV=" << rootV << " rootH=" << rootH
+                                 << std::setprecision(1) << " slipL=" << slip[0] << " slipR=" << slip[1]
+                                 << " pelvisH=" << pelvisHeight
+                                 << " errZ=" << mRagdoll->getSoftRootTelemetry().mPositionErrorUp
+                                 << " contacts=" << footContacts << "/" << withImpulse
+                                 << std::setprecision(3) << " other=" << otherLoad / weight << " otherBody="
+                                 << (otherBody ? static_cast<int>(*otherBody) : -1)
+                                 << " kneeU=" << (mLeftLeg && mLeftLeg->mKnee < mJointMotorUtilizations.size() ? mJointMotorUtilizations[mLeftLeg->mKnee] : -1.0f)
+                                 << "," << (mRightLeg && mRightLeg->mKnee < mJointMotorUtilizations.size() ? mJointMotorUtilizations[mRightLeg->mKnee] : -1.0f)
+                                 << " actor=" << getPtr().getCellRef().getRefId().toDebugString();
+            }
+
             if (!mControllerObservationInitialized || !mSupportEstimate || !mPelvisBodyIndex || !mTorsoBodyIndex
                 || *mPelvisBodyIndex >= telemetry.mBodies.size() || *mTorsoBodyIndex >= telemetry.mBodies.size())
                 return;
@@ -7395,6 +7476,23 @@
                 input.mPelvisHeight = std::max(0.0f,
                     static_cast<float>(telemetry.mBodies[*mPelvisBodyIndex].mCenterOfMass.GetZ()
                         - input.mSupport.mGroundCenter.GetZ()));
+            }
+            // K2_UPRIGHT_NOT_FALLEN (registry): the pelvis over the lower foot.
+            {
+                static const auto uprightNotFallen_tuned = RagdollCore::tuned<bool>([] {
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_UPRIGHT_NOT_FALLEN");
+                    return text && std::atoi(text) != 0;
+                });
+                if (uprightNotFallen_tuned.get() && mLeftFootBodyIndex && mRightFootBodyIndex
+                    && *mLeftFootBodyIndex < telemetry.mBodies.size() && *mRightFootBodyIndex < telemetry.mBodies.size())
+                {
+                    const double lower = std::min(telemetry.mBodies[*mLeftFootBodyIndex].mCenterOfMass.GetZ(),
+                        telemetry.mBodies[*mRightFootBodyIndex].mCenterOfMass.GetZ());
+                    const float above
+                        = static_cast<float>(telemetry.mBodies[*mPelvisBodyIndex].mCenterOfMass.GetZ() - lower);
+                    if (std::isfinite(above))
+                        input.mPelvisAboveFeet = above;
+                }
             }
             JPH::Vec3 centerOfMassVelocity = JPH::Vec3::sZero();
             if (mRecoveryHandoverPending)
@@ -7681,114 +7779,71 @@
                     || preservingGaitOrientation))
             {
                 RagdollCore::UprightControllerInput upright;
-                // Joint motors only control bodies relative to the pelvis; the
-                // free pelvis needs a world-space torque to follow a get-up.
-                // Recovery therefore keeps bounded orientation control even
-                // while the animation temporarily has no foot support. Without
-                // a support surface, suppress translational correction rather
-                // than manufacturing a world-space support point.
-                // Physical settling must restore COM and height feedback;
-                // continued unweighting replaces it with lift-only acceleration.
-                // Not with the soft root: its balance spring already carries
-                // the get-up, and the extra 2.5 g lift on top threw a kneeling
-                // body 50 units above the clip at 226-273 u/s ("the stand up
-                // animation is crazy", 2026-09-24 R5; new walking cases
-                // `knockdown`). OPENMW_RAGDOLL_SOFT_ROOT_UNWEIGHT=1 restores it.
-                static const auto softRootUnweight_tuned = RagdollCore::tuned<bool>([] {
-                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_SOFT_ROOT_UNWEIGHT");
-                    return text && std::atoi(text) != 0;
-                });
-                static const auto& softRootUnweight = softRootUnweight_tuned.get();
-                upright.mRecoveryUnweight = recovering
-                    && (softRootUnweight || !mRagdoll->getSoftRoot().mEnabled)
-                    && !recoveryHeight
-                    && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::GettingUp
-                    && input.mSupport.hasGroundContact()
-                    && (!mControllerOutput->mRecoveryHeightAssist
-                        || input.mPelvisUpDot < profile.mStandingMinimumUpDot);
-                upright.mTargetPelvisHeight = correctTranslation ? *targetPelvisHeight
-                    : input.mSupport.hasGroundContact()          ? input.mPelvisHeight
-                                                                 : *targetPelvisHeight;
-                if (correctTranslation && mHandover.active())
-                    upright.mTargetPelvisHeight
-                        = mHandover.blendPelvisHeight(*targetPelvisHeight, mExperimentalReferenceProfile);
-                upright.mPelvisHeight
-                    = input.mSupport.hasGroundContact() ? input.mPelvisHeight : *targetPelvisHeight;
-                if (correctTranslation)
+                // The input through ragdollcore uprightholder.
                 {
-                    upright.mPelvisVerticalVelocity
+                    RagdollCore::UprightAssembly a;
+                    a.mRecovering = recovering;
+                    a.mGettingUp = mControllerOutput
+                        && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::GettingUp;
+                    a.mSoftRoot = mRagdoll->getSoftRoot().mEnabled;
+                    a.mRecoveryHeight = recoveryHeight.has_value();
+                    a.mRecoveryHeightAssist = mControllerOutput && mControllerOutput->mRecoveryHeightAssist;
+                    a.mCorrectTranslation = correctTranslation;
+                    a.mGroundContact = input.mSupport.hasGroundContact();
+                    a.mHasSupport = input.mSupport.hasSupport();
+                    a.mSoftRootUnweight = k2SoftRootUnweight();
+                    a.mPelvisUpDot = input.mPelvisUpDot;
+                    a.mStandingMinimumUpDot = profile.mStandingMinimumUpDot;
+                    a.mTargetPelvisHeight = *targetPelvisHeight;
+                    if (correctTranslation && mHandover.active())
+                        a.mHandoverPelvisHeight
+                            = mHandover.blendPelvisHeight(*targetPelvisHeight, mExperimentalReferenceProfile);
+                    a.mPelvisHeight = input.mPelvisHeight;
+                    a.mPelvisVerticalVelocity
                         = telemetry.mBodies[*mPelvisBodyIndex].mMotion.mLinearVelocity.Dot(JPH::Vec3::sAxisZ());
-                }
-                if (correctTranslation && input.mSupport.hasSupport())
-                {
-                    const JPH::Vec3 defaultOffset(telemetry.mCenterOfMass - input.mSupport.mCenter);
-                    std::optional<JPH::Vec3> stanceOffset;
-                    if (stanceSupportEstimate && stanceSupportEstimate->hasSupport())
+                    if (correctTranslation && input.mSupport.hasSupport())
                     {
-                        const JPH::RVec3 target = stanceSupportEstimate->mClosestPoint
-                            + 0.5 * (stanceSupportEstimate->mCenter - stanceSupportEstimate->mClosestPoint);
-                        stanceOffset = JPH::Vec3(telemetry.mCenterOfMass - target);
-                        stanceOffset->SetZ(0.0f);
+                        const JPH::Vec3 defaultOffset(telemetry.mCenterOfMass - input.mSupport.mCenter);
+                        std::optional<JPH::Vec3> stanceOffset;
+                        if (stanceSupportEstimate && stanceSupportEstimate->hasSupport())
+                        {
+                            const JPH::RVec3 target = stanceSupportEstimate->mClosestPoint
+                                + 0.5 * (stanceSupportEstimate->mCenter - stanceSupportEstimate->mClosestPoint);
+                            stanceOffset = JPH::Vec3(telemetry.mCenterOfMass - target);
+                            stanceOffset->SetZ(0.0f);
+                        }
+                        const auto selectedOffset = RagdollCore::selectGaitCenterOfMassOffset(
+                            *mGaitActuationDecision, mTargetHorizontalVelocity, defaultOffset, stanceOffset);
+                        if (!selectedOffset)
+                        {
+                            failPoweredControl(__LINE__);
+                            return;
+                        }
+                        a.mCenterOfMassOffset = *selectedOffset;
                     }
-                    const auto selectedOffset = RagdollCore::selectGaitCenterOfMassOffset(
-                        *mGaitActuationDecision, mTargetHorizontalVelocity, defaultOffset, stanceOffset);
-                    if (!selectedOffset)
+                    a.mCenterOfMassVelocity = centerOfMassVelocity;
+                    a.mTargetHorizontalVelocity = mGaitActuationDecision->mTargetHorizontalVelocity;
+                    a.mPelvisUp = telemetry.mBodies[*mPelvisBodyIndex].mRotation * mPelvisLocalUp;
+                    a.mPelvisAngularVelocity = telemetry.mBodies[*mPelvisBodyIndex].mMotion.mAngularVelocity;
+                    a.mTorsoUp = telemetry.mBodies[*mTorsoBodyIndex].mRotation * mTorsoLocalUp;
+                    a.mTorsoAngularVelocity = telemetry.mBodies[*mTorsoBodyIndex].mMotion.mAngularVelocity;
+                    if (a.mGettingUp && mMotorTargetCaptured)
                     {
-                        failPoweredControl(__LINE__);
-                        return;
+                        if (const auto rotation = mRagdoll->getWorldBodyRotation(mMotorTargetPose, *mPelvisBodyIndex))
+                            a.mGetUpTargetUp = *rotation * mPelvisLocalUp;
                     }
-                    upright.mCenterOfMassOffset = *selectedOffset;
+                    else if (mMotorTargetCaptured && mRagdoll->isRootKinematic() && k2HeldSpineFollow())
+                    {
+                        if (const auto rotation = mRagdoll->getWorldBodyRotation(mMotorTargetPose, *mTorsoBodyIndex))
+                            a.mHeldFollowTargetUp = *rotation * mTorsoLocalUp;
+                    }
+                    a.mTotalMass = telemetry.mTotalMass;
+                    a.mSupportFriction = input.mSupport.mFriction.value_or(0);
+                    a.mGravity = RagdollCore::UnitModel::GravityUnitsPerSecondSquared;
+                    a.mCenterOfMassPosition = telemetry.mCenterOfMass;
+                    a.mCenterOfMassHeight = input.mSupport.mCenterOfMassHeight;
+                    upright = RagdollCore::assembleUprightInput(a);
                 }
-                if (correctTranslation)
-                    upright.mCenterOfMassVelocity = centerOfMassVelocity;
-                // During a brief authored gait flight phase, keep orientation
-                // torque alive but do not accelerate the ragdoll through the
-                // air. Translation resumes from measured support after the
-                // next ground contact.
-                upright.mTargetHorizontalVelocity = mGaitActuationDecision->mTargetHorizontalVelocity;
-                upright.mPelvisUp = telemetry.mBodies[*mPelvisBodyIndex].mRotation * mPelvisLocalUp;
-                upright.mPelvisAngularVelocity = telemetry.mBodies[*mPelvisBodyIndex].mMotion.mAngularVelocity;
-                upright.mTorsoUp = telemetry.mBodies[*mTorsoBodyIndex].mRotation * mTorsoLocalUp;
-                upright.mTorsoAngularVelocity = telemetry.mBodies[*mTorsoBodyIndex].mMotion.mAngularVelocity;
-                // Standing and gait balance against world up. Following the
-                // animated pelvis-up vector here makes authored walk-cycle
-                // lean become the physical definition of upright and can
-                // topple the whole ragdoll. Only the active get-up follows
-                // the changing authored orientation. Physical settling must
-                // balance against world up, not retain an animation lean.
-                if (mControllerOutput
-                    && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::GettingUp
-                    && mMotorTargetCaptured)
-                {
-                    const auto targetPelvisRotation
-                        = mRagdoll->getWorldBodyRotation(mMotorTargetPose, *mPelvisBodyIndex);
-                    if (targetPelvisRotation)
-                        upright.mTargetUp = *targetPelvisRotation * mPelvisLocalUp;
-                }
-                // Under the held (soft) root only the spine torque of this
-                // controller is applied (the pelvis parts are zeroed): toward
-                // world up it held the chest against the animation's lean and
-                // side sway (running roll 13 of 21 deg). Aimed at the animated
-                // torso's up it keeps its damping and helps the pose instead.
-                // OPENMW_RAGDOLL_HELD_SPINE_FOLLOW = 1 (test knob, 2026-09-28).
-                else if (mMotorTargetCaptured && mRagdoll->isRootKinematic())
-                {
-                    static const auto followAnimation_tuned = RagdollCore::tuned<bool>([] {
-                        const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HELD_SPINE_FOLLOW");
-                        return text && std::atoi(text) != 0;
-                    });
-                    static const auto& followAnimation = followAnimation_tuned.get();
-                    if (followAnimation)
-                        if (const auto targetTorsoRotation
-                            = mRagdoll->getWorldBodyRotation(mMotorTargetPose, *mTorsoBodyIndex))
-                            upright.mTargetUp = *targetTorsoRotation * mTorsoLocalUp;
-                }
-                upright.mTotalMass = telemetry.mTotalMass;
-                // Contact budgets are selected by the shared gait policy.
-                upright.mSupportFriction = input.mSupport.mFriction.value_or(0);
-                upright.mGravityMagnitude = RagdollCore::UnitModel::GravityUnitsPerSecondSquared;
-                upright.mCenterOfMassPosition = telemetry.mCenterOfMass;
-                upright.mCenterOfMassHeight = input.mSupport.mCenterOfMassHeight;
                 RagdollCore::configureGaitSupportBudget(*mGaitActuationDecision, correctTranslation, contacts,
                     { *mLeftFootBodyIndex, *mRightFootBodyIndex }, upright);
                 // Standing too, the upright controller's horizontal pull on the
@@ -7800,11 +7855,7 @@
                 // = the limit as a share of weight (0 = unlimited, the old law).
                 static const auto standFriction_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_STAND_FRICTION", 0.0f); });
                 static const auto& standFriction = standFriction_tuned.get();
-                if (standFriction > 0.0f && correctTranslation && !upright.mLimitToSupportFriction)
-                {
-                    upright.mLimitToSupportFriction = true;
-                    upright.mSupportFriction = standFriction;
-                }
+                RagdollCore::limitStandingFriction(upright, standFriction, correctTranslation);
                 if (auto correction = RagdollCore::calculateUprightControl(upright, profile))
                 {
                     mUprightControllerInput = upright;
@@ -7902,6 +7953,23 @@
                 if (output.mMode != RagdollCore::ActiveControllerMode::GettingUp
                     && output.mMode != RagdollCore::ActiveControllerMode::BlendBack)
                     mSampledRecoveryTarget.reset();
+                // An upright body called lying (the 11-16 play: seven drops
+                // with no decided fall): what the ground was read from.
+                if (output.mMode == RagdollCore::ActiveControllerMode::Fallen && input.mTorsoUpDot > 0.5f
+                    && mControllerOutput
+                    && RagdollCore::isDrivenControllerMode(mControllerOutput->mMode)
+                    && mControllerOutput->mMode != RagdollCore::ActiveControllerMode::GettingUp
+                    && mControllerOutput->mMode != RagdollCore::ActiveControllerMode::BlendBack)
+                    Log(Debug::Info) << "RAGDOLL_FALLEN_FROM_FEET actor=" << getPtr().getCellRef().getRefId()
+                                     << " from=" << static_cast<int>(mControllerOutput->mMode)
+                                     << " ground_contacts=" << input.mSupport.mGroundContactCount
+                                     << " foot_contacts=" << input.mSupport.mFootContactCount
+                                     << " ground_z=" << input.mSupport.mGroundCenter.GetZ()
+                                     << " pelvis_z=" << telemetry.mBodies[*mPelvisBodyIndex].mCenterOfMass.GetZ()
+                                     << " pelvis_height=" << input.mPelvisHeight
+                                     << " torso_up=" << input.mTorsoUpDot
+                                     << " speed=" << input.mCenterOfMassVelocity.Length()
+                                     << " held_dropped=" << mHeldGroundContactsDropped;
                 mControllerInput = input;
                 mControllerOutput = output;
 
@@ -7941,6 +8009,8 @@
                 RagdollCore::GaitControllerOutput gaitOutput;
                 if (mGaitController.step(gaitInput, duration, profile.mGait, gaitOutput))
                 {
+                    RagdollCore::countPath(
+                        RagdollCore::CountedPath::GaitClock, getPtr() == MWMechanics::getPlayer());
                     mGaitOutput = gaitOutput;
                     if (!gaitOutput.hasStance())
                     {
@@ -8014,6 +8084,9 @@
         // Powered AI melee strike: while the controller attacks, the swing
         // is driven toward the victim and the physical contact prices the hit.
         bool mAiStrikeActive = false;
+        std::uint64_t mHeldBlowLogged = 0; // K2_HELD_NOT_BODY: the last log step
+        float mNpcShoveSince = 1e9f; // SHOVE-02: s since this NPC last shoved
+        std::uint64_t mNpcShoveRoll = 0x9e3779b97f4a7c15ull; // its dice
         bool mAiAttackIntent = false;
         // Hard blocks this body's blade struck (it staggered), for tests.
         std::uint64_t mBlockStaggerCount = 0;
@@ -8157,6 +8230,39 @@
         }
         // The nearest opponent weapon while guarding (updateGuardThreats).
         std::optional<JPH::RVec3> mGuardThreat;
+        // That weapon's striking part and its velocity, world (the player's
+        // block steers to it: K2_PARRY_STEER).
+        std::optional<JPH::RVec3> mGuardStrike;
+        JPH::Vec3 mGuardStrikeVelocity = JPH::Vec3::sZero();
+        // FIST-08 (OPENMW_RAGDOLL_K2_PALM_PARRY, registry): the player's
+        // bare-handed parry (ragdollcore palmparry). With mGuardStrike: the
+        // foe's weapon hand and its stroke's stage (updateGuardThreats).
+        JPH::RVec3 mGuardStrikeHand = JPH::RVec3::sZero();
+        int mGuardStrikeStage = -1; // AttackStage as int, -1 = not on the wheel
+        bool mGuardStrikeAi = false; // its AI strike runs
+        static const RagdollCore::PalmParrySettings& palmParrySettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<RagdollCore::PalmParrySettings>([] {
+                return RagdollCore::parsePalmParrySettings(RagdollCore::tuningText("OPENMW_RAGDOLL_K2_PALM_PARRY"));
+            });
+            return value_tuned.get();
+        }
+        RagdollCore::PalmParry mPalmParry;
+        float mPalmSkill = 0.0f; // palmParrySkill, this step
+        std::uint64_t mPalmParries = 0; // blows a palm deflected
+        std::uint64_t mPalmDeflectStep = 0, mPalmLogStep = 0;
+        // The palm parry has the guard: this body's hands are its own.
+        bool palmParryUp() const { return mGuardActive && mPalmParry.phase() != RagdollCore::PalmPhase::Down; }
+        // OPENMW_RAGDOLL_K2_PARRY_STEER (registry): units, 0 = off.
+        static float parrySteerSetting()
+        {
+            static const auto value_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_PARRY_STEER");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 30.0f) : 0.0f;
+            });
+            return value_tuned.get();
+        }
         // The opponent in front for the attack wheel's aim (updateHscFoes):
         // its chest, world.
         std::optional<JPH::RVec3> mHscFoe;
@@ -8226,8 +8332,6 @@
         // Alternating strokes: a horizontal slash across the victim and a
         // forward thrust. Each starts with a hard kick so the weapon arrives
         // with real speed instead of being pushed in gently.
-        bool mAiStrikeSlash = false;
-        int mAiStrikeSide = 1;
         bool mAiHandTraceSeeded = false;
         JPH::RVec3 mAiLastAnimHand = JPH::RVec3::sZero();
         JPH::RVec3 mAiLastPhysHand = JPH::RVec3::sZero();
@@ -8340,17 +8444,25 @@
         }
         bool mDying = false, mDyingDone = false;
         float mDyingTime = 0.0f;
+        // Physical death through ragdollcore lifecycle.
+        static RagdollCore::PhysicalDeathSettings k2DeathSettings()
+        {
+            const auto& s = deathPhysicalSettings();
+            return { s[0] > 0.0f, s[1], s[2] };
+        }
         bool beginDying(const osg::Vec3f& direction)
         {
             const auto& s = deathPhysicalSettings();
             using Mode = RagdollCore::ActiveControllerMode;
-            if (!(s[0] > 0.0f) || !mPowered || !mRagdoll || mDying || !mControllerOutput
-                || !(mControllerOutput->mMode == Mode::Standing || mControllerOutput->mMode == Mode::Bracing
-                    || mControllerOutput->mMode == Mode::Stumbling))
+            RagdollCore::PhysicalDeathState state{ mDying, mDyingDone, mDyingTime };
+            std::optional<Mode> mode;
+            if (mControllerOutput)
+                mode = mControllerOutput->mMode;
+            if (!mRagdoll || !RagdollCore::beginPhysicalDeath(state, k2DeathSettings(), mPowered, mode))
                 return false;
-            mDying = true;
-            mDyingDone = false;
-            mDyingTime = 0.0f;
+            mDying = state.mDying;
+            mDyingDone = state.mDone;
+            mDyingTime = state.mTime;
             osg::Vec3f flat(direction.x(), direction.y(), 0.0f);
             if (flat.length2() > 1e-6f)
                 flat.normalize();
@@ -8364,10 +8476,12 @@
             if (!mDying || mDyingDone)
                 return;
             const auto& s = deathPhysicalSettings();
-            mDyingTime += dt;
             mHitStun.begin(s[2], mExperimentalReferenceProfile);
             const bool lying = mControllerOutput && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Fallen;
-            if (lying || mDyingTime >= std::max(0.2f, s[1]) || !mPowered)
+            RagdollCore::PhysicalDeathState state{ mDying, mDyingDone, mDyingTime };
+            const bool ended = RagdollCore::stepPhysicalDeath(state, k2DeathSettings(), lying, mPowered, dt);
+            mDyingTime = state.mTime;
+            if (ended)
             {
                 mDyingDone = true;
                 Log(Debug::Info) << "RAGDOLL_DEATH_PHYSICAL limp actor=" << getPtr().getCellRef().getRefId()
@@ -8478,20 +8592,6 @@
             if (mStumbleAge > stumbleSettings().mWindow)
                 mStumbleLeft = 0;
         }
-        void applyStumble(RagdollCore::CatchStepInput& catchInput) const
-        {
-            catchInput.mStumbleSteps = mStumbleLeft;
-            catchInput.mStumbleSpeed = stumbleSettings().mSpeed;
-        }
-        void countStumble(const std::optional<RagdollCore::CatchStepCommand>& result)
-        {
-            if (result && result->mSwingNow && mStumbleLeft > 0)
-            {
-                --mStumbleLeft;
-                if (result->mStumble)
-                    ++mStumbleSteps;
-            }
-        }
         // bodyDv: the blow's speed change of the whole body (u/s) when the
         // caller knows it (the contact path prices impulseMagnitude from it);
         // unset, impulseMagnitude is a raw impulse and dv = impulse / mass.
@@ -8504,6 +8604,9 @@
             }
             if (!std::isfinite(impulseMagnitude) || impulseMagnitude <= 0.0f)
                 return;
+            RagdollCore::breakCalmHold(mCalmState); // K2_CALM: the push meets the kinetic body
+            mCalm = {};
+            mCalm.mDraw = mCalmState.mDraw; // the picture eases to the body (updateCalmHold)
             beginScopedRecovery(impulseMagnitude);
             // Stagger settle (build 55: the helper dragged a staggering body
             // ~85 u back to the capsule; the capsule now eases to the body once
@@ -8523,6 +8626,13 @@
             {
                 mStaggerSettle = staggerSettleFor;
                 mStaggerSettleTime = mStaggerSettling = 0.0f;
+            }
+            static const auto blowTrace_tuned = RagdollCore::tuned<bool>(
+                [] { return RagdollCore::tuningText("OPENMW_RAGDOLL_K2_BLOW_TRACE") != nullptr; });
+            if (blowTrace_tuned.get() && bodyDv >= 25.0f)
+            {
+                mBlowTrack = 3.0f;
+                Log(Debug::Info) << "RAGDOLL_BLOW_TRACK actor=" << getPtr().getCellRef().getRefId() << " blow dv=" << bodyDv;
             }
             beginStumble(bodyDv);
             mHitStun.begin(impulseMagnitude / std::max(0.1f, hitToughness()), mExperimentalReferenceProfile);
@@ -8793,6 +8903,27 @@
             if (auto* animation = MWBase::Environment::get().getWorld()->getAnimation(getPtr()))
                 animation->clearAnatomicalDamageTints();
         }
+        // K2_WOUND_HEAL (ragdollcore woundheal): the ledger follows the
+        // actor's health. `share` of what is left heals; a region under 0.05
+        // is whole again (and loses its debug tint).
+        RagdollCore::WoundHealState mWoundHeal;
+        void healRegionDamage(float share)
+        {
+            const float keep = 1.0f - std::clamp(share, 0.0f, 1.0f);
+            for (std::size_t index = 0; index < mRegionDamage.size(); ++index)
+            {
+                float& damage = mRegionDamage[index];
+                if (!(damage > 0.0f))
+                    continue;
+                damage *= keep;
+                if (damage >= 0.05f)
+                    continue;
+                damage = 0.0f;
+                if (auto* animation = MWBase::Environment::get().getWorld()->getAnimation(getPtr()))
+                    animation->setAnatomicalDamageTint(
+                        RagdollCore::regionName(static_cast<RagdollCore::AnatomicalRegion>(index)), 0.0f);
+            }
+        }
 
         // Bounded visible recoil: a hit shoves the kinematic root off its
         // animation path so it reads as a flinch or stumble instead of a
@@ -9033,14 +9164,6 @@
             pose.mBodyTransforms[*mTorsoBodyIndex].mRotation
                 = (JPH::Quat::sRotation(axis, angle) * pose.mBodyTransforms[*mTorsoBodyIndex].mRotation).Normalized();
         }
-
-        std::size_t bodyIndexForIdentity(std::uint32_t identity) const
-        {
-            for (std::size_t i = 0; i < mRagdoll->getBodyCount(); ++i)
-                if (mRagdoll->getBodyId(i).GetIndexAndSequenceNumber() == identity)
-                    return i;
-            return mRagdoll->getBodyCount();
-        }
         // Plan item 1.6 diagnostic: heading travel accumulated per fixed step.
         float mRequestHeadingTravel = 0.0f;
         float mCommandHeadingTravel = 0.0f;
@@ -9076,6 +9199,31 @@
             float mMaxForce = 0.0f;
         };
         std::optional<Grab> mGrab;
+        // K2_LODGE (ragdollcore lodge): this weapon in another fighter's body.
+        // Forces only, each step (PhysicsSystem::stepLodges): no joint between
+        // the two bodies, the victim is found again by its serial.
+        struct Lodge
+        {
+            RagdollCore::LodgeKind mKind = RagdollCore::LodgeKind::None;
+            std::uint64_t mVictimSerial = 0;
+            std::size_t mVictimBody = 0;
+            // In the struck body's frame (about its centre of mass): where
+            // the weapon went in, and the way in.
+            JPH::Vec3 mVictimPoint = JPH::Vec3::sZero();
+            JPH::Vec3 mVictimAxis = JPH::Vec3::sAxisX();
+            // In the weapon body's frame: the contact (a chop's pinned point).
+            JPH::Vec3 mWeaponPoint = JPH::Vec3::sZero();
+            float mDepthMax = 0.0f, mHold = 0.0f, mAge = 0.0f, mDepth = 0.0f, mDeepest = 0.0f;
+            // Let go: the weapon only goes through the body until it is out.
+            bool mClearing = false;
+            float mClearAge = 0.0f;
+        };
+        std::optional<Lodge> mLodge;
+        float mLodgeDriveYield = 1.0f; // the weapon drive's share while held (stepLodges)
+        std::uint64_t mLodgeCount = 0;
+        RagdollCore::LodgeKind mLastLodgeKind = RagdollCore::LodgeKind::None;
+        RagdollCore::LodgeRelease mLastLodgeRelease = RagdollCore::LodgeRelease::Held;
+        float mLastLodgeDeepest = 0.0f, mLastLodgeHeld = 0.0f;
         RagdollCore::SkeletonDescriptor mReplayCreationSkeleton;
         RagdollCore::BuildOptions mReplayCreationOptions;
         // BUILD_FRAMES: the skeleton's standing-pose key, and whether the
@@ -9151,6 +9299,13 @@
         {
             return mWeapon && !mWeapon->mAttached && body == mWeapon->mWeaponBody;
         }
+        // The held weapon's or shield's body.
+        bool heldItemBody(std::size_t body) const
+        {
+            return (mWeapon && body == mWeapon->mWeaponBody) || (mShield && body == mShield->mShieldBody);
+        }
+        // Contacts K2_HELD_NOT_GROUND kept out of the ground contacts (under mContactMutex).
+        std::uint64_t mHeldGroundContactsDropped = 0;
         std::size_t mPoseBindingBodyCount = 0;
         RagdollCore::RagdollPose mPreviousPhysicsPose;
         RagdollCore::RagdollPose mCurrentPhysicsPose;
@@ -9216,6 +9371,9 @@
         // and stride must follow where the actor really moves, not the request.
         JPH::Vec3 mKinematicRootActualVelocity = JPH::Vec3::sZero();
         JPH::Vec3 mStopHandoffPending = JPH::Vec3::sZero(); // a stop carry's capsule move, kept out of it
+        JPH::Vec3 mLeashPullPending = JPH::Vec3::sZero(); // the feet leash's pulls, kept out of it (K2_LEASH_GAIT)
+        float mStairTreads = 0.0f; // s: K2_STAIR_STRAFE's stairs, the same
+        float mMoveScale = 1.0f; // the share of its speed the body asks for (World::poweredMoveScale)
         float mStopHandoffAge = 0.0f;
         bool mStopHandingOff = false;
         float mKinematicRootActualVerticalVelocity = 0.0f;
@@ -9231,6 +9389,12 @@
         float mCameraPhysicalBlend = 1.0f;
         std::optional<JPH::RVec3> mSoftRootLastTarget; // balance target of the last step
         JPH::RVec3 mSoftRootPrevTarget = JPH::RVec3::sZero(); // the step before (camera interpolation)
+        // K2_CAMERA_STEADY: the actor positions the last two steps' targets
+        // were built from, and where the actor is drawn this frame.
+        JPH::RVec3 mSoftRootLastActor = JPH::RVec3::sZero();
+        JPH::RVec3 mSoftRootPrevActor = JPH::RVec3::sZero();
+        bool mSoftRootActorKnown = false;
+        std::optional<JPH::RVec3> mRenderActorDrawn;
         JPH::Vec3 mSoftRootKnockback = JPH::Vec3::sZero();
         JPH::Vec3 mStopAbsorb = JPH::Vec3::sZero(); // see OPENMW_RAGDOLL_STOP_ABSORB
         JPH::Vec3 mStopTravelDirection = JPH::Vec3::sZero();
@@ -9289,6 +9453,10 @@
         bool mJumpReleasePending = false;
         // Active body: seconds the body still rides with a jumping capsule.
         float mSoftRootJumpWindow = 0.0f;
+        // Last Footfall eligibility the leg trace logged (RAGDOLL_FOOTFALL_ELIGIBLE).
+        bool mFootfallTracedEligible = true;
+        RagdollCore::ArmStepState mArmStep; // K2_ARM_STEP
+        unsigned mArmStepTraced = 0;
         // Seconds left of a commanded jump's air time (JUMP_KEEPS_TRAVEL).
         float mJumpCommanded = 0.0f;
         // The capsule's launch velocity (world) queued this frame; the body
@@ -9316,11 +9484,6 @@
         unsigned mLedgeDrops = 0;
         float mLandingRootFloor = 0.0f;
         float mLandingTime = 0.0f;
-        // Smoothed grounding correction. Applying the raw per-tick lowest sole
-        // pins whichever foot happens to swing lower and stops it lifting, so
-        // the correction only tracks the slow systematic float.
-        float mKinematicRootSoleCorrection = 0.0f;
-        bool mKinematicRootSoleCorrectionSeeded = false;
         // Stride matching: a slow integral of the planted foot's slip adjusts
         // the played animation speed so the stance foot stays still relative to
         // the ground. 1.0 is the game's own speed scaling.
@@ -9360,6 +9523,264 @@
         // The root yaw actually followed last step (bounded by the profile's
         // yaw rate); empty while physics owns the root.
         std::optional<JPH::Quat> mKinematicRootFollowedRotation;
+
+        // The soft root's strength, horizontal hold and weight support through
+        // ragdollcore rootstrength. The settings are read here; the state is
+        // the entry's own, copied in and out.
+        static RagdollCore::RootStrengthSettings k2RootStrengthSettings()
+        {
+            RagdollCore::RootStrengthSettings s;
+            s.mGetUpStrength = softRootHitSettings().mGetUpStrength;
+            static const auto ramp_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.2f, 1.2f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_GETUP_RAMP"))
+                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                return value;
+            });
+            s.mGetUpRamp = ramp_tuned.get();
+            s.mBudget = pgcKnobs()[0];
+            static const auto budget_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                std::array<float, 3> v{ 0.15f, 0.3f, 0.45f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PGC_BUDGET"))
+                    std::sscanf(text, "%f,%f,%f", &v[0], &v[1], &v[2]);
+                return v;
+            });
+            s.mBudgetShares = budget_tuned.get();
+            static const auto moveVertical_tuned = RagdollCore::tuned<float>(
+                [] { return weaponDriveSetting("OPENMW_RAGDOLL_PGC_MOVE_VERTICAL", 180.0f); });
+            s.mMoveVertical = moveVertical_tuned.get();
+            static const auto climbHold_tuned = RagdollCore::tuned<float>(
+                [] { return weaponDriveSetting("OPENMW_RAGDOLL_PGC_CLIMB_HOLD", 100.0f); });
+            s.mClimbHold = climbHold_tuned.get();
+            static const auto tiltHold_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                std::array<float, 3> value{ 7.0f, 15.0f, 0.5f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PGC_TILT_HOLD"))
+                    std::sscanf(text, "%f,%f,%f", &value[0], &value[1], &value[2]);
+                return value;
+            });
+            const auto& tilt = tiltHold_tuned.get();
+            s.mTiltHold = { tilt[0], tilt[1], tilt[2] };
+            static const auto catchHold_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CATCH_HOLD");
+                return text ? std::clamp(static_cast<float>(std::atof(text)), 0.0f, 1.0f) : 1.0f;
+            });
+            s.mCatchHold = catchHold_tuned.get();
+            static const auto landingHold_tuned = RagdollCore::tuned<float>(
+                [] { return std::clamp(weaponDriveSetting("OPENMW_RAGDOLL_LANDING_HOLD", 1.0f), 0.0f, 1.0f); });
+            s.mLandingHold = landingHold_tuned.get();
+            s.mLegsLeadShare = legsLeadSettings()[1];
+            s.mRollStrength = dropRollSettings().mStrength;
+            s.mSagHold = { unevenSettings()[4], unevenSettings()[5] };
+            static const auto calm_tuned = RagdollCore::tuned([] { return RagdollCore::calmHoldSettings().mStrength; });
+            s.mCalmStrength = calm_tuned.get();
+            return s;
+        }
+        static RagdollCore::RootSupportSettings k2RootSupportSettings()
+        {
+            RagdollCore::RootSupportSettings s;
+            static const auto airFade_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_SOFT_ROOT_AIRFADE");
+                return text != nullptr && std::atoi(text) != 0;
+            });
+            s.mAirFade = airFade_tuned.get();
+            static const auto limp_tuned = RagdollCore::tuned<float>(
+                [] { return weaponDriveSetting("OPENMW_RAGDOLL_ROOT_BUDGET_LIMP", 0.0f); });
+            s.mLimpBudget = limp_tuned.get();
+            static const auto walk_tuned = RagdollCore::tuned<float>([] {
+                return std::clamp(weaponDriveSetting("OPENMW_RAGDOLL_ROOT_WALK_SUPPORT", 1.0f), 0.0f, 1.0f);
+            });
+            s.mWalkSupport = walk_tuned.get();
+            s.mRollSupport = dropRollSettings().mSupport;
+            return s;
+        }
+        RagdollCore::RootRollPhase rootRollPhase() const
+        {
+            switch (mRollPhase)
+            {
+                case RollPhase::Absorb:
+                    return RagdollCore::RootRollPhase::Absorb;
+                case RollPhase::Roll:
+                    return RagdollCore::RootRollPhase::Roll;
+                case RollPhase::Rise:
+                    return RagdollCore::RootRollPhase::Rise;
+                default:
+                    return RagdollCore::RootRollPhase::None;
+            }
+        }
+        RagdollCore::RootStrengthState rootStrengthState() const
+        {
+            RagdollCore::RootStrengthState s;
+            s.mGetUpElapsed = mGetUpElapsed;
+            s.mReholdElapsed = mSoftRootReholdElapsed;
+            s.mHorizontalBudget = mPgcHorizontalBudget;
+            s.mTilt.mTiltTime = mPgcTiltTime;
+            s.mTilt.mUprightTime = mPgcUprightTime;
+            s.mTilt.mShare = mPgcTiltShare;
+            s.mTilt.mHolding = mPgcTiltHolding;
+            return s;
+        }
+        void storeRootStrengthState(const RagdollCore::RootStrengthState& s)
+        {
+            mGetUpElapsed = s.mGetUpElapsed;
+            mSoftRootReholdElapsed = s.mReholdElapsed;
+            mPgcHorizontalBudget = s.mHorizontalBudget;
+            mPgcTiltTime = s.mTilt.mTiltTime;
+            mPgcUprightTime = s.mTilt.mUprightTime;
+            mPgcTiltShare = s.mTilt.mShare;
+            mPgcTiltHolding = s.mTilt.mHolding;
+        }
+        RagdollCore::RootStrengthInput rootStrengthInput(bool recoveryOwns, float bodySpeed) const
+        {
+            RagdollCore::RootStrengthInput in;
+            in.mHitStrength = mSoftRootStrength;
+            in.mRecoveryOwns = recoveryOwns;
+            in.mRequestSpeed = pgcRequestSpeed();
+            in.mBodySpeed = bodySpeed;
+            in.mLandingFloor = mLandingRootFloor;
+            in.mAirborne = mJumpAirborne;
+            in.mVerticalVelocity = mKinematicRootActualVerticalVelocity;
+            in.mTilt.mKnown = mControllerInput.has_value();
+            in.mTilt.mTorsoUpDot = mControllerInput ? mControllerInput->mTorsoUpDot : 1.0f;
+            in.mTilt.mHit = mHitStun.active() || mScopedEpisode;
+            in.mTilt.mBodySpeed = bodySpeed;
+            in.mTilt.mRequestSpeed = in.mRequestSpeed;
+            in.mCatchRecovering = mCatchRecovering;
+            in.mLanding = mLandingTime > 0.0f;
+            in.mStumble = bearingsStumble();
+            in.mLegsLeading = mLegsLeading;
+            in.mUneven = groundUneven();
+            in.mSag = mPelvisSag;
+            in.mCalm = mCalm.mLevel;
+            in.mRoll = rootRollPhase();
+            in.mRollPhaseTime = mRollPhaseTime;
+            return in;
+        }
+        RagdollCore::RootSupportInput rootSupportInput() const
+        {
+            RagdollCore::RootSupportInput in;
+            in.mGroundContact = mSupportEstimate && mSupportEstimate->hasGroundContact();
+            in.mFootfall = footfallEnabled();
+            in.mPinned = { footfallPinnedAt(0), footfallPinnedAt(1) };
+            in.mWound = { limbWound(true, false), limbWound(false, false) };
+            in.mRequestSpeed = pgcRequestSpeed();
+            in.mAirborne = mJumpAirborne;
+            in.mUneven = unevenSettings()[2] > 0.0f && groundUneven();
+            in.mCalm = mCalm.mLevel;
+            in.mRoll = rootRollPhase();
+            in.mRollPhaseTime = mRollPhaseTime;
+            return in;
+        }
+        // OPENMW_RAGDOLL_K2_ROOT_TRACE: the player's terms every 0.5 s.
+        void traceRootStrength(const RagdollCore::RootStrength& r)
+        {
+            static const auto trace_tuned = RagdollCore::tuned<bool>(
+                [] { return RagdollCore::tuningText("OPENMW_RAGDOLL_K2_ROOT_TRACE") != nullptr; });
+            if (!trace_tuned.get() || getPtr() != MWMechanics::getPlayer() || (mFixedSteps % 30) != 0)
+                return;
+            Log(Debug::Info) << "RAGDOLL_K2_ROOT strength=" << r.mStrength << " held=" << r.mHeld
+                             << " getup_ramp=" << r.mGetUpRamp << " rehold_ramp=" << r.mReholdRamp
+                             << " budgeted=" << r.mBudgeted << " moving_vertical=" << r.mMovingVertical
+                             << " climbing=" << r.mClimbing << " tilt=" << r.mTiltShare
+                             << " horizontal=" << r.mHorizontal << " budget=" << r.mHorizontalBudget
+                             << " hold=" << r.mHorizontalHold;
+        }
+
+        // The soft root's topple, rehold and retake through ragdollcore
+        // roothold, on the entry's own members copied in and out.
+        static RagdollCore::RootHoldSettings k2RootHoldSettings()
+        {
+            RagdollCore::RootHoldSettings s;
+            static const auto brace_tuned = RagdollCore::tuned<float>(
+                [] { return weaponDriveSetting("OPENMW_RAGDOLL_BRACE_REACQUIRE", 1.0f); });
+            s.mBraceReacquire = brace_tuned.get();
+            static const auto landing_tuned = RagdollCore::tuned<bool>(
+                [] { return weaponDriveSetting("OPENMW_RAGDOLL_GETUP_ENDS_LANDING", 1.0f) > 0.0f; });
+            s.mGetUpEndsLanding = landing_tuned.get();
+            s.mToppleUpDot = softRootHitSettings().mToppleUpDot;
+            static const auto rising_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_TOPPLE_RISING");
+                return text ? std::atoi(text) != 0 : true;
+            });
+            s.mToppleRising = rising_tuned.get();
+            static const auto rehold_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.7f, 0.5f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_TOPPLE_REHOLD"))
+                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                return value;
+            });
+            s.mRehold = rehold_tuned.get();
+            return s;
+        }
+        RagdollCore::RootHoldState rootHoldState() const
+        {
+            RagdollCore::RootHoldState s;
+            s.mReacquireTimer = mKinematicRootReacquireTimer;
+            s.mBracedTime = mKinematicRootBracedTime;
+            s.mReheld = mSoftRootReheld;
+            s.mLandingReleased = mKinematicRootLandingReleased;
+            s.mPhysicsOwned = mKinematicRootPhysicsOwned;
+            s.mToppleTime = mSoftRootToppleTime;
+            s.mToppleLastUp = mSoftRootToppleLastUp;
+            s.mTippedFor = mSoftRootTippedFor;
+            s.mToppled = mSoftRootToppled;
+            s.mToppledStandTime = mSoftRootToppledStandTime;
+            s.mFallDecidedTime = mFallDecidedTime;
+            return s;
+        }
+        void storeRootHoldState(const RagdollCore::RootHoldState& s)
+        {
+            mKinematicRootReacquireTimer = s.mReacquireTimer;
+            mKinematicRootBracedTime = s.mBracedTime;
+            mSoftRootReheld = s.mReheld;
+            mKinematicRootLandingReleased = s.mLandingReleased;
+            mKinematicRootPhysicsOwned = s.mPhysicsOwned;
+            mSoftRootToppleTime = s.mToppleTime;
+            mSoftRootToppleLastUp = s.mToppleLastUp;
+            mSoftRootTippedFor = s.mTippedFor;
+            mSoftRootToppled = s.mToppled;
+            mSoftRootToppledStandTime = s.mToppledStandTime;
+            mFallDecidedTime = s.mFallDecidedTime;
+        }
+        RagdollCore::RootHoldInput rootHoldInput() const
+        {
+            RagdollCore::RootHoldInput in;
+            if (mControllerOutput)
+                in.mMode = mControllerOutput->mMode;
+            in.mKnown = mControllerInput.has_value();
+            in.mTorsoUpDot = mControllerInput ? mControllerInput->mTorsoUpDot : 1.0f;
+            in.mCenterOfMassSpeed = mControllerInput ? mControllerInput->mCenterOfMassVelocity.Length() : 0.0f;
+            in.mRootKinematic = mRagdoll && mRagdoll->isRootKinematic();
+            in.mRollOwns = rollOwnsBody();
+            return in;
+        }
+
+        // The upright holder through ragdollcore uprightholder - the
+        // controller's input, and (physicssystem.cpp) what of its output
+        // reaches the body.
+        static bool k2SoftRootUnweight()
+        {
+            static const auto value_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_SOFT_ROOT_UNWEIGHT");
+                return text && std::atoi(text) != 0;
+            });
+            return value_tuned.get();
+        }
+        static bool k2HeldSpineFollow()
+        {
+            static const auto value_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HELD_SPINE_FOLLOW");
+                return text && std::atoi(text) != 0;
+            });
+            return value_tuned.get();
+        }
+        static float k2HeldSpineUpright()
+        {
+            static const auto value_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HELD_SPINE_UPRIGHT");
+                return text ? static_cast<float>(std::atof(text)) : 1.0f;
+            });
+            return value_tuned.get();
+        }
 
         // PLAY-01 architecture base. While the kinematic route owns a driven
         // body, the root follows the game actor exactly; every other body
@@ -9406,6 +9827,11 @@
             }
             const JPH::RVec3 actorPosition = Misc::Convert::toJolt<JPH::RVec3>(
                 getPtr().getRefData().getPosition().asVec3());
+            // K2_CAMERA_STEADY: this step's and the last step's (the root
+            // target below is built from it).
+            mSoftRootPrevActor = mSoftRootActorKnown ? mSoftRootLastActor : actorPosition;
+            mSoftRootLastActor = actorPosition;
+            mSoftRootActorKnown = true;
             // Smoothed actual actor velocity: the engine integrates the actor
             // movement, so these deltas are ground truth for the clip speed.
             if (mKinematicRootHasLastPosition && duration > 0.0f)
@@ -9435,12 +9861,16 @@
                         mStopHandoffAge = 0.0f;
                     }
                 }
+                // K2_LEASH_GAIT: nor is the feet leash's pull (the capsule
+                // waiting for the feet must not stop them).
+                raw -= JPH::Vec3(mLeashPullPending.GetX(), mLeashPullPending.GetY(), 0.0f);
                 raw /= duration;
                 mKinematicRootActualVelocity
                     = mKinematicRootActualVelocity * 0.65f + raw * 0.35f;
             }
             mKinematicRootHasLastPosition = true;
             mKinematicRootLastActorPosition = actorPosition;
+            mLeashPullPending = JPH::Vec3::sZero();
             // Hard-landing release: track the actor's vertical speed. A landing
             // above the registered threshold hands the root to the passive
             // ragdoll so the impact and recovery are physical; softer landings
@@ -9516,63 +9946,18 @@
             // physics owned the body also needs a short settled-standing
             // confirmation, otherwise the body is snapped back mid-recovery
             // (the "levitating in ragdoll mode" lock after repeated hits).
-            const bool drivenMode = mControllerOutput
-                && (mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Standing
-                    || mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Bracing
-                    || mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Stumbling
-                    || mControllerOutput->mMode == RagdollCore::ActiveControllerMode::GettingUp
-                    || mControllerOutput->mMode == RagdollCore::ActiveControllerMode::BlendBack);
-            const bool standingSlow = mControllerOutput
-                && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Standing
-                && mControllerInput
-                && mControllerInput->mCenterOfMassVelocity.Length() < 30.0f;
-            if (standingSlow)
-                mKinematicRootReacquireTimer += duration;
-            else
-                mKinematicRootReacquireTimer = 0.0f;
-            // An upright, slow Bracing body takes the root back too (user
-            // bookmark 2026-10-31 hub session, "NPC stuck in recovery": a
-            // longsword duellist toppled, caught itself and was reheld, then
-            // braced in place for 17 s while its duel AI chased and gave up -
-            // only Standing re-took a released root, and a body on its own
-            // legs without the root reads Bracing 40-65% of the time, so it
-            // never stood up enough to be walked again). A topple rehold
-            // takes it back at once (mSoftRootReheld).
-            // OPENMW_RAGDOLL_BRACE_REACQUIRE = seconds upright and slow in
-            // Bracing (0 = off, the rehold too).
-            static const auto braceReacquire_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_BRACE_REACQUIRE", 1.0f); });
-            static const auto& braceReacquire = braceReacquire_tuned.get();
-            const bool bracedUpright = braceReacquire > 0.0f && mKinematicRootPhysicsOwned && mControllerOutput
-                && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Bracing && mControllerInput
-                && mControllerInput->mTorsoUpDot > 0.85f && mControllerInput->mCenterOfMassVelocity.Length() < 60.0f;
-            mKinematicRootBracedTime = bracedUpright ? mKinematicRootBracedTime + duration : 0.0f;
-            const bool bracedReacquire = braceReacquire > 0.0f && mKinematicRootBracedTime >= braceReacquire;
-            const bool reacquired = mKinematicRootReacquireTimer >= 0.25f || bracedReacquire
-                || (braceReacquire > 0.0f && mSoftRootReheld);
-            if (reacquired && mKinematicRootPhysicsOwned && (bracedReacquire || mSoftRootReheld)
-                && !mKinematicRootLandingReleased && !mSoftRootToppled)
+            // The retake decision (ragdollcore roothold).
+            RagdollCore::RootHoldState hold = rootHoldState();
+            const RagdollCore::RootRetake retake
+                = RagdollCore::judgeRootRetake(rootHoldInput(), k2RootHoldSettings(), hold, duration);
+            const bool drivenMode = retake.mDriven;
+            const bool recoveryOwns = retake.mRecoveryOwns;
+            const bool reacquired = retake.mReacquired;
+            if (retake.mBraceOrRehold)
                 Log(Debug::Info) << "RAGDOLL_BRACE_REACQUIRE actor=" << getPtr().getCellRef().getRefId()
-                                 << " cause=" << (mSoftRootReheld ? "rehold" : "braced")
-                                 << " braced=" << mKinematicRootBracedTime;
-            mSoftRootReheld = false;
-            // Recovery re-takes the root without the settled-standing
-            // confirmation: the get-up clip is the only thing that raises the
-            // body, and it must own the root from its first frame. A hard
-            // landing's release flag does not block it either - the physical
-            // fall is over once getting-up starts.
-            const bool recoveryOwns = mControllerOutput
-                && (mControllerOutput->mMode == RagdollCore::ActiveControllerMode::GettingUp
-                    || mControllerOutput->mMode == RagdollCore::ActiveControllerMode::BlendBack);
-            // A get-up ends the hard landing that released the root. The flag
-            // cleared only Standing below 30 u/s, and the get-up crawl keeps a
-            // player holding a direction at ~34 u/s, so the first Standing step
-            // released the root again: braced in place for 6.4 s until the keys
-            // were let go (user bookmark 12, 2026-10-01).
-            // OPENMW_RAGDOLL_GETUP_ENDS_LANDING=0 = old.
-            static const auto getUpEndsLanding_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_GETUP_ENDS_LANDING", 1.0f) > 0.0f; });
-            static const auto& getUpEndsLanding = getUpEndsLanding_tuned.get();
-            if (recoveryOwns && getUpEndsLanding)
-                mKinematicRootLandingReleased = false;
+                                 << " cause=" << (retake.mByRehold ? "rehold" : "braced")
+                                 << " braced=" << hold.mBracedTime;
+            storeRootHoldState(hold);
             // A hit keeps the root animation-owned: the feet keep adjusting
             // and PGC decides a fall (no hit band releases the root).
             const bool holdsRoot = mHitStun.active();
@@ -9588,10 +9973,8 @@
                 // OPENMW_RAGDOLL_HIT_RECOVERY_SKILL = share lost at no control.
                 static const auto recoverySkill_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HIT_RECOVERY_SKILL", 0.4f); });
                 static const auto& recoverySkill = recoverySkill_tuned.get();
-                const float recoveryScale
-                    = 1.0f - std::clamp(recoverySkill, 0.0f, 0.9f) * (1.0f - std::clamp(mWeaponControl, 0.2f, 1.0f)) / 0.8f;
-                mSoftRootStrength
-                    = std::min(1.0f, mSoftRootStrength + hit.mHitRecoveryPerSecond * recoveryScale * duration);
+                mSoftRootStrength = RagdollCore::recoverRootStrength(
+                    mSoftRootStrength, hit.mHitRecoveryPerSecond, mWeaponControl, recoverySkill, duration);
                 stepDaze(duration);
                 mSoftRootStumbleTime = std::max(0.0f, mSoftRootStumbleTime - duration);
                 static const auto cameraAnchor_tuned = RagdollCore::tuned<bool>([] {
@@ -9602,69 +9985,9 @@
                 const bool onFeet = cameraAnchor && mRagdoll->isRootKinematic() && !mSoftRootToppled;
                 mCameraPhysicalBlend = std::clamp(
                     mCameraPhysicalBlend + (onFeet ? -1.0f : 1.0f) * duration / 0.3f, 0.0f, 1.0f);
-                // Getting up is driven gently: full strength hauls a lying
-                // body up hard enough to stretch its joints.
-                // Getting up, the root spring grows from a fraction: at full
-                // strength from the clip's first frame it yanked the lying
-                // body to the clip's pose - thrown off the floor and flipped
-                // over (look knockdown 2026-09-26: both feet off, pelvis
-                // up-dot +0.4 -> -0.25 -> +0.5 in 0.4 s). The Mixamo get-ups
-                // rise over 1-3 s. OPENMW_RAGDOLL_GETUP_RAMP = start share,
-                // seconds to full.
-                static const auto getUpRamp_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                    std::array<float, 2> value{ 0.2f, 1.2f };
-                    if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_GETUP_RAMP"))
-                        std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                    return value;
-                });
-                static const auto& getUpRamp = getUpRamp_tuned.get();
-                mGetUpElapsed = recoveryOwns ? mGetUpElapsed + duration : 0.0f;
-                const float ramp = getUpRamp[1] > 0.0f
-                    ? getUpRamp[0] + (1.0f - getUpRamp[0]) * std::clamp(mGetUpElapsed / getUpRamp[1], 0.0f, 1.0f)
-                    : 1.0f;
-                mSoftRootReholdElapsed += duration;
-                const float reholdRamp = getUpRamp[1] > 0.0f
-                    ? getUpRamp[0] + (1.0f - getUpRamp[0]) * std::clamp(mSoftRootReholdElapsed / getUpRamp[1], 0.0f, 1.0f)
-                    : 1.0f;
-                // PGC root budget (knob A). The body's own speed counts as
-                // moving too: a body still running after the keys are released
-                // must brake on the moving budget, not the standing 0.15 (PGC
-                // session f3c5ed851e: offline every stop from a run fell).
-                // OPENMW_RAGDOLL_PGC_MOVE_VERTICAL=speed: above this speed
-                // (requested or the body's) the budget weakens only the root's
-                // horizontal pull; the weight support and vertical spring stay
-                // whole (user 2026-09-30: unarmed running "choppy" with PGC; the
-                // running torso sank 8.5 units, chest spun 30% faster). From 0
-                // it also broke walking step timing (stepT 28-41, bar 28), so
-                // only running (walk ~127 u/s, run ~227). 0 = off. Default 180:
-                // fists course x2, run sink -8.2 -> -3.5, chest spin 87 -> 69
-                // deg/s, pelvis 105 -> 76 (old controller -2.6, 70, 75).
-                const float held = std::min(mSoftRootStrength, reholdRamp);
                 const float bodySpeed = mControllerInput
                     ? std::hypot(mControllerInput->mCenterOfMassVelocity.GetX(), mControllerInput->mCenterOfMassVelocity.GetY())
                     : 0.0f;
-                static const auto moveVertical_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_PGC_MOVE_VERTICAL", 180.0f); });
-                static const auto& moveVertical = moveVertical_tuned.get();
-                RagdollCore::RootBudgetInput budget{ held, pgcRequestSpeed(), bodySpeed, {} };
-                // OPENMW_RAGDOLL_PGC_BUDGET = "standing, moving, braking" root
-                // budget. Braking (the body 20+ u/s faster than its request: a
-                // stop, a reversal) holds harder (user 10-30: "less drifting",
-                // "change direction faster"): at 0.15/0.3 a run's stop overshot
-                // the capsule 15-19 units and rested 8-12 off it. A firmer moving
-                // budget everywhere (0.45) halved that but leaned the hill
-                // course's end 11 -> 16 deg (2 of 2), so only braking takes it.
-                static const auto budgetSetting_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
-                    std::array<float, 3> v{ 0.15f, 0.3f, 0.45f };
-                    if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PGC_BUDGET"))
-                        std::sscanf(text, "%f,%f,%f", &v[0], &v[1], &v[2]);
-                    return v;
-                });
-                const auto& budgetSetting = budgetSetting_tuned.get();
-                const bool braking = bodySpeed > pgcRequestSpeed() + 20.0f;
-                budget.mSettings.mStanding = std::clamp(budgetSetting[0], 0.0f, 1.0f);
-                budget.mSettings.mMoving = std::clamp(braking ? budgetSetting[2] : budgetSetting[1], 0.0f, 1.0f);
-                mPgcHorizontalBudget = 1.0f;
-                float strength = held;
                 mPgcSinceRecovery = recoveryOwns ? 0.0f : mPgcSinceRecovery + duration;
                 {
                     // A fall soon after a get-up (bookmark 10: "NPCs ... stumble
@@ -9672,113 +9995,25 @@
                     const bool falling = mControllerOutput
                         && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Falling;
                     if (falling && !mWasFallingForRefall && mPgcSinceRecovery < 3.0f && mHadRecovery)
+                    {
                         Log(Debug::Info) << "RAGDOLL_REFALL actor=" << getPtr().getCellRef().getRefId()
                                          << " since_getup=" << mPgcSinceRecovery;
+                        // K2_NPC_REFALL: the population reads these.
+                        mRefallSteps.push_back(mFixedSteps);
+                        if (mRefallSteps.size() > 8)
+                            mRefallSteps.erase(mRefallSteps.begin());
+                    }
                     if (recoveryOwns)
                         mHadRecovery = true;
                     mWasFallingForRefall = falling;
                 }
-                if (pgcKnobs()[0] && !recoveryOwns)
-                {
-                    if (moveVertical > 0.0f && std::max(pgcRequestSpeed(), bodySpeed) > moveVertical)
-                        mPgcHorizontalBudget = budget.mSettings.mMoving;
-                    else
-                        strength = RagdollCore::rootBudgetStrength(budget);
-                    strength = std::max(strength, std::min(held, mLandingRootFloor));
-                    // Climbing (user bookmark 9, stairs drag; STAIRS-01: the
-                    // pelvis left 50-80 units under a capsule rising up the
-                    // steps): while the capsule climbs faster than this, the
-                    // root keeps its whole strength. OPENMW_RAGDOLL_PGC_CLIMB_HOLD
-                    // = upward u/s (0 = off). 100: STAIRS-01 x2 lag p90 78-81 ->
-                    // 24-46, no climb falls; 40 hurt the course run, 150 weaker.
-                    static const auto climbHold_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_PGC_CLIMB_HOLD", 100.0f); });
-                    static const auto& climbHold = climbHold_tuned.get();
-                    if (climbHold > 0.0f && !mJumpAirborne && mKinematicRootActualVerticalVelocity > climbHold)
-                    {
-                        strength = held;
-                        mPgcHorizontalBudget = 1.0f;
-                    }
-                    if (mLandingRootFloor > 0.0f)
-                        mPgcHorizontalBudget = std::max(mPgcHorizontalBudget, mLandingRootFloor);
-                    // Tilt hold (user bookmark 16, 2026-10-06: "stuck leaning";
-                    // DROP-01: an armed body stopped from a run stood 17-20 deg
-                    // off upright for 7+ s while the unarmed one stood at 1; the
-                    // sentinel's armed "end lean" fails, 15-22 deg). Standing
-                    // still, the 0.15 budget cannot right a body a heavy weapon
-                    // pulls forward. Slow (both speeds under 25 u/s), no hit being
-                    // recovered from, and the torso past `from` deg for `after`
-                    // s: the strength grows toward the held strength by `full`
-                    // deg, eased in and out over 0.4 s. A push's recovery keeps
-                    // the budget (it moves fast or is in a hit episode).
-                    // OPENMW_RAGDOLL_PGC_TILT_HOLD = "from, full, after" (0 = off).
-                    static const auto tiltHold_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
-                        std::array<float, 3> value{ 7.0f, 15.0f, 0.5f };
-                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_PGC_TILT_HOLD"))
-                            std::sscanf(text, "%f,%f,%f", &value[0], &value[1], &value[2]);
-                        return value;
-                    });
-                    static const auto& tiltHold = tiltHold_tuned.get();
-                    float tiltWant = 0.0f;
-                    if (tiltHold[0] > 0.0f && mControllerInput && !mHitStun.active() && !mScopedEpisode
-                        && bodySpeed < 25.0f && pgcRequestSpeed() < 25.0f)
-                    {
-                        const float tilt = osg::RadiansToDegrees(std::acos(std::clamp(mControllerInput->mTorsoUpDot, -1.0f, 1.0f)));
-                        // Engaged, it holds until the torso has been within
-                        // `from` - 3 deg for 0.5 s (letting go at `from` the body
-                        // sagged straight back: it swung 7-15 deg).
-                        if (!mPgcTiltHolding)
-                        {
-                            mPgcTiltTime = tilt > tiltHold[0] ? mPgcTiltTime + duration : 0.0f;
-                            mPgcTiltHolding = mPgcTiltTime >= tiltHold[2];
-                            mPgcUprightTime = 0.0f;
-                        }
-                        else
-                        {
-                            mPgcUprightTime = tilt < tiltHold[0] - 3.0f ? mPgcUprightTime + duration : 0.0f;
-                            if (mPgcUprightTime >= 0.5f)
-                                mPgcTiltHolding = false, mPgcTiltTime = 0.0f;
-                        }
-                        if (mPgcTiltHolding)
-                            tiltWant = std::max(0.5f, std::clamp((tilt - tiltHold[0]) / std::max(1.0f, tiltHold[1] - tiltHold[0]), 0.0f, 1.0f));
-                    }
-                    else
-                    {
-                        mPgcTiltTime = 0.0f;
-                        mPgcTiltHolding = false;
-                        // A hit lets go at once: a push meets the standing budget.
-                        if (mHitStun.active() || mScopedEpisode)
-                            mPgcTiltShare = 0.0f;
-                    }
-                    // Released slowly once upright again: dropping at once let it
-                    // sag back.
-                    mPgcTiltShare += std::clamp(tiltWant - mPgcTiltShare, -duration / 0.4f, duration / 0.4f);
-                    {
-                        static const auto tiltTrace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_TILT_TRACE") != nullptr; });
-                        static const auto& tiltTrace = tiltTrace_tuned.get();
-                        static unsigned tiltRows = 0;
-                        if (tiltTrace && getPtr() == MWMechanics::getPlayer() && (++tiltRows % 30) == 0 && mControllerInput)
-                            Log(Debug::Info) << "RAGDOLL_TILT_HOLD up=" << mControllerInput->mTorsoUpDot << " pelvisUp="
-                                             << mControllerInput->mPelvisUpDot << " body=" << bodySpeed << " req="
-                                             << pgcRequestSpeed() << " stun=" << mHitStun.active() << " scoped=" << mScopedEpisode
-                                             << " t=" << mPgcTiltTime << " share=" << mPgcTiltShare << " strength=" << strength
-                                             << " held=" << held << " kin=" << (mRagdoll->isRootKinematic() ? 1 : 0);
-                    }
-                    if (mPgcTiltShare > 0.0f)
-                    {
-                        strength = std::max(strength, strength + (held - strength) * mPgcTiltShare);
-                        mPgcHorizontalBudget = std::max(mPgcHorizontalBudget, mPgcTiltShare);
-                    }
-                }
-                float rootStrength = recoveryOwns ? std::min(mSoftRootStrength, hit.mGetUpStrength * ramp) : strength;
-                // The drop roll: the root's authority is its strength.
-                if (rollOwnsBody())
-                {
-                    const float roll = dropRollSettings().mStrength;
-                    const float k = std::clamp(mRollPhaseTime / (mRollPhase == RollPhase::Rise ? 0.4f : 0.12f), 0.0f, 1.0f);
-                    rootStrength = mRollPhase == RollPhase::Absorb ? rootStrength + (roll - rootStrength) * k
-                        : mRollPhase == RollPhase::Roll           ? roll
-                                                                   : roll + (rootStrength - roll) * k * k * (3.0f - 2.0f * k);
-                }
+                updateCalm(recoveryOwns, duration);
+                // The root's strength and horizontal hold (ragdollcore rootstrength).
+                RagdollCore::RootStrengthState rootState = rootStrengthState();
+                const RagdollCore::RootStrength root = RagdollCore::updateRootStrength(
+                    rootStrengthInput(recoveryOwns, bodySpeed), k2RootStrengthSettings(), rootState, duration);
+                storeRootStrengthState(rootState);
+                const float rootStrength = root.mStrength;
                 mRollLastStrength = rootStrength;
                 // STEP-01 S5 trace: what holds a body up after a decided fall.
                 static const auto s5Trace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_STEP01_TRACE") != nullptr; });
@@ -9801,43 +10036,18 @@
                     }
                 }
                 mRagdoll->setSoftRootStrength(rootStrength);
-                // Catch steps carry the push (roadmap step 3, a weaker helper):
-                // while a catch runs, the helper's horizontal hold drops to this
-                // share; weight and tilt stay. OPENMW_RAGDOLL_CATCH_HOLD (1 = off).
-                static const auto catchHold_tuned = RagdollCore::tuned<float>([] {
-                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CATCH_HOLD");
-                    return text ? std::clamp(static_cast<float>(std::atof(text)), 0.0f, 1.0f) : 1.0f;
-                });
-                static const auto& catchHold = catchHold_tuned.get();
-                // Landing release (alpha 0.5, JUMP-01): for a moment after a jump
-                // lands, the root drags the pelvis less along the floor. The
-                // capsule comes down at running speed and slows over half a
-                // second; the saturated root pulled the pelvis over the planted
-                // feet and the body pitched forward and fell.
-                // OPENMW_RAGDOLL_LANDING_HOLD = horizontal scale (1 = off).
-                static const auto landingHold_tuned = RagdollCore::tuned<float>([] { return std::clamp(weaponDriveSetting("OPENMW_RAGDOLL_LANDING_HOLD", 1.0f), 0.0f, 1.0f); });
-                static const auto& landingHold = landingHold_tuned.get();
-                float horizontal = mCatchRecovering && !recoveryOwns ? catchHold : 1.0f;
-                if (mLandingTime > 0.0f)
-                    horizontal = std::min(horizontal, landingHold);
-                // Getting the bearings back (PGC_FALLS): the helper holds less
-                // sideways, so the blow's push carries the body and the catch
-                // steps it - a stagger of real steps, by how long the bearings
-                // window (fatigue, health, severity) still runs.
-                if (const float stumble = bearingsStumble(); stumble > 0.0f)
-                    horizontal = std::min(horizontal, 1.0f - stumble);
-                float rootHorizontal = std::min(horizontal, mPgcHorizontalBudget);
-                // LEGS_LEAD: the legs carry the body; the root only steadies it.
-                if (mLegsLeading)
-                    rootHorizontal = std::min(rootHorizontal, std::max(0.0f, legsLeadSettings()[1]));
-                if (rollOwnsBody())
-                {
-                    const float k = std::clamp(mRollPhaseTime / 0.4f, 0.0f, 1.0f);
-                    rootHorizontal = mRollPhase == RollPhase::Absorb ? 0.3f
-                        : mRollPhase == RollPhase::Roll             ? 0.0f
-                                                                     : k * k * (3.0f - 2.0f * k);
-                }
+                const float rootHorizontal = root.mHorizontal;
+                traceRootStrength(root);
                 mRagdoll->setSoftRootHorizontalScale(rootHorizontal);
+                // K2_ROOT_FIELD (roottarget.hpp): at a run the root's pull acts
+                // on the whole body by mass, not on the hips.
+                {
+                    static const auto field_tuned
+                        = RagdollCore::tuned([] { return RagdollCore::rootFieldSettings(); });
+                    const float asked
+                        = std::hypot(mRawTargetHorizontalVelocity.GetX(), mRawTargetHorizontalVelocity.GetY());
+                    mRagdoll->setSoftRootFieldShare(RagdollCore::rootFieldShare(field_tuned.get(), asked));
+                }
                 // The stiff pelvis anchor (60 Hz, for the running torso) snapped
                 // the lying pelvis to the get-up clip: legs flung up and the body
                 // flipped at the start (look knockdown 2026-09-28); at 25 Hz it
@@ -9849,70 +10059,21 @@
                 });
                 static const auto& getUpAnchor = getUpAnchor_tuned.get();
                 mRagdoll->setSoftAnchorFrequencyCap(recoveryOwns ? getUpAnchor : 0.0f);
-                const bool tipped = mRagdoll->isRootKinematic() && mControllerInput
-                    && mControllerInput->mTorsoUpDot < hit.mToppleUpDot && !rollOwnsBody();
-                // The tilt counts only while the torso still tips further
-                // (ToppleJudge mRising, PGC offline: falls 93 -> 44 of 224
-                // near the catch limit, the rescues 3-4 step staggers ending
-                // upright): a body leaning past the line but coming back up
-                // is staggering, not falling. On;
-                // OPENMW_RAGDOLL_TOPPLE_RISING = 0 turns it off.
-                static const auto toppleRising_tuned = RagdollCore::tuned<bool>([] {
-                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_TOPPLE_RISING");
-                    return text ? std::atoi(text) != 0 : true;
-                });
-                static const auto& toppleRising = toppleRising_tuned.get();
-                const float upNow = mControllerInput ? mControllerInput->mTorsoUpDot : 1.0f;
-                const bool stillTipping = !toppleRising || upNow <= mSoftRootToppleLastUp + 1e-4f;
-                mSoftRootToppleLastUp = upNow;
-                mFallDecidedTime += duration;
-                mSoftRootToppleTime = tipped ? mSoftRootToppleTime + (stillTipping ? duration : 0.0f) : 0.0f;
-                // A lean past the line that rises too slowly to matter still
-                // falls after 1 s (review 10-08: no stuck lean).
-                mSoftRootTippedFor = tipped ? mSoftRootTippedFor + duration : 0.0f;
-                if (mSoftRootTippedFor >= 1.0f)
-                    mSoftRootToppleTime = std::max(mSoftRootToppleTime, 0.15f);
-                if (mSoftRootToppleTime >= 0.15f && !mSoftRootToppled && !recoveryOwns)
                 {
-                    mSoftRootToppled = true;
-                    Log(Debug::Info) << "RAGDOLL_TOPPLE actor=" << getPtr().getCellRef().getRefId() << " mode="
-                                     << (mControllerOutput ? static_cast<int>(mControllerOutput->mMode) : -1)
-                                     << " up=" << mControllerInput->mTorsoUpDot;
-                }
-                if (recoveryOwns)
-                    mSoftRootToppled = false;
-                // A toppled body that never falls: released while its legs
-                // keep it up, the controller still standing, it stayed leaned
-                // until it happened to fall for real (play test 2026-09-28,
-                // "stuck in smooth criminal lean": 51 deg, then 29 deg for 5 s,
-                // then a full fall and a clean get-up). Upright enough for a
-                // while, the root is taken back, its strength ramped like a
-                // get-up's. OPENMW_RAGDOLL_TOPPLE_REHOLD = "upDot,seconds"
-                // (seconds 0 = off).
-                static const auto rehold_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                    std::array<float, 2> value{ 0.7f, 0.5f };
-                    if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_TOPPLE_REHOLD"))
-                        std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                    return value;
-                });
-                static const auto& rehold = rehold_tuned.get();
-                const bool standingMode = mControllerOutput
-                    && (mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Standing
-                        || mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Bracing
-                        || mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Stumbling);
-                if (mSoftRootToppled && rehold[1] > 0.0f && standingMode && mControllerInput
-                    && mControllerInput->mTorsoUpDot > rehold[0] && mFallDecidedTime > 1.5f)
-                    mSoftRootToppledStandTime += duration;
-                else
-                    mSoftRootToppledStandTime = 0.0f;
-                if (mSoftRootToppledStandTime > rehold[1])
-                {
-                    mSoftRootToppled = false;
-                    mSoftRootToppledStandTime = 0.0f;
-                    mSoftRootReholdElapsed = 0.0f;
-                    mSoftRootReheld = true;
-                    Log(Debug::Info) << "RAGDOLL_TOPPLE_REHOLD actor=" << getPtr().getCellRef().getRefId()
-                                     << " up=" << mControllerInput->mTorsoUpDot;
+                    RagdollCore::RootHoldState topple = rootHoldState();
+                    const RagdollCore::ToppleEvents events = RagdollCore::judgeTopple(
+                        rootHoldInput(), recoveryOwns, k2RootHoldSettings(), topple, duration);
+                    storeRootHoldState(topple);
+                    if (events.mToppled)
+                        Log(Debug::Info) << "RAGDOLL_TOPPLE actor=" << getPtr().getCellRef().getRefId() << " mode="
+                                         << (mControllerOutput ? static_cast<int>(mControllerOutput->mMode) : -1)
+                                         << " up=" << mControllerInput->mTorsoUpDot;
+                    if (events.mReheld)
+                    {
+                        mSoftRootReholdElapsed = 0.0f;
+                        Log(Debug::Info) << "RAGDOLL_TOPPLE_REHOLD actor=" << getPtr().getCellRef().getRefId()
+                                         << " up=" << mControllerInput->mTorsoUpDot;
+                    }
                 }
             }
             const bool owns = routeMatches && mPowered && !interrupted && drivenMode && !mSoftRootToppled
@@ -9942,7 +10103,6 @@
                 mKinematicRootFollowedRotation.reset();
                 mKinematicRootSupportDrop = 0.0f;
                 mKinematicRootLocalRise.reset();
-                mKinematicRootSoleCorrectionSeeded = false;
                 mKinematicRootReactionOffset = JPH::Vec3::sZero();
                 mKinematicRootReactionVelocity = JPH::Vec3::sZero();
                 mSoftRootFollower.reset();
@@ -10118,9 +10278,19 @@
                     // 2 by default since alpha 0.4 item 10 (skating feet): push
                     // table (2 runs x 12 per row) standing 2000-4000 slide 89-96
                     // -> 80-86 units, walking 268-294 -> 240-257, falls, drift and
-                    // recovery unchanged.
+                    // recovery unchanged. 3 in play since 11-03 with FOOTFALL_FF
+                    // 0.75 (MOVE-01 W5, the numbers there).
                     static const auto pinnedGrip_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_PINNED_FOOT_FRICTION", 2.0f); });
-                    static const auto& pinnedGrip = pinnedGrip_tuned.get();
+                    // NPCs keep their own grip (11-03: at 3 the NPC duel to the
+                    // death ran out its 300 s 2 of 3 times, against 0 of 3 at 2 -
+                    // gripping feet fall less). OPENMW_RAGDOLL_PINNED_FOOT_FRICTION_NPC
+                    // (unset = the player's value).
+                    static const auto npcGrip_tuned = RagdollCore::tuned<float>([] {
+                        return weaponDriveSetting("OPENMW_RAGDOLL_PINNED_FOOT_FRICTION_NPC",
+                            weaponDriveSetting("OPENMW_RAGDOLL_PINNED_FOOT_FRICTION", 2.0f));
+                    });
+                    const float pinnedGrip
+                        = getPtr() == MWMechanics::getPlayer() ? pinnedGrip_tuned.get() : npcGrip_tuned.get();
                     // Stagger grip (10-05): after a hit, a swinging foot already
                     // on the ground grips like a planted one. At 0.05 it glided
                     // (0.09 combined) when a staggering body put it down before
@@ -10340,49 +10510,30 @@
             // sits `sink` units lower, faded in from 60% to 100% of `speed`.
             // OPENMW_RAGDOLL_RUN_BOB = "keep, sink, speed u/s" (1,0 = off).
             {
+                RagdollCore::RunBobState bobState{ mRunBobMean, mRunBobShare, mRunBobHeading, mRunBobTurnRate };
                 const auto& bob = runBobSettings();
-                const float z = localOffset.GetZ();
-                if (!mRunBobMean)
-                    mRunBobMean = z;
-                *mRunBobMean += (z - *mRunBobMean) * std::min(1.0f, duration / 0.35f);
-                const JPH::Vec3 request(mRawTargetHorizontalVelocity.GetX(), mRawTargetHorizontalVelocity.GetY(), 0.0f);
-                const float run = bob[2] > 0.0f && footfallEnabled()
-                    ? std::clamp((request.Length() - 0.6f * bob[2]) / (0.4f * bob[2]), 0.0f, 1.0f)
-                    : 0.0f;
-                mRunBobShare += (run - mRunBobShare) * std::min(1.0f, duration * 6.0f);
-                // The sink fades out while the run turns (10-30 release check:
-                // with the pelvis 5 units down a warhammer's fast-turn run ended
-                // leaning 15-23 deg, 2-4 without the sink): full on a straight
-                // run, gone at 1.5 rad/s of the request's heading.
-                if (request.Length() > 1.0f && duration > 0.0f)
-                {
-                    const float heading = std::atan2(request.GetX(), request.GetY());
-                    if (mRunBobHeading)
-                    {
-                        float turn = heading - *mRunBobHeading;
-                        turn = std::atan2(std::sin(turn), std::cos(turn));
-                        const float rate = std::abs(turn) / duration;
-                        if (std::isfinite(rate))
-                            mRunBobTurnRate += (rate - mRunBobTurnRate) * std::min(1.0f, duration * 4.0f);
-                    }
-                    mRunBobHeading = heading;
-                }
-                const float straight = std::clamp(1.0f - mRunBobTurnRate / 1.5f, 0.0f, 1.0f);
-                if (mRunBobShare > 1e-3f && std::isfinite(*mRunBobMean))
-                    localOffset.SetZ(*mRunBobMean + (z - *mRunBobMean) * (1.0f - (1.0f - bob[0]) * mRunBobShare)
-                        - bob[1] * mRunBobShare * straight);
+                localOffset.SetZ(RagdollCore::applyRunBob(bobState, localOffset.GetZ(),
+                    JPH::Vec3(mRawTargetHorizontalVelocity.GetX(), mRawTargetHorizontalVelocity.GetY(), 0.0f),
+                    footfallEnabled(), { bob[0], bob[1], bob[2] }, duration));
+                mRunBobMean = bobState.mMean;
+                mRunBobShare = bobState.mShare;
+                mRunBobHeading = bobState.mHeading;
+                mRunBobTurnRate = bobState.mTurnRate;
             }
             // The landing and slope crouch reach the root once: through the
             // Footfall library's pelvis drop when it drives (mExtraCrouch),
             // else here (both, before: twice the crouch).
             const float ownCrouch = footfallLibraryDrives()
                 ? 0.0f : mLandingCrouch + mSlopeStance * slopeStanceSettings().mCrouch;
-            const JPH::RVec3 targetPosition = actorPosition
-                + JPH::RVec3(localOffset)
-                - JPH::RVec3(0.0f, 0.0f, mKinematicRootSupportDrop + footfallRootDrop() + mDazeDrop + ownCrouch)
-                - JPH::RVec3(mTeeterToward * (mTeeter * edgeTeeterSettings().mHips))
-                - JPH::RVec3(0.0f, 0.0f, std::max(0.0f, mTeeter - 0.4f) * 20.0f)
-                + JPH::RVec3(mKinematicRootReactionOffset);
+            RagdollCore::RootTargetInput rootTargetIn;
+            rootTargetIn.mActor = actorPosition;
+            rootTargetIn.mOffset = localOffset;
+            rootTargetIn.mDrop = mKinematicRootSupportDrop + footfallRootDrop() + mDazeDrop + ownCrouch;
+            rootTargetIn.mTeeter = mTeeter;
+            rootTargetIn.mTeeterToward = mTeeterToward;
+            rootTargetIn.mTeeterHips = edgeTeeterSettings().mHips;
+            rootTargetIn.mRecoil = mKinematicRootReactionOffset;
+            JPH::RVec3 targetPosition = RagdollCore::rootTargetPosition(rootTargetIn);
             // Root height: the live animation pelvis can leave the physical
             // feet floating, and correcting per tick pins whichever sole is
             // lowest, which stops that foot from ever lifting. Instead the
@@ -10431,36 +10582,12 @@
                 // falls instead of hanging from the spring.
                 // Off by default: a held root is by definition on its feet
                 // (knockdowns release it), and the fade dropped jumps.
-                static const auto airFade_tuned = RagdollCore::tuned<bool>([] {
-                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_SOFT_ROOT_AIRFADE");
-                    return text != nullptr && std::atoi(text) != 0;
-                });
-                static const auto& airFade = airFade_tuned.get();
-                const bool grounded = !airFade || (mSupportEstimate && mSupportEstimate->hasGroundContact());
-                mSoftRootSupport = std::clamp(mSoftRootSupport + (grounded ? 1.0f : -1.0f) * duration / 0.1f, 0.0f, 1.0f);
-                // Root budget (alpha 0.5 whole-body evaluation, first step): the
-                // root's weight support shrinks while the body stands on a
-                // wounded leg alone, so that leg carries more of the body and
-                // gives (a limp) instead of the root holding it up.
-                // OPENMW_RAGDOLL_ROOT_BUDGET_LIMP = support taken at a full
-                // wound (0 = off).
-                static const auto limpBudget_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_ROOT_BUDGET_LIMP", 0.0f); });
-                static const auto& limpBudget = limpBudget_tuned.get();
-                float limpScale = 1.0f;
-                if (limpBudget > 0.0f && footfallEnabled())
-                    for (std::size_t side = 0; side < 2; ++side)
-                        if (footfallPinnedAt(side) && !footfallPinnedAt(1 - side))
-                            limpScale = 1.0f - std::clamp(limpBudget, 0.0f, 0.8f) * limbWound(side == 0, false);
-                mRootLimpScale += (limpScale - mRootLimpScale) * std::clamp(duration * 10.0f, 0.0f, 1.0f);
-                float rootSupport = mSoftRootSupport * mRootLimpScale;
-                if (rollOwnsBody())
-                {
-                    const float roll = dropRollSettings().mSupport;
-                    const float k = std::clamp(mRollPhaseTime / 0.4f, 0.0f, 1.0f);
-                    rootSupport = mRollPhase == RollPhase::Absorb ? 1.0f
-                        : mRollPhase == RollPhase::Roll           ? roll
-                                                                   : roll + (rootSupport - roll) * k * k * (3.0f - 2.0f * k);
-                }
+                RagdollCore::RootSupportState support{ mSoftRootSupport, mRootLimpScale, mRootWalkSupport };
+                float rootSupport
+                    = RagdollCore::updateRootSupport(rootSupportInput(), k2RootSupportSettings(), support, duration);
+                mSoftRootSupport = support.mAir;
+                mRootLimpScale = support.mLimp;
+                mRootWalkSupport = support.mWalk;
                 mRagdoll->setSoftRootSupport(rootSupport);
                 bool leftGrounded = mSupportEstimate && mSupportEstimate->mLeftFootSupported;
                 bool rightGrounded = mSupportEstimate && mSupportEstimate->mRightFootSupported;
@@ -10619,12 +10746,8 @@
                 JPH::RVec3 pelvis;
                 JPH::Quat pelvisRotation;
                 physics.GetBodyInterface().GetPositionAndRotation(mRagdoll->getBodyId(0), pelvis, pelvisRotation);
-                JPH::Vec3 offset(pelvis - groundedTarget);
-                offset.SetZ(0.0f);
-                const float excess = offset.Length() - yield.mDeadZone;
-                mSoftRootKnockback = excess > 0.0f
-                    ? offset.Normalized() * std::min(excess * yield.mGain, yield.mMaximumSpeed)
-                    : JPH::Vec3::sZero();
+                mSoftRootKnockback = RagdollCore::rootYieldVelocity(
+                    pelvis, groundedTarget, yield.mDeadZone, yield.mGain, yield.mMaximumSpeed);
                 mRagdoll->setSoftRootVelocityBias(mSoftRootKnockback);
             }
             else
@@ -10641,30 +10764,12 @@
                 // follower, so a physical body carries its momentum for a
                 // short distance instead of pivoting over planted feet.
                 const float maximumAcceleration = softRootInertiaSettings();
-                JPH::Vec3 capsuleVelocity = JPH::Vec3::sZero();
-                if (mSoftRootCapsulePrevious && duration > 0.0f)
-                    capsuleVelocity = JPH::Vec3(groundedTarget - *mSoftRootCapsulePrevious) / duration;
-                capsuleVelocity.SetZ(0.0f);
-                mSoftRootCapsulePrevious = groundedTarget;
-                if (!mSoftRootFollower || capsuleVelocity.Length() > 2000.0f || maximumAcceleration <= 0.0f)
-                {
-                    mSoftRootFollower = groundedTarget;
-                    mSoftRootFollowerVelocity = capsuleVelocity;
-                }
-                else
-                {
-                    JPH::Vec3 lag(groundedTarget - *mSoftRootFollower);
-                    lag.SetZ(0.0f);
-                    const JPH::Vec3 desired = capsuleVelocity + lag * 8.0f;
-                    JPH::Vec3 change = desired - mSoftRootFollowerVelocity;
-                    const float limit = maximumAcceleration * duration;
-                    if (change.Length() > limit)
-                        change = change.Normalized() * limit;
-                    mSoftRootFollowerVelocity += change;
-                    JPH::RVec3 next = *mSoftRootFollower + JPH::RVec3(mSoftRootFollowerVelocity * duration);
-                    next.SetZ(groundedTarget.GetZ());
-                    mSoftRootFollower = next;
-                }
+                RagdollCore::RootFollowerState follow{ mSoftRootCapsulePrevious, mSoftRootFollower,
+                    mSoftRootFollowerVelocity };
+                static_cast<void>(RagdollCore::followRootTarget(follow, groundedTarget, maximumAcceleration, duration));
+                mSoftRootCapsulePrevious = follow.mPrevious;
+                mSoftRootFollower = follow.mFollower;
+                mSoftRootFollowerVelocity = follow.mVelocity;
                 groundedTarget = *mSoftRootFollower;
             }
             if (mRagdoll->getSoftRoot().mEnabled)
@@ -10809,7 +10914,10 @@
                     const bool recovering = rollOwnsBody() || (mControllerOutput
                         && (mControllerOutput->mMode == Mode::Falling || mControllerOutput->mMode == Mode::Fallen
                             || mControllerOutput->mMode == Mode::GettingUp || mControllerOutput->mMode == Mode::BlendBack));
-                    if (jump.Length() > 40.0f || recovering)
+                    // Nor a held NPC's (K2_CALM): its legs are the clip's and brake
+                    // nothing, so the target following the coast let the body
+                    // run 40 u past a wander's stop; the root stops it instead.
+                    if (jump.Length() > 40.0f || recovering || mCalm.mLegsOnClip)
                     {
                         mStopAbsorb = JPH::Vec3::sZero();
                         mStopAbsorbOpen = false;
@@ -11320,7 +11428,12 @@
                 if (footfallDrivesLeg(footSide))
                 {
                     // OPENMW_RAGDOLL_FOOTFALL_FF: feed-forward strength (1 = the
-                    // targets' own speed).
+                    // targets' own speed). 0.75 in play since 11-03 with the
+                    // pinned grip 3 (MOVE-01 W5: found offline on the matched
+                    // StrideSim, then the game's courses x2-3 against 0.5 / 2:
+                    // a loaded foot's contact slip running 53-58 -> 28-38 u/s
+                    // fists, 29-30 -> 5.2-5.8 claymore; walking 9.5-12 -> 8.6-10;
+                    // the turn, stop, reversal and stairs cases pass).
                     static const auto footfallFeed_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_FOOTFALL_FF", 0.5f); });
                     static const auto& footfallFeed = footfallFeed_tuned.get();
                     const auto at = [&](std::size_t body) {
@@ -12084,20 +12197,22 @@
             static const auto& hscHz = hscHz_tuned.get();
             const bool hscWeapon = mHscActive && mWeapon && index == mWeapon->mWeaponBody;
             const bool rampedWeapon = mWeapon && index == mWeapon->mWeaponBody;
-            const float knock = rampedWeapon ? weaponKnockYield() : 1.0f;
+            // K2_LODGE: a weapon held in a body gives way to the pin.
+            const float knock = rampedWeapon ? weaponKnockYield() * mLodgeDriveYield : 1.0f;
             const float yield = (hscWeapon ? mHscDriveYield * mHscDrivePhase * mImpactTwistYield : 1.0f) * knock;
             const float rampCap = (rampedWeapon ? std::max(0.05f, mWeaponDriveRamp * mWeaponDriveRamp * (3.0f - 2.0f * mWeaponDriveRamp)) : 1.0f) * knock;
             const float phaseCap = (hscWeapon ? mHscDrivePhase : 1.0f) * rampCap;
-            const float omega
-                = 2.0f * osg::PIf * (mHscActive && hscHz > 0.0f ? hscHz * yield : weaponDriveFrequency());
+            const bool fistPunch = fistPunchDriven(index);
+            const float omega = 2.0f * osg::PIf
+                * (fistPunch ? k2FistDrive()[0] : mHscActive && hscHz > 0.0f ? hscHz * yield : weaponDriveFrequency());
             const float gravity = RagdollCore::UnitModel::GravityUnitsPerSecondSquared;
             static const auto baseAcceleration_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_WEAPON_DRIVE_ACCEL", 12.0f); });
             static const auto& baseAcceleration = baseAcceleration_tuned.get();
             static const auto baseAngularAcceleration_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_WEAPON_DRIVE_ALPHA", 400.0f); });
             static const auto& baseAngularAcceleration = baseAngularAcceleration_tuned.get();
             // ...and a wounded weapon arm puts less into it (alpha 0.4 item 7).
-            const float maximumAcceleration
-                = baseAcceleration * mGuardStiffness * armWoundScale() * tiredSwingScale() * phaseCap;
+            const float maximumAcceleration = (fistPunch ? k2FistDrive()[1] : baseAcceleration) * mGuardStiffness
+                * armWoundScale() * tiredSwingScale() * phaseCap;
             const float maximumAngularAcceleration
                 = baseAngularAcceleration * mGuardStiffness * armWoundScale() * tiredSwingScale() * phaseCap;
             const JPH::Vec3 error(target - body.mPosition);
@@ -12149,6 +12264,22 @@
                             applyJointChainWrench(telemetry, segment, acceleration * (part.mMass * share), JPH::Vec3::sZero());
                         }
                 }
+                // K2_FIST_TRUE: the same for a fist - the hand's push alone left
+                // the upper arm and forearm to be dragged out by it (the hand
+                // 25-35 u behind its command through a straight, on a curve).
+                // An arm that straightens: the forearm takes about three
+                // quarters of the hand's acceleration, the upper arm a third.
+                if (fistsTrue())
+                    for (const auto* arm : { &mLeftArm, &mRightArm })
+                        if (*arm && index == (*arm)->mHand)
+                        {
+                            const std::array<std::pair<std::size_t, float>, 2> parts{ { { (*arm)->mElbow, 0.75f },
+                                { (*arm)->mShoulder, 0.35f } } };
+                            for (const auto& [segment, share] : parts)
+                                if (segment < telemetry.mBodies.size())
+                                    applyJointChainWrench(telemetry, segment,
+                                        acceleration * (telemetry.mBodies[segment].mMass * share), JPH::Vec3::sZero());
+                        }
                 return applyJointChainWrench(telemetry, index, force, torque);
             }
             // Active body: the push comes from the fighter's own arm, so the
@@ -12278,9 +12409,540 @@
         // sheathe and the staff's 2.3-2.9 at the draw against a run p99 of
         // 1.4-1.6 (HANDOFF-01). OPENMW_RAGDOLL_WEAPON_DRIVE_RAMP=0 = off.
         float mWeaponDriveRamp = 0.0f;
+        // KINETIC-2 phase 1, order step 4 (K2-WEAPON-phase1.md, "Hand drive
+        // bench"): the weapon carried by the arm's own joints instead of the
+        // spring that pulls the weapon body from outside. The grip goes to the
+        // wheel's target by joint torques at the shoulder and elbow (their
+        // motors let go), gravity on the arm and weapon cancelled joint by
+        // joint, the elbow led toward the key's pole; the blade turned by the
+        // wrist's own motor to the wheel's rotation (the nearer of its two
+        // edges). Each torque a pair on the joint's two bodies: nothing from
+        // outside. OPENMW_RAGDOLL_K2_HAND_DRIVE (registry): 0 = the old
+        // spring; above 0 = on, the arm joints' strength x that (1 = the
+        // profile's, with the weapon's holding allowance). Only where the
+        // wheel runs through the KINETIC-2 planner (K2_WEAPON) and a weapon
+        // is held.
+        static float k2HandDriveScale()
+        {
+            static const auto value_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HAND_DRIVE");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 10.0f) : 0.0f;
+            });
+            return value_tuned.get();
+        }
+        // OPENMW_RAGDOLL_K2_EDGE_BITE (registry, experiment): edge lead share,
+        // armour stick seconds (contactoutcome, wound).
+        static const std::array<float, 2>& k2EdgeBite()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_EDGE_BITE"))
+                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                for (float& v : value)
+                    v = std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // OPENMW_RAGDOLL_K2_POINT_LEAD (registry, experiment): a thrusting
+        // spear point's lead share and where its tip zone starts (wound).
+        static const std::array<float, 2>& k2PointLead()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_POINT_LEAD", value);
+                for (float& v : value)
+                    v = std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // OPENMW_RAGDOLL_K2_FIST_STEER (registry, experiment): FIST-06's
+        // steered fists - on, the mouse counts to the full wind-up, and
+        // mode 4's swing (counts against the draw within 0.1 s; 0 = a wound
+        // fist is thrown by letting go only).
+        static const std::array<float, 4>& k2FistSteer()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 4>>([] {
+                std::array<float, 4> value{ 0.0f, 300.0f, 100.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_FIST_STEER", value);
+                // The fourth: 1 = letting go of a wound fist throws it too
+                // (0: only the swing and the click punch, the weapons' rule).
+                value[3] = std::isfinite(value[3]) && value[3] > 0.0f ? 1.0f : 0.0f;
+                // The mode: 0 off, 1 the steered fists, 2 the feet pick the
+                // punch, 3 the crosshair picks it, 4 a click the crosshair's
+                // and a hold wound up by the mouse as the weapons (FIST-12).
+                value[0] = std::isfinite(value[0]) && value[0] > 0.0f
+                    ? (value[0] >= 4.0f ? 4.0f : value[0] >= 3.0f ? 3.0f : value[0] >= 2.0f ? 2.0f : 1.0f)
+                    : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 50.0f, 2000.0f) : 300.0f;
+                value[2] = std::isfinite(value[2]) ? (value[2] > 0.0f ? std::clamp(value[2], 20.0f, 600.0f) : 0.0f) : 100.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // OPENMW_RAGDOLL_K2_FIST_DRIVE (registry, experiment): a punching
+        // fist's drive - Hz and the acceleration cap in g; 0 = the hands'.
+        static const std::array<float, 2>& k2FistDrive()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 12.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_FIST_DRIVE", value);
+                value[0] = std::isfinite(value[0]) ? std::clamp(value[0], 0.0f, 20.0f) : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 4.0f, 60.0f) : 12.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // OPENMW_RAGDOLL_K2_FIST_STANCE (registry, experiment): the fists'
+        // stance on the move - the shoulders' line from square to the view
+        // (degrees, negative = the left shoulder forward), the turn's share,
+        // the share of the clip's side tilt taken out.
+        static const std::array<float, 3>& k2FistStance()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                std::array<float, 3> value{ 0.0f, 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_FIST_STANCE", value);
+                value[0] = std::isfinite(value[0]) ? std::clamp(value[0], -90.0f, 90.0f) : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 0.0f, 1.0f) : 0.0f;
+                value[2] = std::isfinite(value[2]) ? std::clamp(value[2], 0.0f, 1.0f) : 0.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        float mFistStanceBlend = 0.0f; // 0..1, eased in with the fists up
+        // The turn the physical shoulders' line still asks for (radians; the
+        // body gave about a third of the turn its target asked: STANCE-01).
+        float mFistStanceTrim = 0.0f;
+        std::uint64_t mFistStanceStep = 0;
+        bool mFistHeldNow = false; // a fist is held charging this step
+        // OPENMW_RAGDOLL_K2_FIST_CHARGE (registry, experiment): a charged
+        // fist's further draw (u), the trunk's coil (rad), and whether the
+        // charge is the blow's strength.
+        static const std::array<float, 3>& k2FistCharge()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                std::array<float, 3> value{ 0.0f, 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_FIST_CHARGE", value);
+                value[0] = std::isfinite(value[0]) ? std::clamp(value[0], 0.0f, 40.0f) : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 0.0f, 1.0f) : 0.0f;
+                value[2] = std::isfinite(value[2]) && value[2] > 0.0f ? 1.0f : 0.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // The charge of each fist's last punch (left, right), 0..1.
+        std::array<float, 2> mFistPower{ 0.0f, 0.0f };
+        // K2_FIST_CHARGE: the strength a blow of this body carries by its
+        // punch's charge (0: none - not a fist, or a tap).
+        float fistStrikeStrength(std::uint32_t bodyIdentity) const
+        {
+            if (!(k2FistCharge()[2] > 0.0f) || !(k2FistSteer()[0] >= 2.0f) || getPtr() != MWMechanics::getPlayer())
+                return 0.0f;
+            const std::array<const std::optional<RagdollArmChain>*, 2> arms{ &mLeftArm, &mRightArm };
+            for (std::size_t side = 0; side < 2; ++side)
+                if (*arms[side]
+                    && mRagdoll->getBodyId((*arms[side])->mHand).GetIndexAndSequenceNumber() == bodyIdentity)
+                    return mFistPower[side];
+            return 0.0f;
+        }
+        // OPENMW_RAGDOLL_K2_FIST_STEP (registry, experiment): the furthest a
+        // punch's lunge carries the hips (u) and the chests' distance it
+        // lunges to (u); the first 0 = off.
+        static const std::array<float, 2>& k2FistStep()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 42.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_FIST_STEP", value);
+                value[0] = std::isfinite(value[0]) ? std::clamp(value[0], 0.0f, 80.0f) : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 20.0f, 100.0f) : 42.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // The step in: a punch is lunging at its foe, and the gap it began with (u).
+        bool mFistStepping = false;
+        float mFistStepGap = 0.0f;
+        // OPENMW_RAGDOLL_K2_FIST_TRUE (registry, experiment): reach (of the
+        // arm's length), the strike's hold and return (s), the strike's time
+        // (x the short weapons'); reach 0 = off.
+        static const std::array<float, 4>& k2FistTrue()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 4>>([] {
+                std::array<float, 4> value{ 0.0f, 0.06f, 0.25f, 0.75f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_FIST_TRUE", value);
+                value[3] = std::isfinite(value[3]) ? std::clamp(value[3], 0.3f, 1.0f) : 0.75f;
+                value[0] = std::isfinite(value[0]) && value[0] > 0.0f ? std::clamp(value[0], 0.5f, 1.0f) : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 0.0f, 1.0f) : 0.06f;
+                value[2] = std::isfinite(value[2]) ? std::clamp(value[2], 0.05f, 1.0f) : 0.25f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // The player's bare fists under K2_FIST_TRUE.
+        bool fistsTrue() const
+        {
+            return k2FistTrue()[0] > 0.0f && mHscActive && hscStriker().mFist && getPtr() == MWMechanics::getPlayer();
+        }
+        // K2_FIST_TRUE: a fist's commanded place, kept within the arm's reach
+        // of its shoulder.
+        JPH::RVec3 fistWithinReach(JPH::RVec3Arg target, const std::optional<RagdollArmChain>& arm) const
+        {
+            if (!arm || !(mFistArmLength > 1.0f) || !mCurrentPhysicsPoseCaptured)
+                return target;
+            const auto shoulder = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, arm->mShoulder);
+            if (!shoulder)
+                return target;
+            const JPH::Vec3 out(target - *shoulder);
+            const float limit = k2FistTrue()[0] * mFistArmLength;
+            const float length = out.Length();
+            return length > limit ? *shoulder + JPH::RVec3(out * (limit / length)) : JPH::RVec3(target);
+        }
+        static bool fistAimEnabled()
+        {
+            static const auto value = RagdollCore::tuned<bool>([] {
+                return weaponDriveSetting("OPENMW_RAGDOLL_K2_FIST_AIM", 0.0f) > 0.0f;
+            });
+            return value.get();
+        }
+        std::array<float, 2> mFistAimBlend{ 0.0f, 0.0f };
+        std::array<float, 2> mFistHudCharge{ -1.0f, -1.0f };
+        std::array<RagdollCore::PunchKind, 2> mFistHudKind{};
+        bool mFistHudActive = false;
+        // FIST-12: a fist is held winding up by the mouse - the reticle shows
+        // the weapons' wind-up from its draw (to the right, up; 1 = full).
+        bool mFistHudDrag = false;
+        std::optional<std::array<float, 2>> mFistHudDraw;
+
+        // One update per hand per step. The target stays on the camera ray
+        // through the late strike, then eases back to the authored recovery.
+        JPH::RVec3 aimFist(std::size_t side, JPH::RVec3Arg target, float cut, float duration)
+        {
+            const auto& arm = side == 0 ? mLeftArm : mRightArm;
+            if (!fistAimEnabled() || !fistsTrue() || !arm || !mSwingAimRayOrigin
+                || mSwingAimRayDirection.LengthSq() < 1e-6f || mGuardActive
+                || mFistHudCharge[side] >= 0.0f)
+            {
+                mFistAimBlend[side] = 0.0f;
+                return target;
+            }
+            const auto shoulder = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, arm->mShoulder);
+            if (!shoulder)
+                return target;
+            float& weight = mFistAimBlend[side];
+            if (cut >= 0.0f)
+            {
+                const float u = std::clamp(cut / 0.6f, 0.0f, 1.0f);
+                weight = u * u * (3.0f - 2.0f * u);
+            }
+            else
+                weight *= std::exp(-20.0f * std::max(duration, 0.0f));
+            const JPH::Vec3 aimed = RagdollCore::aimFistTarget(JPH::Vec3(target - *shoulder),
+                JPH::Vec3(*mSwingAimRayOrigin - *shoulder), mSwingAimRayDirection,
+                k2FistTrue()[0] * mFistArmLength, weight);
+            return *shoulder + JPH::RVec3(aimed);
+        }
+
+        float mFistArmLength = 0.0f; // the arm's reach, units (stepK2Wheel)
+        std::optional<JPH::RVec3> mLeftFistTarget; // the left fist's commanded place this step (K2_FIST_TRUE)
+        // The left straight (K2_FIST_TRUE): where the fist was commanded when
+        // it began and last step, about its shoulder (world axes).
+        std::optional<JPH::Vec3> mLeftStraightFrom, mLeftFistLast;
+        // OPENMW_RAGDOLL_K2_FIST_EASE (registry, experiment): the seconds the
+        // left fist takes from where its punch left it to where it is held
+        // (FIST-13; the user's 11-17 play: the command stepped 18-19 u in one
+        // tick at the end of every wound left punch, 4-5 u for the right,
+        // whose hold eases in on the wheel). 0 = at once.
+        static float k2FistEase()
+        {
+            static const auto value_tuned = RagdollCore::tuned<float>([] {
+                return std::min(1.0f, weaponDriveSetting("OPENMW_RAGDOLL_K2_FIST_EASE", 0.0f));
+            });
+            return value_tuned.get();
+        }
+        // OPENMW_RAGDOLL_K2_FIST_WOUND (registry, experiment): a wound hook's
+        // or uppercut's least strike seconds, and its wind-up's share of a
+        // quick punch's (RagdollCore::woundStrikeSeconds, woundWindShare);
+        // each 0 = as it was. The third value, the uppercut's wind-up raise,
+        // is read where the fist lines are made (cutwheel.cpp).
+        static const std::array<float, 3>& k2FistWound()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                std::array<float, 3> value{ 0.0f, 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_FIST_WOUND", value);
+                value[0] = std::isfinite(value[0]) ? std::clamp(value[0], 0.0f, 0.5f) : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 0.0f, 2.0f) : 0.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // Where the left punch's command was last (the chest frame), and the
+        // seconds a hold has eased from it.
+        std::optional<JPH::Vec3> mLeftFistEaseFrom;
+        float mLeftFistEaseTime = 0.0f;
+        // The body is a fist in its punch (K2_FIST_DRIVE).
+        bool fistPunchDriven(std::size_t index) const
+        {
+            if (!(k2FistDrive()[0] > 0.0f) || !mHscActive || !hscStriker().mFist)
+                return false;
+            if (mRightArm && index == mRightArm->mHand)
+                return mWheel.stage() == RagdollCore::WheelStage::Wind || mWheel.stage() == RagdollCore::WheelStage::Cut;
+            return mLeftArm && index == mLeftArm->mHand && mLeftFistTime >= 0.0f;
+        }
+        // OPENMW_RAGDOLL_K2_LEFT_PUNCH (registry, experiment): the left punch's
+        // share of its line's trunk turn, and whether its line follows the view.
+        static const std::array<float, 2>& k2LeftPunch()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_LEFT_PUNCH", value);
+                for (float& v : value)
+                    v = std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // OPENMW_RAGDOLL_K2_WEAPON_PACE (registry, tunable): the weapon's
+        // response, the player's and the NPCs'.
+        static float k2WeaponResponse(bool player)
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 1.0f, 1.0f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_WEAPON_PACE"))
+                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                for (float& v : value)
+                    v = std::isfinite(v) ? std::clamp(v, 0.5f, 3.0f) : 1.0f;
+                return value;
+            });
+            return value_tuned.get()[player ? 0 : 1];
+        }
+        // K2_DRIVE_RESPONSE (registry): a one-handed weapon's hand drive takes
+        // the weapon's response (K2_WEAPON_PACE) up to this, the wheel's timing
+        // all of it; a two-hander's second hand steadies its own.
+        static float k2DriveResponse(bool player, bool oneHanded)
+        {
+            if (!oneHanded)
+                return k2WeaponResponse(player);
+            static const auto cap_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_DRIVE_RESPONSE");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) && value > 0.0f ? value : 0.0f;
+            });
+            const float response = k2WeaponResponse(player);
+            return cap_tuned.get() > 0.0f ? std::min(response, cap_tuned.get()) : response;
+        }
+        std::optional<JPH::RVec3> mK2PreviousGrip;
+        std::optional<JPH::Quat> mK2PreviousRotation;
+        // The hand drive's last wrist torque and assist torque (HSC_TRACE).
+        float mK2TraceWristTorque = 0.0f, mK2TraceAssistTorque = 0.0f, mK2TraceWristUtil = 0.0f;
+        // The arm joints' strength (their motors' caps with the weapon's
+        // allowance), read while the motors still hold it and kept for the
+        // weapon: this drive sets the shoulder's and elbow's to 0.
+        std::array<float, 3> mK2Strength{};
+        std::size_t mK2StrengthWeapon = ~std::size_t(0);
+        bool applyK2HandDrive(float duration)
+        {
+            const float scale = k2HandDriveScale();
+            if (!(scale > 0.0f) || duration <= 0.0f || !mHscActive || !mRightArm || !mWeapon
+                || !mWeapon->mAttached || !mRagdoll)
+            {
+                mK2PreviousGrip.reset();
+                mK2PreviousRotation.reset();
+                return false;
+            }
+            RagdollCore::RagdollTelemetry telemetry;
+            if (!mRagdoll->captureTelemetry(telemetry))
+                return false;
+            const RagdollArmChain& arm = *mRightArm;
+            const std::size_t weaponBody = mWeapon->mWeaponBody;
+            if (weaponBody >= telemetry.mBodies.size() || arm.mHand >= telemetry.mBodies.size())
+                return false;
+            applyPlayerTorsoHold(telemetry);
+
+            RagdollCore::HandChain chain;
+            const std::array<std::size_t, 3> children{ arm.mShoulder, arm.mElbow, arm.mHand };
+            for (std::size_t j = 0; j < 3; ++j)
+            {
+                for (const RagdollCore::ConstraintTelemetry& constraint : telemetry.mConstraints)
+                    if (constraint.mChildBodyIndex == children[j])
+                        chain.mJoint[j] = constraint.mPosition;
+                if (mK2StrengthWeapon != weaponBody || !(mK2Strength[j] > 0.0f))
+                {
+                    const auto motor = mRagdoll->getMotorDebug(children[j]);
+                    if (motor && motor->mMaximumTorque > 0.0f)
+                        mK2Strength[j] = motor->mMaximumTorque;
+                }
+                chain.mStrength[j] = mK2Strength[j] * scale;
+            }
+            if (mK2StrengthWeapon != weaponBody)
+                Log(Debug::Info) << "RAGDOLL_K2_HAND strength actor=" << getPtr().getCellRef().getRefId()
+                                 << " shoulder=" << mK2Strength[0] << " elbow=" << mK2Strength[1]
+                                 << " wrist=" << mK2Strength[2] << " scale=" << scale;
+            mK2StrengthWeapon = weaponBody;
+            if (!(chain.mStrength[0] > 0.0f && chain.mStrength[1] > 0.0f && chain.mStrength[2] > 0.0f))
+                return false;
+            const std::array<std::size_t, 4> bodies{ arm.mShoulder, arm.mElbow, arm.mHand, weaponBody };
+            for (std::size_t b = 0; b < 4; ++b)
+                chain.mBody[b] = { telemetry.mBodies[bodies[b]].mCenterOfMass, telemetry.mBodies[bodies[b]].mMass };
+            // K2_HAND_EFFECTIVE_MASS (registry): the weapon's own inertia.
+            // "grip, turn": the grip's mass, the blade's turn's inertia.
+            static const auto effectiveMass_tuned = RagdollCore::tuned<std::array<int, 2>>([] {
+                std::array<int, 2> value{ 0, 0 };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HAND_EFFECTIVE_MASS"))
+                    std::sscanf(text, "%d,%d", &value[0], &value[1]);
+                return value;
+            });
+            // One-handed only: on a two-hander (the iron spear) the wrist went
+            // 25 deg past its limit with it (VARIANT-01 11-07).
+            if (effectiveMass_tuned.get()[0] != 0 && !mWeapon->mTwoHanded)
+            {
+                chain.mWeaponInertia = mWeapon->mCrossInertia;
+                chain.mRigidTurn = effectiveMass_tuned.get()[1] != 0;
+            }
+            // K2_TWO_HAND_TURN (registry): "wide, close" - the share of a
+            // two-hander's own inertia its turn is sized on, for a wide grip
+            // (spear, staff) and for the others.
+            static const auto twoHandTurn_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_TWO_HAND_TURN", value);
+                for (float& v : value)
+                    v = std::isfinite(v) ? std::clamp(v, 0.0f, 2.0f) : 0.0f;
+                return value;
+            });
+            if (mWeapon->mTwoHanded)
+                chain.mTurnInertia
+                    = mWeapon->mCrossInertia * twoHandTurn_tuned.get()[mWeapon->mShoulderRestStance ? 1 : 0];
+            const RagdollCore::BodyTelemetry& hand = telemetry.mBodies[arm.mHand];
+            chain.mGrip = hand.mPosition;
+            chain.mGripVelocity = hand.mMotion.mLinearVelocity
+                + hand.mMotion.mAngularVelocity.Cross(JPH::Vec3(hand.mPosition - hand.mCenterOfMass));
+            chain.mHandRotation = hand.mRotation;
+            chain.mHandAngularVelocity = hand.mMotion.mAngularVelocity;
+
+            RagdollCore::HandDriveGoal goal;
+            goal.mGrip = mHscGrip;
+            if (!mHscWorldRotation)
+                return false;
+            goal.mRotation = *mHscWorldRotation;
+            goal.mBladeAxis = hscStriker().mBladeAxis;
+            if (mRightArmTarget)
+                goal.mPole = mRightArmTarget->mWorldBend.NormalizedOr(-JPH::Vec3::sAxisZ());
+            if (mK2PreviousGrip)
+                goal.mGripVelocity = JPH::Vec3(goal.mGrip - *mK2PreviousGrip) / duration;
+            if (mK2PreviousRotation)
+            {
+                JPH::Quat delta = (goal.mRotation * mK2PreviousRotation->Conjugated()).Normalized();
+                if (delta.GetW() < 0.0f)
+                    delta = -delta;
+                JPH::Vec3 axis;
+                float turn = 0.0f;
+                delta.GetAxisAngle(axis, turn);
+                if (turn > 1e-6f)
+                    goal.mAngularVelocity = axis * (turn / duration);
+            }
+            mK2PreviousGrip = goal.mGrip;
+            mK2PreviousRotation = goal.mRotation;
+
+            RagdollCore::HandDriveGains gains = RagdollCore::handDriveGains(
+                hscStriker().mWeight, mWeaponControl, k2DriveResponse(getPtr() == MWMechanics::getPlayer(), !mWeapon->mTwoHanded));
+            gains.mRotationTorque = false;
+            gains.mDt = duration;
+            // K2_ARM_STRAIN: a strained arm is weaker - its caps, its spring
+            // (stiffness by strength) and its reach for speed.
+            if (const float strength = armStrength(); strength < 1.0f)
+            {
+                gains.mStrength *= strength;
+                gains.mFrequency *= std::sqrt(strength);
+                gains.mRotationFrequency *= std::sqrt(strength);
+                gains.mMaxAcceleration *= strength;
+                gains.mMaxAngularAcceleration *= strength;
+            }
+            // OPENMW_RAGDOLL_K2_HAND_ASSIST (registry, experiment): this share of
+            // the blade's turn as a torque on the weapon from outside the body
+            // (the old spring's way, rotation only), a budget to measure.
+            static const auto assist_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HAND_ASSIST");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+            });
+            const float assist = assist_tuned.get();
+            gains.mComputeRotation = assist > 0.0f;
+            const RagdollCore::HandDriveOutput out
+                = RagdollCore::solveHandDrive(chain, goal, gains, RagdollCore::UnitModel::GravityUnitsPerSecondSquared);
+
+            // The shoulder's and elbow's motors let go; the wrist's turns the blade.
+            // OPENMW_RAGDOLL_K2_HAND_POSTURE=1 (registry, experiment): the arm
+            // keeps the game's solved posture on its own motors instead, and the
+            // drive only adds its gravity support and grip push (no spring on
+            // the weapon either way).
+            static const auto posture_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HAND_POSTURE");
+                return text && std::atoi(text) != 0;
+            });
+            const bool posture = posture_tuned.get();
+            if (!posture)
+            {
+                mRagdoll->setMotorMaximumTorque(arm.mShoulder, 0.0f);
+                mRagdoll->setMotorMaximumTorque(arm.mElbow, 0.0f);
+                mRagdoll->setMotorMaximumTorque(arm.mHand, chain.mStrength[2] * gains.mStrength);
+                mRagdoll->driveMotorToWorldOrientation(arm.mHand,
+                    RagdollCore::nearestEdgeRotation(goal.mRotation, chain.mHandRotation, *goal.mBladeAxis), duration);
+            }
+
+            // The torque pairs; the wrist's shared by the hand and the weapon
+            // fixed in it, by their inertia about the wrist.
+            const auto aboutWrist = [&](std::size_t b) {
+                const float r = static_cast<float>((chain.mBody[b].mCenterOfMass - chain.mJoint[2]).Length());
+                return chain.mBody[b].mMass * (r * r + 1.0f);
+            };
+            const float weaponShare = aboutWrist(3) / std::max(1e-6f, aboutWrist(2) + aboutWrist(3));
+            const std::array<std::pair<std::size_t, std::size_t>, 3> joints{ std::pair{ arm.mShoulder, arm.mFrame },
+                std::pair{ arm.mElbow, arm.mShoulder }, std::pair{ arm.mHand, arm.mElbow } };
+            for (std::size_t j = 0; j < 3; ++j)
+            {
+                if (j == 2)
+                {
+                    mRagdoll->applyExternalBodyWrench(arm.mHand, JPH::Vec3::sZero(), out.mTorque[j] * (1.0f - weaponShare));
+                    mRagdoll->applyExternalBodyWrench(weaponBody, JPH::Vec3::sZero(), out.mTorque[j] * weaponShare);
+                }
+                else
+                    mRagdoll->applyExternalBodyWrench(joints[j].first, JPH::Vec3::sZero(), out.mTorque[j]);
+                mRagdoll->applyExternalBodyWrench(joints[j].second, JPH::Vec3::sZero(), -out.mTorque[j]);
+            }
+            if (assist > 0.0f)
+                mRagdoll->applyExternalBodyWrench(weaponBody, JPH::Vec3::sZero(), out.mRotationTorque * assist);
+            mK2TraceWristTorque = out.mTorque[2].Length();
+            mK2TraceAssistTorque = (out.mRotationTorque * assist).Length();
+            mK2TraceWristUtil = out.mUtilization[2];
+            mWeaponDriveActive = true;
+            if (RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+            {
+                static unsigned rows = 0;
+                if (rows < 3000 && (++rows % 10) == 0)
+                {
+                    const JPH::Vec3 bladeNow = (chain.mHandRotation * *goal.mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY());
+                    const JPH::Vec3 bladeWant = (goal.mRotation * *goal.mBladeAxis).NormalizedOr(bladeNow);
+                    Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_K2_HAND s=" << mChamberS
+                                     << " hand_err=" << JPH::Vec3(goal.mGrip - chain.mGrip).Length() << " blade_err="
+                                     << osg::RadiansToDegrees(std::acos(std::clamp(bladeNow.Dot(bladeWant), -1.0f, 1.0f)))
+                                     << " util=" << out.mUtilization[0] << ',' << out.mUtilization[1] << ','
+                                     << out.mUtilization[2];
+                }
+            }
+            return true;
+        }
+
+        bool leftFistHeldNow() const
+        {
+            return mHscActive && mLeftArm && mRagdoll && hscStriker().mFist && mLeftFistHold && mFistCentre
+                && mLeftFistTime < 0.0f && mLeftJabTime < 0.0f;
+        }
         void applyPlayerWeaponDrive(float duration)
         {
             mWeaponDriveActive = false;
+            if (applyK2HandDrive(duration))
+                return;
             const bool weapon = weaponDriveEligible() && duration > 0.0f;
             const bool fists = !weapon && fistDriveEligible() && duration > 0.0f;
             static const auto driveRamp_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_WEAPON_DRIVE_RAMP", 1.0f) > 0.0f; });
@@ -12491,6 +13153,54 @@
                 {
                     hand = mHscGrip;
                     handRotation = *mHscWorldRotation;
+                }
+                // FIST-06: the held left fist to where the mouse has it, as
+                // the right one.
+                // K2_FIST_DRIVE: the left punch is carried too (it went on the
+                // free arm's motors alone).
+                // K2_FIST_TRUE: the left fist is driven as the right is, in
+                // its guard, its hold and its punch.
+                else if (side == 0 && mLeftFistTarget && fistsTrue())
+                {
+                    hand = *mLeftFistTarget;
+                    handRotation = telemetry.mBodies[arm->mHand].mRotation;
+                }
+                else if (side == 0 && mLeftPunchTarget && fistPunchDriven(arm->mHand))
+                {
+                    hand = *mLeftPunchTarget;
+                    handRotation = telemetry.mBodies[arm->mHand].mRotation;
+                }
+                else if (side == 0 && leftFistHeldNow())
+                {
+                    const JPH::Vec3& at = mLeftFistHold->mHand;
+                    hand = *mFistCentre + JPH::RVec3(mFistRight * at.GetX() + mFistForward * at.GetY() + mFistUp * at.GetZ());
+                    handRotation = telemetry.mBodies[arm->mHand].mRotation;
+                    // The held left arm (HSC_TRACE): the target, the hand and the
+                    // shoulder, elbow and wrist joints, the chest frame.
+                    if (RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+                    {
+                        static unsigned rows = 0;
+                        if ((++rows % 6) == 1)
+                        {
+                            const auto inChest = [&](JPH::RVec3Arg p) {
+                                const JPH::Vec3 d(p - *mFistCentre);
+                                return JPH::Vec3(d.Dot(mFistRight), d.Dot(mFistForward), d.Dot(mFistUp));
+                            };
+                            std::array<JPH::Vec3, 3> joint{};
+                            const std::array<std::size_t, 3> children{ arm->mShoulder, arm->mElbow, arm->mHand };
+                            for (std::size_t j = 0; j < 3; ++j)
+                                for (const RagdollCore::ConstraintTelemetry& constraint : telemetry.mConstraints)
+                                    if (constraint.mChildBodyIndex == children[j])
+                                        joint[j] = inChest(constraint.mPosition);
+                            const JPH::Vec3 real = inChest(telemetry.mBodies[arm->mHand].mPosition);
+                            Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_FIST_LEFT_ARM want=" << at.GetX()
+                                             << "," << at.GetY() << "," << at.GetZ() << " hand=" << real.GetX() << ","
+                                             << real.GetY() << "," << real.GetZ() << " shoulder=" << joint[0].GetX() << ","
+                                             << joint[0].GetY() << "," << joint[0].GetZ() << " elbow=" << joint[1].GetX()
+                                             << "," << joint[1].GetY() << "," << joint[1].GetZ() << " wrist="
+                                             << joint[2].GetX() << "," << joint[2].GetY() << "," << joint[2].GetZ();
+                        }
+                    }
                 }
                 else if (!(mManualMotorPoseApplied && mManualMotorPoseTick == mCurrentContactPhysicsStep))
                     continue;
@@ -13012,13 +13722,22 @@
         float mDuelSinceFast = 1.0e9f;
         float mDuelSinceImpact = 1.0e9f;
         float mAiSinceParryWon = 1.0e9f; // AI-02 item 5: since this body's last parry won (knockaway)
-        bool mRiposteAttack = false; // ... and the attack now running answers it
         // The weapon's tip (hand + blade axis x reach) and its velocity,
         // differenced per frame (u/s): the timed parry reads the arrival from
         // it - the weapon body's linear velocity misses the swing's rotation.
         std::optional<JPH::RVec3> mDuelTipPoint;
         JPH::Vec3 mDuelTipVelocity = JPH::Vec3::sZero();
         float mRiposteGranted = 0.0f; // the AI decided a riposte (requestRagdollAiRiposte), s left
+        float mFightThroughGranted = 0.0f; // K2_AI_STAGGER_CUT: the AI swings through a stagger, s left
+        // K2_ARM_STRAIN (RagdollCore::ArmStrain): the weapon arm tired by the
+        // clashes it parried - a weaker drive and guard, and spent, no guard.
+        RagdollCore::ArmStrain mArmStrain;
+        static const RagdollCore::ArmStrainSettings& armStrainSettings()
+        {
+            static const auto settings_tuned = RagdollCore::tuned([] { return RagdollCore::armStrainSettings(); });
+            return settings_tuned.get();
+        }
+        float armStrength() const { return mArmStrain.strength(armStrainSettings()); }
         void trackDuelMotion(float duration, JPH::BodyInterface& bodies)
         {
             mAiSinceParryWon += duration;
@@ -13231,6 +13950,44 @@
             static const auto& value = value_tuned.get();
             return value;
         }
+        // CLASH-SLIDE (user 11-03 bookmark 5: "unless the player or the enemy
+        // were parrying, the blade would provide minimum resistance, instead
+        // of bouncing the weapons like a clash"). Blade on blade with no guard
+        // held on either side is no clash: the contact has no friction or
+        // bounce and the slower blade gives way (onContactSettingsSided), the
+        // blades are nudged apart by `deflect` x weapon mass x approach
+        // (capped at `cap`), and nothing else happens - no hit-stop, knock,
+        // recoil, stagger or block fatigue; the stroke goes on. With a guard
+        // held the clash is as before, and the guard's grip and wrist decide
+        // how hard: two hands (x1.4), struck near the hilt (down to x0.5 at
+        // the tip) and Strength and fatigue (clashArmFactor) against a
+        // one-handed fresh average guard struck mid-blade, `grip` = how much
+        // that counts (an exponent; the attack's bounce x it, the guard's
+        // knock / it, 0.5-1.5).
+        // OPENMW_RAGDOLL_CLASH_SLIDE = "on, yield, deflect, cap, grip"
+        // (off in the code; play 1,4,0.15,150,1; on 0 = every blade contact
+        // clashes, as before).
+        struct ClashSlideSettings
+        {
+            bool mOn = false;
+            float mYield = 4.0f, mDeflect = 0.15f, mCap = 150.0f, mGrip = 1.0f;
+        };
+        static const ClashSlideSettings& clashSlideSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<ClashSlideSettings>([] {
+                ClashSlideSettings v;
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CLASH_SLIDE"))
+                {
+                    float on = 1.0f;
+                    std::sscanf(text, "%f,%f,%f,%f,%f", &on, &v.mYield, &v.mDeflect, &v.mCap, &v.mGrip);
+                    v.mOn = on > 0.0f;
+                    v.mYield = std::clamp(v.mYield, 1.0f, 20.0f);
+                }
+                return v;
+            });
+            return value_tuned.get();
+        }
+        unsigned mClashSlideCount = 0;
         JPH::RVec3 mKnockHandStart = JPH::RVec3::sZero();
         JPH::Vec3 mKnockDirection = JPH::Vec3::sZero();
         float mKnockPeak = 0.0f;
@@ -13508,12 +14265,18 @@
         std::optional<JPH::RVec3> mDeathWatchStart;
         std::uint64_t mDeathWatchStep = 0; // physical blows the hit roll turned aside
         int mDeathDragSteps = 0; // steps left of the corpse's slide drag (DEATH_DRAG)
+        // K2_DEATH_LIMITS: the joints opened at the hand-off, closing to
+        // their authored ranges, and the seconds since.
+        std::vector<RagdollCore::DeathLimit> mDeathLimits;
+        float mDeathLimitsTime = 0.0f;
         // Death watch, drawn: the actor's position at death, the drawn root
         // bone's first offset from its physics place and the largest change
         // of that offset since (units; the corpse dragged by its actor).
         std::optional<osg::Vec3f> mDeathWatchActorStart;
         std::optional<osg::Vec3f> mDeathDrawnOrigin;
         float mDeathDrawnOff = 0.0f;
+        // The farthest any bone was drawn from its body in that watch (units, -1 = not measured).
+        float mDeathBodyOff = -1.0f;
         JPH::Vec3 mRenderShift = JPH::Vec3::sZero(); // this frame's render pose shift (world, RENDER_REBASE)
         unsigned mCommitSwishRequests = 0;
         unsigned mCommitSwishPlayed = 0;
@@ -15689,7 +16452,6 @@
             return value;
         }
         unsigned mNpcLineTurn = 0; // which of an attack type's lines comes next
-        float mNpcChamberHeld = 0.0f; // seconds an NPC's click has held its chamber
         static int halfSwordMode()
         {
             static const auto value_tuned = RagdollCore::tuned<int>([] {
@@ -15700,25 +16462,15 @@
             return value;
         }
         bool mHscActive = false;
+        // The elbow's speed through a one-handed cut (units/s; K2_CUT_REACH's
+        // second value), set each step by the K2 wheel; 0 = ARM_ELBOW_SPEED.
+        float mK2CutElbowSpeed = 0.0f;
         static bool hscBlocks()
         {
             static const auto value_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_BLOCK", 1.0f) > 0.0f; });
             static const auto& value = value_tuned.get();
             return value;
         }
-        bool mHscBlocking = false;
-        // GUARD-03: a block ended by the player's attack goes straight into
-        // it (passiveragdollentry's block end and the chain rule).
-        // OPENMW_RAGDOLL_GUARD_TO_ATTACK=0 = the return to the guard first.
-        static bool guardToAttack()
-        {
-            static const auto value_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_GUARD_TO_ATTACK", 1.0f) > 0.0f; });
-            static const auto& value = value_tuned.get();
-            return value;
-        }
-        float mHscSinceBlock = 1e9f; // seconds since a block ended into its return
-        GuardZone mHscBlockZone = GuardZone::Middle; // the zone the block went to (GUARD_ZONES)
-        float mHscBlockTime = 0.0f;
         static bool pelvisFrameActive()
         {
             static const auto value_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_PELVIS_FRAME", 1.0f) > 0.0f; });
@@ -15737,16 +16489,13 @@
         float mHscPressTravel = 0.0f; // the hand's travel at the current press
         float mHscCut = -1.0f; // seconds into a click's cut (< 0 none)
         bool mHscAttackIdle = true; // the native attack was idle last step
-        bool mHscThrust = false; // the cut under way is a thrust
         std::optional<float> mHscCutReach; // the reach a cut or thrust asks for (arm lengths)
-        float mHscCutFromAz = 0.0f, mHscCutFromEl = 0.0f;
         float mHscReleased = 0.0f; // seconds since the button came up
         float mHscSinceInit = 0.0f; // seconds since it took the arm
         JPH::Vec3 mHscPrevious = JPH::Vec3::sAxisY();
         float mHscRate = 0.0f; // rad/s, filtered
         float mHscReach = 0.0f;
         float mHscTwist = 0.0f, mHscLean = 0.0f, mHscRoll = 0.0f;
-        float mFollowTurnPrevCut = 0.0f, mFollowTurnAmplitude = 0.0f, mFollowTurnTime = 0.0f; // HSC_FOLLOW_TURN
         float mHscReturnTime = 0.4f; // the last return to the guard's length (s)
         // HUD-01 (user 10-30 bookmark: "can we make it so the reticle shows
         // the cooldown to attack again"): 1 = a new attack starts from the
@@ -15777,42 +16526,6 @@
             static const auto value_tuned = RagdollCore::tuned<float>([] { return std::clamp(weaponDriveSetting("OPENMW_RAGDOLL_HSC_WAIT_RETURN", 0.15f), 0.05f, 1.0f); });
             static const auto& value = value_tuned.get();
             return value;
-        }
-        // Momentum chains as combos (user 10-31, after the release): a chained
-        // attack whose new line goes on the way the weapon was already going
-        // (the carried hand velocity toward the new chamber, full at 150 u/s
-        // carried - skill 50-100 already scales what is carried) winds up
-        // faster and its cut costs less fatigue; a chain against its own
-        // momentum gets nothing. OPENMW_RAGDOLL_HSC_CHAIN_FLOW = "wind share,
-        // fatigue share" at full flow (0,0 = off: every chain as before).
-        static const std::array<float, 2>& hscChainFlow()
-        {
-            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                std::array<float, 2> value{ 0.0f, 0.0f };
-                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_CHAIN_FLOW"))
-                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                for (float& v : value)
-                    v = std::isfinite(v) ? std::clamp(v, 0.0f, 0.8f) : 0.0f;
-                return value;
-            });
-            return value_tuned.get();
-        }
-        // The player's riposte (user 10-31): a click within `window` s of a
-        // parry the player won (the clash's knockaway or a blow stopped on the
-        // guard - the NPCs' AI-02 riposte timer) winds up `wind share` as long:
-        // it lands while the beaten attacker is still locked out.
-        // OPENMW_RAGDOLL_HSC_RIPOSTE = "window s, wind share" (window 0 = off).
-        static const std::array<float, 2>& hscRiposte()
-        {
-            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                std::array<float, 2> value{ 0.0f, 0.5f };
-                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_RIPOSTE"))
-                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                value[0] = std::isfinite(value[0]) ? std::clamp(value[0], 0.0f, 2.0f) : 0.0f;
-                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 0.2f, 1.0f) : 1.0f;
-                return value;
-            });
-            return value_tuned.get();
         }
         // GRIP-05 (user 10-31: "they give armour a real answer"): a long
         // blade's grips. Half-sword: the support hand on the blade `blade
@@ -16098,15 +16811,119 @@
         }
         float mLeftJabTime = -1.0f; // s into the jab, -1 = none
         bool mLeftJabStriking = false; // its fist strikes (the contact callback publishes it)
+        // FIST-05: the left fist's punch (fistcontrol), in the wheel's chest frame.
+        float mLeftFistTime = -1.0f; // s into it, -1 = none
+        float mLeftFistTwist = 0.0f; // its share of the trunk's turn (radians, + = the left shoulder in)
+        RagdollCore::PunchKind mLeftFistKind = RagdollCore::PunchKind::Straight;
+        RagdollCore::PunchTiming mLeftFistTiming;
+        float mRightPunchFatigue = 1.0f;
+        std::optional<JPH::RVec3> mFistCentre;
+        JPH::Vec3 mFistRight = JPH::Vec3::sAxisX(), mFistForward = JPH::Vec3::sAxisY(), mFistUp = JPH::Vec3::sAxisZ();
+        // FIST-06 (K2_FIST_STEER): the steered fists. The left button's
+        // press comes through the swing input, the right button's here
+        // (mouse counts since the last step).
+        RagdollCore::FistSteer mFistSteer;
+        struct LeftFistInput
+        {
+            bool mHeld = false;
+            bool mCancel = false;
+            float mRight = 0.0f, mUp = 0.0f;
+        };
+        LeftFistInput mLeftFistInput;
+        void driveLeftFist(float countsRight, float countsUp, bool held, bool cancel)
+        {
+            mLeftFistInput.mRight += countsRight;
+            mLeftFistInput.mUp += countsUp;
+            mLeftFistInput.mHeld = held && !cancel;
+            mLeftFistInput.mCancel = mLeftFistInput.mCancel || cancel;
+        }
+        std::optional<RagdollCore::FistSteerHold> mLeftFistHold; // the left fist held, the wheel's chest frame
+        std::optional<JPH::RVec3> mLeftPunchTarget; // the left punch's hand target this step, world (K2_FIST_DRIVE)
+        float mLeftHoldTwist = 0.0f; // its share of the trunk's turn
+        // The left fist's places are the right's mirrored across the body,
+        // which holds for shoulders level across the chest frame. The stance
+        // is not: the left shoulder leads (11-16: it sat at -6,9,5 in the
+        // chest frame, the right's mirror at -7,-9,5), so the mirrored
+        // wind-ups lay beside and behind the left shoulder (the hook's 16 u
+        // to its side, 1 u behind it) and the arm could not go there (asked
+        // 16 u to the side it held -4 to -1; the fist drive and slack motors
+        // changed nothing). This is the left shoulder's place less the
+        // right's mirrored (chest frame): added, the left fist's places sit
+        // about its own shoulder as the right's do about the right one.
+        JPH::Vec3 mLeftFistShift = JPH::Vec3::sZero();
+        // That shift for the left punch `time` s in: all of it through the
+        // wind-up (it starts where the fist was held), gone by the end of the
+        // strike (the punch lands on its line, as FIST-05's).
+        JPH::Vec3 leftPunchShift(float time) const
+        {
+            if (!mLeftFistLine || !mLeftFistFrom)
+                return JPH::Vec3::sZero();
+            const float u = std::clamp(
+                (time - mLeftFistTiming.mWind) / std::max(1e-3f, mLeftFistTiming.mCut), 0.0f, 1.0f);
+            return mLeftFistShift * (1.0f - u * u * (3.0f - 2.0f * u));
+        }
+        // The left punch's line (null: FIST-05's, by its kind) and the held
+        // place it starts from.
+        const RagdollCore::AttackLine* mLeftFistLine = nullptr;
+        std::optional<JPH::Vec3> mLeftFistFrom;
+        RagdollCore::FistPunchPose leftFistPose(float time, bool fromHeld = true) const
+        {
+            if (mLeftFistLine)
+                return RagdollCore::fistLinePunchPose(*mLeftFistLine, RagdollCore::FistHand::Left, mLeftFistTiming,
+                    time, fromHeld && mLeftFistFrom ? &*mLeftFistFrom : nullptr);
+            return RagdollCore::fistPunchPose(mLeftFistKind, RagdollCore::FistHand::Left, mLeftFistTiming, time);
+        }
+        bool startLeftSteerPunch(const RagdollCore::FistSteerPunch& punch)
+        {
+            if (!startLeftFistPunch(punch.mKind, punch.mPower))
+                return false;
+            mFistPower[0] = punch.mWound ? punch.mPower : 0.0f;
+            const auto& lines = RagdollCore::fistLines();
+            mLeftFistLine = &lines[std::min(punch.mLine, lines.size() - 1)];
+            mLeftFistFrom.reset();
+            if (punch.mWound)
+            {
+                // Wound up by hand already: half a quick punch's wind-up to the chamber.
+                mLeftFistFrom = punch.mFrom;
+                // K2_FIST_WOUND: a hook's or uppercut's share, and its strike's least time.
+                mLeftFistTiming.mWind = RagdollCore::woundWindShare(punch.mKind, k2FistWound()[1])
+                    * RagdollCore::punchTiming(punch.mKind, 0.0f, mWeaponControl).mWind;
+                mLeftFistTiming.mCut
+                    = RagdollCore::woundStrikeSeconds(mLeftFistTiming.mCut, punch.mKind, k2FistWound()[0]);
+            }
+            return true;
+        }
+        bool startLeftFistPunch(RagdollCore::PunchKind kind, float power)
+        {
+            if (!mLeftArm || mLeftFistTime >= 0.0f || mLeftJabTime >= 0.0f || !mHscStriker || !mHscStriker->mFist)
+                return false;
+            mLeftFistLine = nullptr;
+            mLeftFistFrom.reset();
+            mLeftFistKind = kind;
+            mLeftFistTiming = RagdollCore::punchTiming(kind, power, mWeaponControl);
+            mLeftFistTime = 0.0f;
+            ++mJabCount;
+            mCommitSwishSize = 0.6f + 0.4f * std::clamp(power, 0.0f, 1.0f);
+            mCommitFatigue = mLeftFistTiming.mFatigue;
+            ++mCommitSwishRequests;
+            return true;
+        }
         bool mNextPunchLeft = true; // the next click's punch is the jab
         float mSincePunch = 1.0e9f; // s since the last punch began
         std::uint64_t mJabCount = 0;
         // A click with bare fists: the jab when it is the left hand's turn.
-        bool startLeftJab()
+        // `forced` (K2_FISTS, a drag to the left): the left fist now, whoever's turn.
+        bool startLeftJab(bool forced = false)
         {
             if (fistAlternateSettings()[0] <= 0.0f || getPtr() != MWMechanics::getPlayer() || !mLeftArm
                 || !mHscStriker || !mHscStriker->mFist)
                 return false;
+            if (forced)
+            {
+                if (mLeftJabTime >= 0.0f)
+                    return false;
+                mNextPunchLeft = true;
+            }
             if (mSincePunch > 1.0f)
                 mNextPunchLeft = true;
             if (!mNextPunchLeft || mLeftJabTime >= 0.0f)
@@ -16129,6 +16946,23 @@
         void stepLeftJab(float duration)
         {
             mSincePunch += duration;
+            if (mLeftFistTime >= 0.0f)
+            {
+                mLeftFistTime += duration;
+                const auto pose = leftFistPose(mLeftFistTime);
+                mLeftJabStriking = pose.mStriking;
+                // K2_LEFT_PUNCH: the punch's keyed turn, for the trunk.
+                mLeftFistTwist = osg::DegreesToRadians(pose.mTwistDegrees) * k2LeftPunch()[0];
+                if (pose.mDone || !mLeftArm)
+                {
+                    mLeftPunchTarget.reset();
+                    mLeftFistTime = -1.0f;
+                    mLeftJabStriking = false;
+                    mLeftFistTwist = 0.0f;
+                }
+                return;
+            }
+            mLeftFistTwist = 0.0f;
             if (mLeftJabTime < 0.0f)
             {
                 mLeftJabStriking = false;
@@ -16605,6 +17439,140 @@
             static const auto& value = value_tuned.get();
             return value;
         }
+        // K2_HAFT_GRIP (registry): "share, speed u/s, minimum u" - the support
+        // hand slides along a long haft (ragdollcore wheeloutput haftGripTarget).
+        static const RagdollCore::HaftGripSettings& k2HaftGripSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<RagdollCore::HaftGripSettings>([] {
+                std::array<float, 3> v{ 0.0f, 60.0f, 8.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_HAFT_GRIP", v);
+                RagdollCore::HaftGripSettings s;
+                s.mShare = std::isfinite(v[0]) ? std::clamp(v[0], 0.0f, 1.0f) : 0.0f;
+                s.mSpeed = std::isfinite(v[1]) ? std::clamp(v[1], 0.0f, 400.0f) : 60.0f;
+                s.mMinimum = std::isfinite(v[2]) ? std::clamp(v[2], 4.0f, 40.0f) : 8.0f;
+                return s;
+            });
+            return value_tuned.get();
+        }
+        // K2_SPEAR_THRUST (registry): "player, npc" - a spear's thrust points at the aim.
+        static const std::array<float, 2>& k2SpearThrust()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_SPEAR_THRUST", value);
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // K2_POINT_AIM (registry): "cone deg, counts a radian, flick counts in 0.2 s" -
+        // the player's held spear is carried point-forward and the
+        // mouse moves the point (ragdollcore wheelplanner, WheelActor::mPointCone).
+        static const std::array<float, 3>& k2PointAim()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                std::array<float, 3> value{ 0.0f, 1800.0f, 500.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_POINT_AIM", value);
+                value[0] = std::isfinite(value[0]) ? std::clamp(value[0], 0.0f, 45.0f) : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 100.0f, 10000.0f) : 1800.0f;
+                value[2] = std::isfinite(value[2]) ? std::clamp(value[2], 50.0f, 100000.0f) : 500.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // K2_POINT_POSE (registry): "right, forward, up, twist deg, draw, reach,
+        // grip" - the point guard's weapon hand (chest-centre frame), the
+        // chest's turn, its thrust's draw back and reach, the rear hand's
+        // distance behind the weapon hand.
+        static const std::array<float, 7>& k2PointPose()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 7>>([] {
+                std::array<float, 7> value{ -9.0f, 18.0f, -6.0f, -35.0f, 6.0f, 20.0f, 21.0f };
+                const std::array<float, 7> fallback = value;
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_POINT_POSE", value);
+                for (std::size_t i = 0; i < value.size(); ++i)
+                    if (!std::isfinite(value[i]))
+                        value[i] = fallback[i];
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // K2_HAFT_LINES (registry): "spear, staff" - the player's long haft
+        // swings on its own lines, authored by both hands (ragdollcore
+        // cutwheel haftLines).
+        static const std::array<float, 2>& k2HaftLines()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_HAFT_LINES", value);
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // K2_HAFT_CHOP (registry): "spear, staff" - the haft's chop is wound up
+        // behind the back.
+        static const std::array<float, 2>& k2HaftChop()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_HAFT_CHOP", value);
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // K2_HAFT_NPC (registry): "spear, staff" - NPCs' hafts on the haft's
+        // lines too (K2_HAFT_LINES, _GUARD, _THRUST, _CHOP as the player's).
+        static const std::array<float, 2>& k2HaftNpc()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_HAFT_NPC", value);
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // K2_HAFT_GUARD (registry): "spear, staff" - the haft's own guard, the
+        // butt beside the support hip; HSC_HAFT_CLEAR does not turn it.
+        static const std::array<float, 2>& k2HaftGuard()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_HAFT_GUARD", value);
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // K2_HAFT_THRUST (registry): "spear, staff" - the haft's dragged
+        // thrust is its own, side-on.
+        static const std::array<float, 2>& k2HaftThrust()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_HAFT_THRUST", value);
+                return value;
+            });
+            return value_tuned.get();
+        }
+        // K2_HAFT_PIVOT (registry): share (ragdollcore wheeloutput pivotBetweenHands).
+        static float k2HaftPivot()
+        {
+            static const auto value_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HAFT_PIVOT");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+            });
+            return value_tuned.get();
+        }
+        // K2_FOREARM_ROLL (registry): radians each way.
+        static float k2ForearmRoll()
+        {
+            static const auto value_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_FOREARM_ROLL");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 1.6f) : 0.0f;
+            });
+            return value_tuned.get();
+        }
+        float mHaftPivotShift = 0.0f; // the last step's pivot shift of the weapon hand (units, for traces)
         float mHaftClearTurn = 0.0f; // the last step's turn out (radians, for traces)
         std::uint64_t mDownStrikeLogged = 0; // DOWN_NO_STRIKE log throttle (physics step)
         std::string mHaftLogged;
@@ -16658,94 +17626,12 @@
                 mHaftClearTurn += std::acos(std::clamp(blade.Dot(newBlade), -1.0f, 1.0f));
             }
         }
-        // Hand rotations of a route's keys. The cut route's edges face the
-        // way the blade moves toward the follow-through; the wind-up route's
-        // face back toward the guard, and its chamber takes the cut's, so the
-        // turn from one route into the other is seamless.
-        static std::optional<std::vector<JPH::Quat>> routeRotations(const std::vector<ChamberKey>& keys,
-            const RagdollCore::WeaponStrikeAxes& axes, bool towardEnd, const std::optional<JPH::Quat>& last)
-        {
-            std::vector<JPH::Quat> rotations(keys.size());
-            for (std::size_t i = 0; i < keys.size(); ++i)
-            {
-                std::optional<JPH::Quat> rotation;
-                if (i + 1 == keys.size() && last)
-                    rotation = last;
-                else
-                {
-                    const JPH::Vec3 blade = keys[i].mBlade.Normalized();
-                    const JPH::Vec3 before = keys[i > 0 ? i - 1 : 0].mBlade.Normalized();
-                    const JPH::Vec3 after = keys[i + 1 < keys.size() ? i + 1 : i].mBlade.Normalized();
-                    const JPH::Vec3 moving = keys[i].mEdge.IsNearZero() ? (towardEnd ? after - before : before - after)
-                                                                        : keys[i].mEdge;
-                    rotation = RagdollCore::alignedStrikeHandRotation(axes, blade, moving);
-                }
-                if (!rotation)
-                    return std::nullopt;
-                rotations[i] = rotation->Normalized();
-                if (i > 0 && rotations[i].Dot(rotations[i - 1]) < 0.0f)
-                    rotations[i] = -rotations[i];
-            }
-            return rotations;
-        }
-        static ChamberPose routePose(const std::vector<ChamberKey>& keys, const std::vector<JPH::Quat>& rotations, float s)
-        {
-            s = std::clamp(s, keys.front().mS, keys.back().mS);
-            std::size_t i = 0;
-            while (i + 2 < keys.size() && s > keys[i + 1].mS)
-                ++i;
-            const float t = (s - keys[i].mS) / std::max(1e-4f, keys[i + 1].mS - keys[i].mS);
-            const auto key = [&](std::ptrdiff_t k) -> const ChamberKey& {
-                return keys[static_cast<std::size_t>(std::clamp<std::ptrdiff_t>(k, 0, keys.size() - 1))];
-            };
-            const auto spline = [&](auto get) {
-                const auto p0 = get(key(static_cast<std::ptrdiff_t>(i) - 1)), p1 = get(key(i)), p2 = get(key(i + 1)),
-                           p3 = get(key(static_cast<std::ptrdiff_t>(i) + 2));
-                const float t2 = t * t, t3 = t2 * t;
-                return (p1 * 2.0f + (p2 - p0) * t + (p0 * 2.0f - p1 * 5.0f + p2 * 4.0f - p3) * t2
-                           + (p1 * 3.0f - p0 - p2 * 3.0f + p3) * t3)
-                    * 0.5f;
-            };
-            ChamberPose pose;
-            pose.mHand = spline([](const ChamberKey& k) { return k.mHand; });
-            pose.mTwist = osg::DegreesToRadians(spline([](const ChamberKey& k) { return k.mTwistDegrees; }));
-            // The blade and the elbow on the same spline as the hand (FLOW-01):
-            // a slerp per segment turned the blade at a constant rate between
-            // keys and changed that rate at every key, a jolt built into the
-            // route. The keys' rotations share one hemisphere (routeRotations),
-            // so a Catmull-Rom of their components, normalized, is smooth.
-            // OPENMW_RAGDOLL_HSC_SMOOTH_KEYS=0 = per-segment slerp.
-            static const auto smoothKeys_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_SMOOTH_KEYS", 1.0f) > 0.0f; });
-            static const auto& smoothKeys = smoothKeys_tuned.get();
-            if (smoothKeys)
-            {
-                pose.mPole = spline([](const ChamberKey& k) { return k.mPole; }).NormalizedOr(keys[i].mPole);
-                const auto rotation = [&](std::ptrdiff_t k) {
-                    return rotations[static_cast<std::size_t>(std::clamp<std::ptrdiff_t>(k, 0, rotations.size() - 1))]
-                        .GetXYZW();
-                };
-                const auto p0 = rotation(static_cast<std::ptrdiff_t>(i) - 1), p1 = rotation(i), p2 = rotation(i + 1),
-                           p3 = rotation(static_cast<std::ptrdiff_t>(i) + 2);
-                const float t2 = t * t, t3 = t2 * t;
-                const JPH::Vec4 r = (p1 * 2.0f + (p2 - p0) * t + (p0 * 2.0f - p1 * 5.0f + p2 * 4.0f - p3) * t2
-                                        + (p1 * 3.0f - p0 - p2 * 3.0f + p3) * t3)
-                    * 0.5f;
-                pose.mRotation = r.Length() > 1e-4f ? JPH::Quat(r).Normalized() : rotations[i];
-            }
-            else
-            {
-                pose.mPole = (keys[i].mPole * (1.0f - t) + keys[i + 1].mPole * t).NormalizedOr(keys[i].mPole);
-                pose.mRotation = rotations[i].SLERP(rotations[i + 1], t).Normalized();
-            }
-            return pose;
-        }
         enum class AttackStage { Guard, Wind, Cut, Recover };
         AttackStage mAttackStage = AttackStage::Guard;
         int mAttackLine = -1; // the nearer of the two lines in play (attackLines()), -1 none
         float mAttackAngle = 0.0f; // the wind-up drag's angle on the wheel, radians (0 right, pi/2 up)
         float mAttackCutAngle = 0.0f; // the angle the cut began at
         float mAttackWind = 0.0f, mAttackCut = 0.0f; // along the routes, 0..1
-        float mAttackDragRight = 0.0f, mAttackDragUp = 0.0f; // the drag that picks a line, counts
         float mAttackRecover = 0.0f; // seconds into the return to the guard
         // The route position shown (0..1 wind-up, 1..2 cut) and its rate:
         // the mouse's position eased by a critically damped spring.
@@ -16756,15 +17642,10 @@
         float mStanceX = 0.0f, mStanceY = 0.0f, mStrokeVX = 0.0f, mStrokeVY = 0.0f;
         float mCutStrokeX = 0.0f, mCutStrokeY = -1.0f, mCutAccX = 0.0f, mCutAccY = 0.0f;
         bool mSnapCut = false;
-        float mCutFromU = 0.0f; // the cut position mCutFrom blends from
         float mChainTime = 0.0f; // seconds since a chain began
-        std::optional<JPH::Quat> mChainWayTarget;
         float mCutOverflow = 0.0f; // counts dragged on past the end of the follow-through
         float mInwardPending = 0.0f; // inward counts from deep not yet taken as a retraction or a cut
-        float mCutTravel = 0.0f; // inward counts since the stroke last moved outward
-        float mLastCutAlong = 0.0f; // this step's drag along the cut's stroke (counts)
         bool mWaitRecover = false; // a press below the chain skill waits for the guard
-        bool mHscClickQueued = false; // a click released during that wait, played at the guard
         // Clash recoil on the attack wheel (user 10-05, build 57: "weapon
         // clashes should bounce more, with more force"). The wheel owns the
         // arm since build 36, and the tip controller's recoil and parry knock
@@ -16788,7 +17669,9 @@
         {
             if (!mHscActive || worldOffset.IsNearZero())
                 return;
-            const float skillLoss = std::clamp((1.0f - mWeaponControl) / 0.8f, 0.0f, 1.0f);
+            // K2_ARM_STRAIN: a strained arm comes back from a knock as an unskilled one.
+            const float control = mWeaponControl * armStrength();
+            const float skillLoss = std::clamp((1.0f - control) / 0.8f, 0.0f, 1.0f);
             mHscKnock = worldOffset;
             mHscKnockTime = 0.0f;
             mHscKnockRecovery = (0.35f + 0.35f * skillLoss) * (chain ? 0.5f : 1.0f);
@@ -16798,6 +17681,7 @@
             mHscKnockHandStart.reset();
             mHscKnockMoved = 0.0f;
             ++mHscKnockCount;
+            mWheel.beginKnock(worldOffset, endStroke, chain, control);
         }
         // The cut begins from where the weapon was (a cut along another line
         // than the wind-up's, a snap cut from a stance): blended into the
@@ -16805,27 +17689,19 @@
         std::optional<ChamberPose> mCutFrom;
         // Momentum carried into a chained attack: the last pose's hand
         // velocity (units/s) and spin (rad/s), body frame, decaying.
-        JPH::Vec3 mChainVelocity = JPH::Vec3::sZero(), mChainSpin = JPH::Vec3::sZero();
         // HSC_CHAIN_FLOW: the line of the attack a chain left (its cut's
         // angle on the wheel) and how much of its momentum was still there
         // (1 in the cut and its hold, fading through the return), whether
         // the new line is still to be read against it, and how much the new
         // attack goes on with the old one's motion (0-1).
-        float mChainPrevAngle = 0.0f;
-        float mChainTiming = 0.0f;
-        bool mChainFlowPending = false;
         float mChainFlowGain = 0.0f;
         bool mPlayerRiposte = false; // HSC_RIPOSTE: this click answers a parry the player won
-        std::optional<ChamberPose> mAttackPrevPose;
         std::optional<JPH::Vec3> mMeasuredHandBody; // the physical hand, chest-centre frame
         JPH::Vec3 mMeasuredHandVelocity = JPH::Vec3::sZero(); // its velocity, filtered (units/s)
         float mHscTwistLead = 0.0f; // the chest turn a moment ahead (the hips lead the chest)
         float mHscDrivePhase = 1.0f; // weapon drive stiffness: stiff in the cut, soft in the follow-through
-        float mFollowHeld = 0.0f; // seconds held at the cut's end
         float mCutPlaneMiss = 0.0f; // diagnostics: the commanded tip's distance from the cut plane
         float mHscFoeAssist = 0.0f; // diagnostics: the foe assist's weight on the cut plane (0..1)
-        bool mHscAimTraced = false, mHscAimMidTraced = false;
-        float mHscFoeTwist = 0.0f, mHscFoeLean = 0.0f; // the body's share of the foe assist (radians)
         // Steering in the cut (aim item 3): the cut's aim offset asked by the
         // mouse across the stroke, and the share given so far (radians, screen
         // right and up).
@@ -16834,21 +17710,17 @@
         // bend and the Footfall knee bend follow it.
         float mHscLow = 0.0f, mHscLowWant = 0.0f;
         float mHscAimElevation = 0.0f; // the cut's aim (radians, up positive), for the low stance
-        JPH::Vec3 mHscAimPointLocal = JPH::Vec3::sZero(); // diagnostics: the aim point from the chest (body frame)
-        float mHscAimRayZ = 0.0f; // diagnostics: the camera ray's up component
         // The chest centre's offset from the pelvis in the body frame, learned
         // in the guard (the pelvis frame).
         std::optional<JPH::Vec3> mHscCentreOffset;
         // Chaining (Meyer's square): a press during an attack or its return
         // starts the next attack from where the weapon is.
         std::optional<ChamberPose> mChainFrom;
-        bool mPathWasHeld = false;
         // A click's attack, played by the controller (the project's one-click
         // attack): wind-up then cut at the weapon's own pace.
         bool mAutoAttack = false;
         std::optional<ChamberPose> mAttackRecoverFrom;
         std::optional<ChamberPose> mAttackLastPose;
-        ChamberPose mHscBlockFrom{}; // where the block began
         // Diagnostics: the route position (wind 0..1, cut 1..2).
         float mChamberS = 0.0f;
         // Diagnostics for the chamber path (tests, trace): the solved hand's
@@ -16868,6 +17740,7 @@
             float mTip = 0.0f;
             float mWeight = 10.0f;
             bool mTwoHanded = false, mWideSpearGrip = false, mShortBlade = false, mShoulderRestStance = false;
+            bool mWideStaffGrip = false;
             std::string mRecordId;
         };
         std::optional<HscStriker> mHscStriker;
@@ -16885,43 +17758,33 @@
             static const auto& value = value_tuned.get();
             return value;
         }
-        // Fists' and daggers' own click timing (user 10-30: "the click makes
-        // the fist go forward but its not a good range punch and it returns
-        // too quickly to the normal position"). At the weapon pace a light
-        // striker's click wound up in 0.12 s and punched in 0.08 s - faster
-        // than the arm straightens - then held 0.3 s and came back in 0.4.
-        // OPENMW_RAGDOLL_HSC_SHORT_PACE = "wind s, cut s, hold s, return s"
-        // for clicks with fists and short blades (0 = the weapon pace).
-        static const std::array<float, 4>& shortPaceSettings()
-        {
-            static const auto value_tuned = RagdollCore::tuned<std::array<float, 4>>([] {
-                std::array<float, 4> v{ 0.0f, 0.0f, 0.0f, 0.0f };
-                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_SHORT_PACE"))
-                    std::sscanf(text, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]);
-                for (float& u : v)
-                    u = std::isfinite(u) ? std::clamp(u, 0.0f, 2.0f) : 0.0f;
-                return v;
-            });
-            static const auto& value = value_tuned.get();
-            return value;
-        }
         bool shortStriker() const { return hscStriker().mFist || hscStriker().mShortBlade; }
-        // Fists' and daggers' straights reach for the crosshair (user 10-30):
-        // a thrust's keys end at a fixed hand place, so a foe a little further
-        // off was never reached, and the aim only turned the line. In the cut,
-        // the hand goes out along the aim until the tip is `through` units past
-        // the aimed point, at most `most` units beyond its key.
-        // OPENMW_RAGDOLL_HSC_SHORT_REACH = "through, most" (0 = off).
-        static const std::array<float, 2>& shortReachSettings()
+        // The skill of what the right hand strikes with: the weapon's own,
+        // Hand-to-hand for bare fists (0 until 11-03, so fists never chained:
+        // user "fix fists"), 0 for a lockpick or probe (no skill; getSkill
+        // throws on it, which ended every frame early - TOOL-01).
+        float strikerSkill() const
         {
-            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                std::array<float, 2> v{ 0.0f, 0.0f };
-                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_SHORT_REACH"))
-                    std::sscanf(text, "%f,%f", &v[0], &v[1]);
-                return v;
-            });
-            static const auto& value = value_tuned.get();
-            return value;
+            const auto& inventory = getPtr().getClass().getInventoryStore(getPtr());
+            const auto item = inventory.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
+            const ESM::RefId skillId
+                = item == inventory.end() ? ESM::Skill::HandToHand : item->getClass().getEquipmentSkill(*item);
+            return skillId.empty() ? 0.0f : getPtr().getClass().getSkill(getPtr(), skillId);
+        }
+        // A downed foe (HSC_DOWN_AIM): its chest under 45 units above the floor
+        // the fighter stands on - lying or on its knees (a standing chest is
+        // 90-100). Measured against the own chest instead, the stoop it causes
+        // lifted the foe back over the line (DOWN-01).
+        // OPENMW_RAGDOLL_HSC_DOWN_AIM = lowest aim at it, radians (1.3; 0 = off).
+        static float downAimSetting()
+        {
+            static const auto value_tuned = RagdollCore::tuned<float>([] { return std::min(weaponDriveSetting("OPENMW_RAGDOLL_HSC_DOWN_AIM", 1.3f), 1.3f); });
+            return value_tuned.get();
+        }
+        bool hscFoeDowned() const
+        {
+            return downAimSetting() > 0.0f && mHscFoe && std::isfinite(mHscFoe->GetZ())
+                && mHscFoe->GetZ() - getPtr().getRefData().getPosition().pos[2] < 45.0f;
         }
         static bool fistStaggerRelease()
         {
@@ -16952,9 +17815,11 @@
                 striker.mBladeAxis = mWeapon->mBladeAxis;
                 striker.mEdgeAxis = mWeapon->mEdgeAxis;
                 striker.mTip = std::max(mWeapon->tipDistanceFromHand(), 0.0f);
-                striker.mWeight = mWeapon->mItemWeight;
+                // Paced at K2_PACE_FLOOR's weight (the wheel, the route, the hand drive).
+                striker.mWeight = mWeapon->mPaceWeight > 0.0f ? mWeapon->mPaceWeight : mWeapon->mItemWeight;
                 striker.mTwoHanded = mWeapon->mTwoHanded;
                 striker.mWideSpearGrip = mWeapon->mWideSpearGrip;
+                striker.mWideStaffGrip = mWeapon->mWideStaffGrip;
                 striker.mShortBlade = mWeapon->mShortBlade;
                 striker.mShoulderRestStance = mWeapon->mShoulderRestStance;
                 striker.mRecordId = mWeapon->mRecordId;
@@ -17019,7 +17884,18 @@
             mClashLockout = std::max(0.0f, mClashLockout - duration);
             // V2: while a reaction has the weapon arm (a stagger, a flung
             // arm) no new attack starts; one already held goes on.
-            const bool armBusy = mReactionV2Step.mWeaponArmBusy && !mHscWasHeld;
+            // K2_AI_STAGGER_CUT: an NPC the AI sends through its stagger.
+            mFightThroughGranted = std::max(0.0f, mFightThroughGranted - duration);
+            {
+                const bool wasSpent = mArmStrain.spent();
+                mArmStrain.step(duration, armStrainSettings());
+                if (mArmStrain.spent())
+                    mWheel.openGuard(0.1f); // no block while the arm is spent
+                else if (wasSpent)
+                    Log(Debug::Info) << "RAGDOLL_K2_ARM_STRAIN actor=" << getPtr().getCellRef().getRefId()
+                                     << " recovered strain=" << mArmStrain.strain();
+            }
+            const bool armBusy = mReactionV2Step.mWeaponArmBusy && !mHscWasHeld && mFightThroughGranted <= 0.0f;
             const bool held = mClashLockout <= 0.0f && !armBusy
                 && ((mNativeStrikeInput ? mNativeStrikeHeld : mSwingInput.mHeld) || mNativeStrikePressLatch);
             // The guard key's block is the tip controller's, except on the
@@ -17027,6 +17903,8 @@
             if (!eligible || (mGuardActive && !held && !(chamberPathMode() && hscBlocks())))
             {
                 mHscWasHeld = false;
+                mLeftFistHold.reset();
+                mLeftHoldTwist = 0.0f;
                 if (mHscActive)
                 {
                     if (RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
@@ -17034,6 +17912,7 @@
                                          << " attached=" << (mWeapon && mWeapon->mAttached)
                                          << " phase=" << static_cast<int>(mAnimationAttack.mPhase);
                     mHscActive = false;
+                    mK2CutElbowSpeed = 0.0f;
                     mHscFistStrike = false;
                     mThrustDrive = mThrustDriveWant = 0.0f;
                     mHscPreview.clear();
@@ -17141,6 +18020,7 @@
                     mAttackLastPose = taken;
                     mChainFrom.reset();
                     mAutoAttack = false;
+                    mWheel.take({ taken.mHand, taken.mPole, taken.mRotation, taken.mTwist });
                 }
             }
             const bool pressed = held && !mHscWasHeld;
@@ -17178,2175 +18058,147 @@
             }
             // The attack path is the only mode (consolidation 2026-10-03: the
             // older free-hand mode was no longer reached in play).
-            return stepChamberPath(duration, profile, rigProfile, held, centre, frame, armLength);
+            mK2CutElbowSpeed = 0.0f;
+            return stepK2Wheel(duration, profile, rigProfile, held, centre, frame, armLength);
         }
 
-        bool stepChamberPath(float duration, const RagdollCore::WeaponSwingProfile& profile,
+        // The cut wheel through ragdollcore's planner (wheelplanner, wheelaim,
+        // wheeloutput; docs/ragdoll/designs/K2-WEAPON-phase1.md), on the hand
+        // drive - the arm request, drive phase, trunk and contact fields
+        // published where the rest of this file reads them.
+        RagdollCore::WheelPlanner mWheel;
+        RagdollCore::NpcGuardHold mWheelHold;
+
+        // The click's line (the intent stage, still here until NPCs move):
+        // Morrowind's attack type or the movement keys for the player, the
+        // turn and the open line for an NPC, the weapon's own rules, the
+        // diagonal toward a foe off to one side.
+        float wheelClickLine(JPH::RVec3Arg centre, const TipFrame& frame, bool nativeStarted, bool spearThrusts,
+            bool spearSwings)
+        {
+            const auto& movement = getPtr().getClass().getMovementSettings(getPtr());
+            const float side = movement.mPosition[0], forward = movement.mPosition[1];
+            float angle = osg::PIf * 0.5f;
+            const std::string& nativeType = mAnimationAttack.mAttackType;
+            const bool player = getPtr() == MWMechanics::getPlayer();
+            if (!player)
+            {
+                const unsigned turn = mNpcLineTurn++;
+                const float q = osg::PIf * 0.25f;
+                const std::array<float, 4> slashes{ 0.0f, osg::PIf, 7.0f * q, 5.0f * q };
+                const std::array<float, 3> chops{ osg::PIf * 0.5f, q, 3.0f * q };
+                const std::array<float, 8> all{ 0.0f, osg::PIf * 0.5f, osg::PIf, q, osg::PIf * 1.5f, 3.0f * q, 7.0f * q,
+                    5.0f * q };
+                const float* lines = all.data();
+                int count = 8;
+                if (nativeType == "thrust")
+                {
+                    angle = osg::PIf * 1.5f;
+                    count = 0;
+                }
+                else if (nativeType == "slash")
+                {
+                    angle = slashes[turn % 4];
+                    lines = slashes.data();
+                    count = 4;
+                }
+                else if (nativeType == "chop")
+                {
+                    angle = chops[turn % 3];
+                    lines = chops.data();
+                    count = 3;
+                }
+                else
+                    angle = all[turn % 8];
+                // AI-02 item 4: a skilled fighter cuts the line its foe's guard
+                // leaves open (OPENMW_RAGDOLL_AI_LINES).
+                static const auto aiLines_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                    std::array<float, 2> value{ -1.0f, -1.0f };
+                    const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_AI_LINES");
+                    if (text && std::string_view(text) != "0")
+                    {
+                        value = { 0.2f, 0.8f };
+                        std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                    }
+                    return value;
+                });
+                const auto& aiLines = aiLines_tuned.get();
+                if (aiLines[0] >= 0.0f && count > 0 && mHscFoe)
+                {
+                    RagdollCore::LineChoiceInput choice;
+                    choice.mLines = lines;
+                    choice.mCount = count;
+                    choice.mGuardZone = mHscFoeGuardZone;
+                    if (mHscFoeBlade)
+                    {
+                        choice.mBladeKnown = true;
+                        choice.mBladeX = mHscFoeBlade->GetX();
+                        choice.mBladeZ = mHscFoeBlade->GetZ();
+                    }
+                    choice.mRecent[0] = mNpcRecentLines[0];
+                    choice.mRecent[1] = mNpcRecentLines[1];
+                    const float control = std::clamp((mWeaponControl - 0.2f) / 0.8f, 0.0f, 1.0f);
+                    choice.mBestChance = aiLines[0] + (aiLines[1] - aiLines[0]) * control;
+                    const std::uint64_t hash = (mSerial * 0x9E3779B97F4A7C15ull) ^ (turn * 0xBF58476D1CE4E5B9ull);
+                    choice.mDraw = static_cast<float>((hash >> 17) % 10000) / 10000.0f;
+                    choice.mTurnLine = angle;
+                    angle = RagdollCore::chooseAttackLine(choice);
+                }
+                mNpcRecentLines[1] = mNpcRecentLines[0];
+                mNpcRecentLines[0] = angle;
+            }
+            else if (nativeStarted && !nativeType.empty())
+                angle = nativeType == "thrust" ? osg::PIf * 1.5f : nativeType == "slash" ? 0.0f : osg::PIf * 0.5f;
+            else if (mNativeThrust || (std::abs(forward) > 0.3f && std::abs(forward) >= std::abs(side)))
+                angle = osg::PIf * 1.5f;
+            else if (side > 0.3f)
+                angle = 0.0f;
+            else if (side < -0.3f)
+                angle = osg::PIf;
+            if (spearThrusts)
+                angle = osg::PIf * 1.5f;
+            if (mMurder)
+                angle = osg::PIf * 0.5f;
+            // A fist's, a dagger's and a swinging spear's standing click thrusts.
+            if ((hscStriker().mFist || hscStriker().mShortBlade || spearSwings) && player
+                && std::abs(angle - osg::PIf * 0.5f) < 1e-3f)
+                angle = osg::PIf * 1.5f;
+            // A chop at a foe off to one side comes down the diagonal toward it
+            // (HSC_CLICK_SIDE 8, 18 deg).
+            static const auto clickSides_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 8.0f, 18.0f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_CLICK_SIDE"))
+                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                return value;
+            });
+            const auto& clickSides = clickSides_tuned.get();
+            if (std::min(clickSides[0], clickSides[1]) > 0.0f && mHscFoe && std::abs(angle - osg::PIf * 0.5f) < 1e-3f)
+            {
+                const JPH::Vec3 toFoe(*mHscFoe - centre);
+                float azimuth = std::atan2(toFoe.Dot(frame.mRight), toFoe.Dot(frame.mForward));
+                if (!std::isfinite(azimuth))
+                    azimuth = 0.0f;
+                if (azimuth < -osg::DegreesToRadians(clickSides[0]) && azimuth > -osg::DegreesToRadians(45.0f))
+                    angle = osg::PIf * 0.25f;
+                else if (azimuth > osg::DegreesToRadians(clickSides[1]) && azimuth < osg::DegreesToRadians(45.0f))
+                    angle = osg::PIf * 0.75f;
+            }
+            return angle;
+        }
+
+        bool stepK2Wheel(float duration, const RagdollCore::WeaponSwingProfile& profile,
             const RagdollCore::RagdollProfile& rigProfile, bool held, JPH::RVec3Arg centre, const TipFrame& frame,
             float armLength)
         {
-            // A spear on the wheel (mode 3). OPENMW_RAGDOLL_HSC_SPEAR_THRUST:
-            // 1 = it only thrusts: its every line is the thrust, the drag's
-            // direction only winds it and drives it (a spear swung on the
-            // sword lines struck with the shaft, FIX-08 spear strikes for 0-1
-            // damage - Morrowind's chop and slash numbers for a spear are that
-            // low). 2 (user 10-31: "the spear can only do thrust?") = it
-            // swings on the wheel's other lines like the staff (shaft blows,
-            // Morrowind's chop and slash damage), the down line and a standing
-            // click thrust, and a thrust keeps its line through the drag; NPC
-            // spearmen keep to the thrust (the duels were tuned on it).
-            // 0 = the sword lines, the standing click a chop.
-            static const auto spearThrustSetting_tuned = RagdollCore::tuned<int>([] { return static_cast<int>(weaponDriveSetting("OPENMW_RAGDOLL_HSC_SPEAR_THRUST", 2.0f)); });
-            static const auto& spearThrustSetting = spearThrustSetting_tuned.get();
-            const bool spear = hscStriker().mWideSpearGrip;
-            const bool spearPlayer = getPtr() == MWMechanics::getPlayer();
-            // A half-sword grip (GRIP-05) thrusts on every line, as these spears.
-            const bool spearThrusts = (spear && (spearThrustSetting == 1 || (spearThrustSetting >= 2 && !spearPlayer)))
-                || halfSwordGrip();
-            const bool spearSwings = spear && spearThrustSetting >= 2 && spearPlayer;
-            // 600 mouse counts from the guard to the chamber (about 70 degrees
-            // of a camera turn). OPENMW_RAGDOLL_HSC_PATH_COUNTS.
-            static const auto counts_tuned = RagdollCore::tuned<float>([] { return std::max(50.0f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_PATH_COUNTS", 600.0f)); });
-            static const auto& counts = counts_tuned.get();
-            // The cut route is twice as long in mouse travel (build 30's cut
-            // took 1200 counts from the chamber to the follow-through).
-            // OPENMW_RAGDOLL_HSC_CUT_COUNTS.
-            static const auto cutCounts_tuned = RagdollCore::tuned<float>([] { return std::max(50.0f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_CUT_COUNTS", 2.0f * counts_tuned.get())); });
-            static const auto& cutCounts = cutCounts_tuned.get();
-            // A drag this long (counts) from the guard picks the attack.
-            static const auto pickCounts_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_PICK_COUNTS", 40.0f); });
-            static const auto& pickCounts = pickCounts_tuned.get();
-            const float dragRight = mSwingInput.mAimRight * 256.0f, dragUp = mSwingInput.mAimUp * 256.0f;
-            mSwingInput.mAimRight = mSwingInput.mAimUp = 0.0f;
-            if (const auto handNow = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mHand))
-            {
-                const JPH::Vec3 v(*handNow - centre);
-                const JPH::Vec3 body(v.Dot(frame.mRight), v.Dot(frame.mForward), v.Dot(frame.mUp));
-                if (mMeasuredHandBody && duration > 0.0f)
-                    mMeasuredHandVelocity += ((body - *mMeasuredHandBody) / duration - mMeasuredHandVelocity)
-                        * std::min(1.0f, duration / 0.05f);
-                mMeasuredHandBody = body;
-            }
-            mNativeStrikePressLatch = false;
-            mHscReleased = held ? 0.0f : mHscReleased + duration;
-            mThrustDriveWant = 0.0f;
-            mHscPreview.clear();
-            const auto& lines = hscStriker().mFist ? fistLines() : attackLines();
-            constexpr float tau = 2.0f * osg::PIf, eighth = osg::PIf / 4.0f;
-            const AttackStage stageBefore = mAttackStage;
-            // A new press while an attack is still out (holding after release,
-            // or on its way back) starts the next attack from where the weapon
-            // is: the drag picks the line as from the guard, and the weapon
-            // blends from where it was into the new line over the first half
-            // of the wind-up. Before, the press went on along the old line, so
-            // a quick second attack went the old attack's way.
-            // OPENMW_RAGDOLL_HSC_CHAIN=0 = off.
-            static const auto chain_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CHAIN", 1.0f) > 0.0f; });
-            static const auto& chain = chain_tuned.get();
-            const bool newPress = held && !mPathWasHeld;
-            const bool newRelease = !held && mPathWasHeld;
-            mPathWasHeld = held;
-            // A click (released before its drag picked a line) plays an
-            // attack: Morrowind's own rule picks it - moving forward or back,
-            // or the thrust button, thrusts; strafing slashes (right: the
-            // forehand, left: the backhand); standing chops. The controller
-            // drives the route at the weapon's pace (a longsword 0.35 s up,
-            // 0.25 s down, heavier ones slower by the square root of their
-            // weight) through the same easing as a drag; a press chains.
-            // OPENMW_RAGDOLL_HSC_CLICK=0 = a click does nothing.
-            static const auto clickAttack_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CLICK", 1.0f) > 0.0f; });
-            static const auto& clickAttack = clickAttack_tuned.get();
-            const bool autoBeforePress = mAutoAttack;
-            if (newPress)
-                mAutoAttack = false;
-            // In play a quick click is Morrowind's own attack (the mouse
-            // manager's tap): the attack it starts, with the type Morrowind
-            // picked from the movement, is the click. A press released
-            // without a drag (tests' injected input) is one too.
-            const bool attackIdle = mAnimationAttack.mPhase == MWMechanics::RagdollAttackPhase::Idle;
-            const bool nativeStarted = mHscAttackIdle && !attackIdle;
-            mHscAttackIdle = attackIdle;
-            const bool undragged = std::hypot(mAttackDragRight, mAttackDragUp) < pickCounts;
-            const bool blocking = hscBlocks() && mGuardActive;
-            // The stance circle (roadmap 2026-10-04, item 1). While the button
-            // is held the mouse moves a point round the guard: inside the
-            // radius (OPENMW_RAGDOLL_HSC_STANCE_RADIUS counts, 300) it moves
-            // among compact centred guards - each line's wind-up route up to
-            // its middle key (vom Tag up, the shoulders right and left, Pflug
-            // and Alber low, the diagonals between) - quick to change and
-            // parry-ready. Past the radius is a commitment: the wind-up goes on
-            // behind the body, deeper with distance, into the line's chamber
-            // OPENMW_RAGDOLL_HSC_COMMIT_COUNTS (300) further. From deep, a
-            // move sideways retracts toward the circle first and only then
-            // turns. A fast drag back toward the centre (inward faster than
-            // OPENMW_RAGDOLL_HSC_CUT_SPEED counts/s) is the cut; a quick flick
-            // inside the circle (OPENMW_RAGDOLL_HSC_SNAP_SPEED) a short snap
-            // cut. A slow drag back retracts the wind-up. Released inside the
-            // circle, the stance stays. OPENMW_RAGDOLL_HSC_STANCE=0 = build 37's
-            // pick-and-drag.
-            static const auto stanceMode_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_STANCE", 1.0f) > 0.0f; });
-            static const auto& stanceMode = stanceMode_tuned.get();
-            static const auto stanceRadius_tuned = RagdollCore::tuned<float>([] { return std::max(50.0f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_STANCE_RADIUS", 300.0f)); });
-            static const auto& stanceRadius = stanceRadius_tuned.get();
-            // Calibrated on the user's play (2026-10-04, 4 sessions, 415 presses
-            // of build 35-37 under hand control, raw counts at camera
-            // sensitivity 1): wind-ups went 1900 / 3000 / 4100 counts deep
-            // (p25/p50/p75) and the cuts back 2800 / 4100 / 5300 - five times
-            // what the routes were sized for (600 and 1200), so a typical cut
-            // finished in its first third and the rest of the stroke did
-            // nothing. The chamber is 1500 counts past the circle, the cut 3000.
-            static const auto commitCounts_tuned = RagdollCore::tuned<float>([] { return std::max(50.0f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_COMMIT_COUNTS", 1500.0f)); });
-            static const auto& commitCounts = commitCounts_tuned.get();
-            static const auto stanceCutCounts_tuned = RagdollCore::tuned<float>([] { return std::max(50.0f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_STANCE_CUT_COUNTS", 3000.0f)); });
-            static const auto& stanceCutCounts = stanceCutCounts_tuned.get();
-            // A held stroke runs on into the next wind-up only this far past
-            // the end of its cut: about a fifth of the recorded cuts went that
-            // far (at 60 counts nearly all of them would have).
-            static const auto runOnCounts_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_RUN_ON_COUNTS", 2500.0f); });
-            static const auto& runOnCounts = runOnCounts_tuned.get();
-            // User 10-05 (build 57): the wind-up -> slash threshold "should
-            // need a bit more swinging". On that night's 1798 presses
-            // (tools/body/stance_cut_variants.py) a cut began after 95 inward counts
-            // (2-3 steps) at 1500 counts/s; 2500 counts/s plus 150 counts of
-            // inward travel makes it 225 and loses 1.5% of the cuts (to snap
-            // cuts or retractions).
-            static const auto cutSpeed_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CUT_SPEED", 2500.0f); });
-            static const auto& cutSpeed = cutSpeed_tuned.get();
-            static const auto cutTravel_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CUT_TRAVEL", 150.0f); });
-            static const auto& cutTravel = cutTravel_tuned.get();
-            static const auto snapSpeed_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_SNAP_SPEED", 3500.0f); });
-            static const auto& snapSpeed = snapSpeed_tuned.get();
-            const bool keptStance = stanceMode && !mAutoAttack && mAttackStage == AttackStage::Wind && mAttackWind <= 0.5f;
-            const bool clickNow = clickAttack && !blocking && (mAttackStage == AttackStage::Guard || keptStance)
-                && !mAutoAttack
-                // A native attack starting under a held button is the start
-                // of a drag (or a click still to be released): only one with
-                // the button up is a tap (FLOW-01: firing on every press, the
-                // two-handers' jolts went 0-1 -> 5-19).
-                && ((newRelease && undragged) || (nativeStarted && !held && undragged)
-                    || (mHscClickQueued && !held));
-            // An NPC whose weapon hand is caught behind its back waits to
-            // bring it round before it attacks (ARM_ROUTE).
-            if (clickNow && hscArmTrapped())
-                mHscClickQueued = true;
-            else if (clickNow && startLeftJab())
-                mHscClickQueued = false; // FIST-02: the left hand's jab, the wheel's hand stays
-            else if (clickNow)
-            {
-                mHscClickQueued = false;
-                const auto& movement = getPtr().getClass().getMovementSettings(getPtr());
-                const float side = movement.mPosition[0], forward = movement.mPosition[1];
-                float angle = osg::PIf * 0.5f;
-                const std::string& nativeType = mAnimationAttack.mAttackType;
-                if (getPtr() != MWMechanics::getPlayer())
-                {
-                    // An NPC's attack type spread over its lines in turn: the
-                    // slash forehand, backhand and the low diagonals; the chop
-                    // straight and the two high diagonals. Its attacks mostly
-                    // come as a release with no type: then every line in turn
-                    // (the thrust one in four).
-                    const unsigned turn = mNpcLineTurn++;
-                    const float q = osg::PIf * 0.25f;
-                    const std::array<float, 4> slashes{ 0.0f, osg::PIf, 7.0f * q, 5.0f * q };
-                    const std::array<float, 3> chops{ osg::PIf * 0.5f, q, 3.0f * q };
-                    const std::array<float, 8> all{ 0.0f, osg::PIf * 0.5f, osg::PIf, q, osg::PIf * 1.5f, 3.0f * q,
-                        7.0f * q, 5.0f * q };
-                    const float* lines = all.data();
-                    int count = 8;
-                    if (nativeType == "thrust")
-                    {
-                        angle = osg::PIf * 1.5f;
-                        count = 0;
-                    }
-                    else if (nativeType == "slash")
-                    {
-                        angle = slashes[turn % 4];
-                        lines = slashes.data();
-                        count = 4;
-                    }
-                    else if (nativeType == "chop")
-                    {
-                        angle = chops[turn % 3];
-                        lines = chops.data();
-                        count = 3;
-                    }
-                    else
-                        angle = all[turn % 8];
-                    // AI-02 item 4: a skilled fighter cuts the line its foe's
-                    // guard leaves open (duelread.hpp chooseAttackLine); the
-                    // rest keep the turn. OPENMW_RAGDOLL_AI_LINES = "best
-                    // chance at no control, at full control" (unset = the turn).
-                    static const auto aiLines_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                        std::array<float, 2> value{ -1.0f, -1.0f };
-                        const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_AI_LINES");
-                        if (text && std::string_view(text) != "0")
-                        {
-                            value = { 0.2f, 0.8f };
-                            std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                        }
-                        return value;
-                    });
-                    static const auto& aiLines = aiLines_tuned.get();
-                    if (aiLines[0] >= 0.0f && count > 0 && mHscFoe)
-                    {
-                        RagdollCore::LineChoiceInput choice;
-                        choice.mLines = lines;
-                        choice.mCount = count;
-                        choice.mGuardZone = mHscFoeGuardZone;
-                        if (mHscFoeBlade)
-                        {
-                            choice.mBladeKnown = true;
-                            choice.mBladeX = mHscFoeBlade->GetX();
-                            choice.mBladeZ = mHscFoeBlade->GetZ();
-                        }
-                        choice.mRecent[0] = mNpcRecentLines[0];
-                        choice.mRecent[1] = mNpcRecentLines[1];
-                        const float control = std::clamp((mWeaponControl - 0.2f) / 0.8f, 0.0f, 1.0f);
-                        choice.mBestChance = aiLines[0] + (aiLines[1] - aiLines[0]) * control;
-                        const std::uint64_t hash = (mSerial * 0x9E3779B97F4A7C15ull) ^ (turn * 0xBF58476D1CE4E5B9ull);
-                        choice.mDraw = static_cast<float>((hash >> 17) % 10000) / 10000.0f;
-                        choice.mTurnLine = angle;
-                        angle = RagdollCore::chooseAttackLine(choice);
-                        if (RagdollCore::tuningText("OPENMW_RAGDOLL_AI_TRACE"))
-                            Log(Debug::Info) << "RAGDOLL_AI2 actor=" << getPtr().getCellRef().getRefId()
-                                             << " what=line chosen=" << osg::RadiansToDegrees(angle)
-                                             << " turn=" << osg::RadiansToDegrees(choice.mTurnLine)
-                                             << " guard=" << mHscFoeGuardZone << " open="
-                                             << (mHscFoeGuardZone < 0 ? 1.0f
-                                                                      : 1.0f - RagdollCore::lineCover(mHscFoeGuardZone, angle))
-                                             << " best=" << choice.mBestChance;
-                    }
-                    mNpcRecentLines[1] = mNpcRecentLines[0];
-                    mNpcRecentLines[0] = angle;
-                }
-                else if (nativeStarted && !nativeType.empty())
-                    angle = nativeType == "thrust" ? osg::PIf * 1.5f : nativeType == "slash" ? 0.0f : osg::PIf * 0.5f;
-                else if (mNativeThrust || (std::abs(forward) > 0.3f && std::abs(forward) >= std::abs(side)))
-                    angle = osg::PIf * 1.5f;
-                else if (side > 0.3f)
-                    angle = 0.0f;
-                else if (side < -0.3f)
-                    angle = osg::PIf;
-                if (spearThrusts)
-                    angle = osg::PIf * 1.5f;
-                // The murder-stroke's click is the overhead chop: the hilt
-                // comes down like a hammer (GRIP-05).
-                if (mMurder)
-                    angle = osg::PIf * 0.5f;
-                // A fist's standing click is the straight (the cross), not the
-                // overhand (FIST-01: the overhand click landed 1 of 3); a
-                // dagger's is the stab (user 10-30: "we cant really aim" - a
-                // dagger's chop came down over its own short reach); a swinging
-                // spear's is the thrust, its strong attack (strafing swings).
-                if ((hscStriker().mFist || hscStriker().mShortBlade || spearSwings) && getPtr() == MWMechanics::getPlayer()
-                    && std::abs(angle - osg::PIf * 0.5f) < 1e-3f)
-                    angle = osg::PIf * 1.5f;
-                // A click's chop at a foe off to one side comes down the
-                // diagonal toward it: from over the right shoulder down to the
-                // left for a foe on the left, the mirror for one on the right
-                // (the straight chop turned into the foe's plane trailed the
-                // command by 20 units mid-cut and missed every foe 15-25 deg to
-                // the left: AIM-03). The right-handed chop already lands a little
-                // right, so the right side's diagonal waits for a foe further out
-                // (at 8 deg it took FIX-08's guided warhammer, a target ahead of
-                // the right shoulder, off the chop: 1 of 3 blows bit nothing).
-                // OPENMW_RAGDOLL_HSC_CLICK_SIDE = "left deg, right deg" off the
-                // facing that pick the diagonal (0 = always the chop). (A hub
-                // reset crash first blamed on it, 10-06, is older: build 57's
-                // code crashes there too, and the shipped build without it does
-                // when only an unrelated env var shifts memory - PLAN.md.)
-                static const auto clickSides_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                    std::array<float, 2> value{ 8.0f, 18.0f };
-                    if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_CLICK_SIDE"))
-                        std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                    return value;
-                });
-                static const auto& clickSides = clickSides_tuned.get();
-                const float clickSide = std::min(clickSides[0], clickSides[1]);
-                if (clickSide > 0.0f && mHscFoe && std::abs(angle - osg::PIf * 0.5f) < 1e-3f)
-                {
-                    const JPH::Vec3 toFoe(*mHscFoe - centre);
-                    float azimuth = std::atan2(toFoe.Dot(frame.mRight), toFoe.Dot(frame.mForward));
-                    if (!std::isfinite(azimuth))
-                        azimuth = 0.0f;
-                    if (azimuth < -osg::DegreesToRadians(clickSides[0]) && azimuth > -osg::DegreesToRadians(45.0f))
-                        angle = osg::PIf * 0.25f;
-                    else if (azimuth > osg::DegreesToRadians(clickSides[1]) && azimuth < osg::DegreesToRadians(45.0f))
-                        angle = osg::PIf * 0.75f;
-                }
-                // From a kept stance the click's attack starts where the
-                // weapon is.
-                if (keptStance && mAttackLastPose)
-                {
-                    mChainFrom = mAttackLastPose;
-                    mChainTime = 0.0f;
-                    mFlowU = mFlowV = 0.0f;
-                }
-                mStanceX = mStanceY = 0.0f;
-                mAttackAngle = angle;
-                mAttackStage = AttackStage::Wind;
-                mAttackWind = mAttackCut = 0.0f;
-                mAttackDragRight = mAttackDragUp = 0.0f;
-                mAutoAttack = true;
-                mPlayerRiposte = getPtr() == MWMechanics::getPlayer() && hscRiposte()[0] > 0.0f
-                    && mAiSinceParryWon < hscRiposte()[0];
-                if (!mChainFlowPending)
-                    mChainFlowGain = 0.0f;
-                if (RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
-                    Log(Debug::Info) << "RAGDOLL_HSC click attack angle=" << osg::RadiansToDegrees(angle)
-                                     << " riposte=" << mPlayerRiposte;
-            }
-            if (RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE") && (newPress || newRelease || mAutoAttack))
-                Log(Debug::Info) << "RAGDOLL_HSC path held=" << held << " press=" << newPress << " release=" << newRelease
-                                 << " stage=" << static_cast<int>(mAttackStage) << " auto=" << mAutoAttack
-                                 << " wind=" << mAttackWind << " cut=" << mAttackCut << " flow=" << mFlowU;
-            // Attack speed (user 10-05: "can we speed up all attacks umm by 2x?
-            // or 1.5 would be fine"): click wind-up and cut times are divided by
-            // it, the route's flow limits raised with it (top speed x it,
-            // acceleration x it squared), the hold after a cut and the return
-            // to the guard shortened. OPENMW_RAGDOLL_HSC_ATTACK_SPEED (1 =
-            // build 55).
-            // Two-handers 1.3: at 1.5 the claymore lost its support grip in 2
-            // of 4 GRIP-01 runs (0 of 5 at 1) and the replays re-seated 1.3 a
-            // minute (bar 1). OPENMW_RAGDOLL_HSC_ATTACK_SPEED_TWO.
-            static const auto attackSpeedOne_tuned = RagdollCore::tuned<float>([] { return std::max(0.25f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_ATTACK_SPEED", 1.5f)); });
-            static const auto& attackSpeedOne = attackSpeedOne_tuned.get();
-            static const auto attackSpeedTwo_tuned = RagdollCore::tuned<float>([] { return std::max(0.25f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_ATTACK_SPEED_TWO", 1.3f)); });
-            static const auto& attackSpeedTwo = attackSpeedTwo_tuned.get();
-            // The player's swings a bit faster again (user 10-31: "we need the
-            // swings to be a bit faster"): the player's attack speed times
-            // `one` (one-handers, fists and daggers - their SHORT_PACE wind-up
-            // and cut divided by it too) or `two` (two-handers: at 1.1 the
-            // battle axe lost its support grip in 2 of 4 GRIP-01 runs, 0 of 3
-            // at 1; the claymore held in 4 of 4). NPCs keep their pace (the
-            // duels' openings, NPC_PACE). Skill shows in the recovery, the
-            // swing's wander, edge and knock recovery, not its speed.
-            // OPENMW_RAGDOLL_HSC_PLAYER_SPEED = "one, two" (1,1 = before).
-            static const auto playerSpeed_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                std::array<float, 2> value{ 1.15f, 1.05f };
-                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_PLAYER_SPEED"))
-                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                for (float& v : value)
-                    v = std::isfinite(v) ? std::clamp(v, 0.5f, 2.0f) : 1.0f;
-                return value;
-            });
-            static const auto& playerSpeed = playerSpeed_tuned.get();
-            const bool playerSwing = getPtr() == MWMechanics::getPlayer();
-            const float playerSpeedHere = playerSwing ? playerSpeed[hscStriker().mTwoHanded ? 1 : 0] : 1.0f;
-            const float attackSpeed = (hscStriker().mTwoHanded ? attackSpeedTwo : attackSpeedOne) * playerSpeedHere;
-            // NPCs open (user 10-05, build 57: enemies should "wind up more and
-            // recover more slowly (more open)"): an NPC's wind-up takes `wind`
-            // times as long, it holds the chamber `chamber` s before the cut
-            // (the tell), holds the follow-through at least `hold` s and returns
-            // `back` times slower. OPENMW_RAGDOLL_HSC_NPC_PACE = "wind, chamber,
-            // hold, back" (1,0,0,1 = the player's timing).
-            static const auto npcPace_tuned = RagdollCore::tuned<std::array<float, 4>>([] {
-                std::array<float, 4> value{ 1.6f, 0.15f, 0.7f, 1.5f };
-                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_NPC_PACE"))
-                    std::sscanf(text, "%f,%f,%f,%f", &value[0], &value[1], &value[2], &value[3]);
-                return value;
-            });
-            static const auto& npcPace = npcPace_tuned.get();
-            const bool npcTiming = getPtr() != MWMechanics::getPlayer();
-            // AI-02 item 5: a riposte (its parry won within the window) winds
-            // up `wind share` as long and holds no chamber: it has to land before
-            // the beaten guard is back. OPENMW_RAGDOLL_AI_RIPOSTE = "window s,
-            // chance A0, A100, wind share" (the tactics read the rest).
-            static const auto riposte_tuned = RagdollCore::tuned<std::array<float, 4>>([] {
-                std::array<float, 4> value{ 0.0f, 0.0f, 0.0f, 1.0f };
-                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_AI_RIPOSTE"))
-                    std::sscanf(text, "%f,%f,%f,%f", &value[0], &value[1], &value[2], &value[3]);
-                return value;
-            });
-            static const auto& riposte = riposte_tuned.get();
-            mRiposteGranted = std::max(0.0f, mRiposteGranted - duration);
-            stepLeftJab(duration);
-            if (mAttackStage == AttackStage::Guard)
-                mRiposteAttack = npcTiming && riposte[0] > 0.0f && mAiSinceParryWon < riposte[0] && mRiposteGranted > 0.0f;
-            else if (mAttackStage == AttackStage::Recover)
-                mRiposteAttack = false;
-            if (mAutoAttack && duration > 0.0f)
-            {
-                const float pace = std::sqrt(std::clamp(hscStriker().mWeight * 0.08f, 0.4f, 4.0f) / 1.6f) / attackSpeed
-                    * (halfSwordGrip() ? gripHalfSettings()[2] : 1.0f);
-                if (mAttackStage == AttackStage::Wind)
-                {
-                    // (A wind-up tell shrinking with weapon control, AI_SKILL_PACE,
-                    // measured no gain in the 10-09 duels; removed 10-12.)
-                    const float npcWind = npcPace[0];
-                    // The player's riposte and a flowing chain wind up quicker
-                    // (HSC_RIPOSTE, HSC_CHAIN_FLOW).
-                    const float comboScale = (mPlayerRiposte ? hscRiposte()[1] : 1.0f)
-                        * (1.0f - hscChainFlow()[0] * mChainFlowGain);
-                    const float windScale = npcTiming ? npcWind * (mRiposteAttack ? std::clamp(riposte[3], 0.2f, 1.0f) : 1.0f) : 1.0f;
-                    // Fists and daggers: their own click timing (SHORT_PACE).
-                    const float windTime = comboScale
-                        * (shortStriker() && !npcTiming && shortPaceSettings()[0] > 0.0f
-                                ? shortPaceSettings()[0] / playerSpeedHere
-                                : 0.35f * pace * windScale);
-                    mAttackWind = std::min(1.0f, mAttackWind + duration / windTime);
-                    mNpcChamberHeld = mAttackWind >= 1.0f && mFlowU >= 0.97f ? mNpcChamberHeld + duration : 0.0f;
-                    if (mAttackWind >= 1.0f && mFlowU >= 0.97f
-                        && (!npcTiming || mRiposteAttack || mNpcChamberHeld >= npcPace[1]))
-                    {
-                        mAttackStage = AttackStage::Cut;
-                        mAttackCutAngle = mAttackAngle;
-                        mAttackCut = 0.0f;
-                    }
-                }
-                else if (mAttackStage == AttackStage::Cut)
-                {
-                    const float cutTime = shortStriker() && !npcTiming && shortPaceSettings()[1] > 0.0f
-                        ? shortPaceSettings()[1] / playerSpeedHere
-                        : 0.25f * pace;
-                    mAttackCut = std::min(1.0f, mAttackCut + duration / cutTime);
-                    // An NPC's feint (C3): drawn once per cut by skill; a third
-                    // of the way in it pulls back into a chamber a quarter turn
-                    // round and cuts from there after its usual hold.
-                    if (npcTiming && feintSettings()[1] > 0.0f)
-                    {
-                        if (mNpcFeintDecided != mSwingIdentity)
-                        {
-                            mNpcFeintDecided = mSwingIdentity;
-                            const auto& inventory = getPtr().getClass().getInventoryStore(getPtr());
-                            const auto item = inventory.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
-                            const float npcSkill = item == inventory.end() ? 0.0f
-                                : getPtr().getClass().getSkill(getPtr(), item->getClass().getEquipmentSkill(*item));
-                            const std::uint64_t hash = (mSerial * 0x9E3779B97F4A7C15ull) ^ (mSwingIdentity * 0xBF58476D1CE4E5B9ull);
-                            const float roll = static_cast<float>((hash >> 11) % 10000) / 10000.0f;
-                            mNpcFeinting = !mNpcFeintedLast && roll < feintSettings()[1] * std::clamp(npcSkill / 100.0f, 0.0f, 1.0f);
-                            mNpcFeintedLast = mNpcFeinting;
-                        }
-                        if (mNpcFeinting && mAttackCut >= 0.33f)
-                        {
-                            mNpcFeinting = false;
-                            ++mFeintCount;
-                            mAttackStage = AttackStage::Wind;
-                            mAttackWind = 1.0f;
-                            mAttackCut = 0.0f;
-                            mAttackAngle = std::fmod(mAttackAngle + ((mSwingIdentity & 1) ? 0.5f : 1.5f) * osg::PIf, 2.0f * osg::PIf);
-                            mNpcChamberHeld = 0.0f;
-                            mCutFrom.reset();
-                        }
-                    }
-                }
-                else
-                    mAutoAttack = false;
-                // The follow-through holds, then the release rule returns it.
-                mHscReleased = std::min(mHscReleased, mAttackCut >= 1.0f ? mHscReleased : 0.0f);
-            }
-            // Momentum chains are a skill (roadmap 2026-10-04, item 4): from
-            // weapon skill 50 a press during an attack chains, carrying the
-            // weapon's momentum into the next attack, the share growing to
-            // all of it at 100; below 50 the next attack waits for the return
-            // to the guard. The fighter's real weapon skill since 10-31 (user:
-            // "make it depend on the skill"; 100 was assumed for everyone
-            // before). OPENMW_RAGDOLL_HSC_SKILL = a skill assumed for everyone
-            // (100 = before; -1 = the real skill).
-            static const auto assumedSkill_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_SKILL", -1.0f); });
-            static const auto& assumedSkill = assumedSkill_tuned.get();
-            const float skill = assumedSkill >= 0.0f ? assumedSkill : [&] {
-                const auto& inventory = getPtr().getClass().getInventoryStore(getPtr());
-                const auto item = inventory.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
-                if (item == inventory.end())
-                    return 0.0f;
-                return getPtr().getClass().getSkill(getPtr(), item->getClass().getEquipmentSkill(*item));
-            }();
-            const float momentumShare = std::clamp((skill - 50.0f) / 50.0f, 0.0f, 1.0f);
-            mHscChainsFree = skill >= 50.0f;
-            const bool stanceHeld = stanceMode && mAttackStage == AttackStage::Wind && !mAutoAttack && mAttackWind <= 0.5f;
-            // A press just after the guard dropped is the guard-to-attack
-            // press (GUARD-03): the mouse hands a click over on its release
-            // (0.08 s) and a drag after 0.16 s, so the block has begun its
-            // return by then; below skill 50 it waited for it (the click came
-            // 0.3 s late, a held chop never cut: GUARD-03 at the test
-            // character's skill). Not a recovery from an attack, so no wait.
-            mHscSinceBlock += duration;
-            const bool fromBlock = guardToAttack() && !npcTiming && mAttackStage == AttackStage::Recover
-                && mHscSinceBlock < 0.3f;
-            if (chain && !blocking && newPress && mAttackStage != AttackStage::Guard && !stanceHeld && mAttackLastPose)
-            {
-                if (skill < 50.0f && !fromBlock)
-                {
-                    // Waits for the guard. A click's attack (wind-up or cut)
-                    // and a cut still under way finish first (the press skips
-                    // only the hold): sent to the return at once, a second
-                    // click stopped the first one.
-                    // OPENMW_RAGDOLL_HSC_WAIT_FINISH=0 = the attack stops.
-                    static const auto waitFinish_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_WAIT_FINISH", 1.0f) > 0.0f; });
-                    static const auto& waitFinish = waitFinish_tuned.get();
-                    const bool cutGoesOn = waitFinish
-                        && ((mAttackStage == AttackStage::Cut && mAttackCut < 1.0f)
-                            || (mAttackStage == AttackStage::Wind && autoBeforePress));
-                    if (cutGoesOn && autoBeforePress)
-                        mAutoAttack = true;
-                    if (mAttackStage != AttackStage::Recover && !cutGoesOn)
-                    {
-                        mAttackStage = AttackStage::Recover;
-                        mAttackRecover = 0.0f;
-                        mAttackRecoverFrom = mAttackLastPose;
-                    }
-                    mWaitRecover = true;
-                }
-                else
-                {
-                    mChainFrom = mAttackLastPose;
-                    mChainTime = 0.0f;
-                    // The hand's measured velocity (the weapon's real momentum:
-                    // the commanded route has stopped at the end of a
-                    // follow-through, the weapon has not) and the last step's
-                    // commanded spin, body frame.
-                    mChainVelocity = mChainSpin = JPH::Vec3::sZero();
-                    if (mAttackPrevPose && duration > 0.0f)
-                    {
-                        mChainVelocity = mMeasuredHandVelocity * momentumShare;
-                        if (mChainVelocity.Length() > 200.0f)
-                            mChainVelocity *= 200.0f / mChainVelocity.Length();
-                        JPH::Quat delta = (mAttackLastPose->mRotation * mAttackPrevPose->mRotation.Conjugated()).Normalized();
-                        if (delta.GetW() < 0.0f)
-                            delta = -delta;
-                        JPH::Vec3 axis;
-                        float angle = 0.0f;
-                        delta.GetAxisAngle(axis, angle);
-                        if (angle > 1e-5f)
-                            mChainSpin = axis * (std::min(angle / duration, 30.0f) * momentumShare);
-                    }
-                    mChainPrevAngle = mAttackCutAngle;
-                    mChainTiming = mAttackStage == AttackStage::Cut ? 1.0f
-                        : mAttackStage == AttackStage::Recover
-                        ? std::clamp(1.0f - mAttackRecover / std::max(0.05f, mHscReturnTime), 0.0f, 1.0f)
-                        : 0.0f; // from a wind-up: a feint, nothing carried
-                    mChainFlowPending = true;
-                    mChainFlowGain = 0.0f;
-                    // A press mid-cut carries the route's speed into the new
-                    // wind-up too (from rest, it started from a stop).
-                    const float carriedFlow = std::max(0.0f, mFlowV) * momentumShare;
-                    mAttackStage = AttackStage::Guard;
-                    mAttackWind = mAttackCut = 0.0f;
-                    mAttackDragRight = mAttackDragUp = 0.0f;
-                    mFlowU = 0.0f;
-                    mFlowV = carriedFlow;
-                    mStanceX = mStanceY = 0.0f;
-                    mCutFrom.reset();
-                }
-            }
-            // A finished cut that a press is waiting on skips its hold.
-            if (mWaitRecover && mAttackStage == AttackStage::Cut && mAttackCut >= 1.0f)
-            {
-                mAttackStage = AttackStage::Recover;
-                mAttackRecover = 0.0f;
-                mAttackRecoverFrom = mAttackLastPose;
-            }
-            // A click released while it waits is not lost: it plays when the
-            // weapon is back at the guard (released in the return, a click
-            // did nothing and the next one had to wait for the bar).
-            // OPENMW_RAGDOLL_HSC_CLICK_QUEUE=0 = dropped as before.
-            static const auto clickQueue_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CLICK_QUEUE", 1.0f) > 0.0f; });
-            static const auto& clickQueue = clickQueue_tuned.get();
-            if (newPress || blocking)
-                mHscClickQueued = false;
-            if (clickQueue && mWaitRecover && newRelease)
-                mHscClickQueued = true;
-            if (mWaitRecover && mAttackStage == AttackStage::Guard)
-                mWaitRecover = false;
-            // The carried momentum: the chain's starting pose goes on moving
-            // the way the weapon was going, fading in 0.12 s, while the new
-            // attack blends in from it.
-            if (mChainFrom && duration > 0.0f && (mChainVelocity.LengthSq() > 1e-4f || mChainSpin.LengthSq() > 1e-6f))
-            {
-                mChainFrom->mHand += mChainVelocity * duration;
-                // Never past the arm's reach from the chest centre.
-                const float reachLimit = 0.95f * armLength;
-                if (mChainFrom->mHand.Length() > reachLimit)
-                {
-                    mChainFrom->mHand *= reachLimit / mChainFrom->mHand.Length();
-                    mChainVelocity *= 0.5f;
-                }
-                const float spin = std::min(mChainSpin.Length(), 12.0f);
-                if (spin > 1e-4f)
-                    mChainFrom->mRotation = (JPH::Quat::sRotation(mChainSpin.Normalized(), spin * duration)
-                        * mChainFrom->mRotation)
-                                                .Normalized();
-                // OPENMW_RAGDOLL_HSC_CHAIN_DRIFT: how long the carried motion
-                // lasts (s).
-                static const auto drift_tuned = RagdollCore::tuned<float>([] { return std::max(0.01f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_CHAIN_DRIFT", 0.12f)); });
-                static const auto& drift = drift_tuned.get();
-                const float decay = std::exp(-duration / drift);
-                mChainVelocity *= decay;
-                mChainSpin *= decay;
-            }
-            else if (!mChainFrom)
-                mChainVelocity = mChainSpin = JPH::Vec3::sZero();
-            // Steering on the cut wheel (design: "Attack library"). Mouse
-            // motion across the line turns the attack round the wheel: freely
-            // while winding up and in the chamber (the chamber travels round
-            // the ring, as a club circles before the strike), and during a cut
-            // it bends the line at most an eighth of a turn from where the cut
-            // began. OPENMW_RAGDOLL_HSC_RING_COUNTS = counts per eighth.
-            static const auto ringCounts_tuned = RagdollCore::tuned<float>([] { return std::max(50.0f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_RING_COUNTS", 300.0f)); });
-            static const auto& ringCounts = ringCounts_tuned.get();
-            const auto wrap = [&](float a) {
-                a = std::fmod(a, tau);
-                return a < 0.0f ? a + tau : a;
+            const bool player = getPtr() == MWMechanics::getPlayer();
+            // FIST-05: the left fist's punches run in this frame too.
+            mFistCentre = centre;
+            mFistRight = frame.mRight;
+            mFistForward = frame.mForward;
+            mFistUp = frame.mUp;
+            const auto toBody = [&](JPH::Vec3Arg v) {
+                return JPH::Vec3(v.Dot(frame.mRight), v.Dot(frame.mForward), v.Dot(frame.mUp));
             };
-            const auto signedDiff = [&](float a, float b) {
-                float d = std::fmod(a - b + osg::PIf, tau);
-                return (d < 0.0f ? d + tau : d) - osg::PIf;
-            };
-            // The mouse's velocity, filtered over about two steps (input comes
-            // in bursts, 13-18% of steps empty).
-            if (held && duration > 0.0f)
-            {
-                const float k = std::min(1.0f, duration / 0.03f);
-                mStrokeVX += (dragRight / duration - mStrokeVX) * k;
-                mStrokeVY += (dragUp / duration - mStrokeVY) * k;
-            }
-            else if (!held)
-                mStrokeVX = mStrokeVY = 0.0f;
-            const float maxRadius = stanceRadius + commitCounts;
-            // The stance point's distance as a place on the wind-up route: the
-            // circle is its first half; past it the rest eases into the
-            // chamber with the same slope at the circle (linear, the route
-            // slowed five-fold at the circle's edge and every wind-up through
-            // it had two speed peaks: FLOW-01).
-            const auto windAt = [&](float rn) {
-                if (rn <= stanceRadius)
-                    return 0.5f * rn / stanceRadius;
-                const float x = std::min(1.0f, (rn - stanceRadius) / commitCounts);
-                const float k = std::max(1.0f, commitCounts / stanceRadius);
-                return 0.5f + 0.5f * (1.0f - std::pow(1.0f - x, k));
-            };
-            // A snap cut starts this far along its cut route.
-            constexpr float snapStart = 0.2f;
-            const auto beginCut = [&](float sx, float sy, bool snap, float progress) {
-                const float l = std::max(1e-3f, std::hypot(sx, sy));
-                mCutStrokeX = sx / l;
-                mCutStrokeY = sy / l;
-                mCutAccX = mCutAccY = 0.0f;
-                mHscSteerWantX = mHscSteerWantY = 0.0f;
-                mCutOverflow = 0.0f;
-                mSnapCut = snap;
-                mCutFrom = mAttackLastPose;
-                // The line whose wind-up is opposite the stroke.
-                mAttackCutAngle = wrap(std::atan2(-mCutStrokeY, -mCutStrokeX));
-                if (spearThrusts)
-                    mAttackCutAngle = osg::PIf * 1.5f;
-                mAttackAngle = mAttackCutAngle;
-                mAttackStage = AttackStage::Cut;
-                mAttackCut = std::clamp((snap ? snapStart : 0.0f) + progress, 0.0f, 1.0f);
-                // The shown route starts at the cut's start and catches up with
-                // the mouse (set to the mouse's place, it jumped 0.08 of a
-                // route in a step: FLOW-01 a 36 deg spike at every cut).
-                mCutFromU = snap ? snapStart : 0.0f;
-                mFlowU = 1.0f + mCutFromU;
-                mFlowV = 0.0f;
-                mStanceX = mStanceY = 0.0f;
-                mChainFrom.reset();
-            };
-            mLastCutAlong = 0.0f;
-            if (stanceMode && held && !blocking && !mAutoAttack && !mWaitRecover
-                && (mAttackStage == AttackStage::Guard || mAttackStage == AttackStage::Wind))
-            {
-                mAttackDragRight += dragRight;
-                mAttackDragUp += dragUp;
-                float px = mStanceX, py = mStanceY;
-                const float r = std::hypot(px, py);
-                bool cut = false;
-                if (r > stanceRadius)
-                {
-                    const float ex = px / r, ey = py / r;
-                    const float dr = dragRight * ex + dragUp * ey;
-                    const float tx = dragRight - ex * dr, ty = dragUp - ey * dr;
-                    const float tl = std::hypot(tx, ty);
-                    const float inward = -(mStrokeVX * ex + mStrokeVY * ey);
-                    // The first inward counts from deep wait (about 120 counts):
-                    // a cut stroke starts slowly, and retracting it first ran
-                    // the wind-up backwards before the cut began (FLOW-01: an
-                    // extra speed peak on every cut).
-                    const bool radialIn = dr < 0.0f && tl <= std::abs(dr);
-                    if (dr < 0.0f)
-                        mCutTravel += -dr;
-                    else if (dr > 0.0f)
-                        mCutTravel = 0.0f;
-                    if (radialIn)
-                        mInwardPending += -dr;
-                    else if (dr > 0.0f)
-                        mInwardPending = 0.0f;
-                    if (inward > cutSpeed && dr < 0.0f && r > stanceRadius + 0.2f * commitCounts
-                        && mCutTravel >= cutTravel)
-                    {
-                        mCutTravel = 0.0f;
-                        beginCut(mStrokeVX, mStrokeVY, false, std::max(-dr, mInwardPending) / stanceCutCounts);
-                        mInwardPending = 0.0f;
-                        cut = true;
-                    }
-                    else if (radialIn && mInwardPending < 120.0f)
-                    {
-                        // Held while it is decided.
-                    }
-                    else if (radialIn && mInwardPending - (-dr) < 120.0f)
-                    {
-                        // Undecided long enough: a slow retraction, all of it.
-                        const float rn = std::max(r - mInwardPending, 0.0f);
-                        px = ex * rn;
-                        py = ey * rn;
-                    }
-                    else if (tl <= std::abs(dr))
-                    {
-                        // Mostly in or out: deeper or shallower, turning as
-                        // the point moves.
-                        px += dragRight;
-                        py += dragUp;
-                    }
-                    else
-                    {
-                        // Mostly sideways from deep: a new direction retracts
-                        // toward the circle first, then turns.
-                        const float need = r + dr - stanceRadius;
-                        if (need <= 0.0f)
-                        {
-                            px = ex * (r + dr) + tx;
-                            py = ey * (r + dr) + ty;
-                        }
-                        else if (tl <= need)
-                        {
-                            const float rn = std::min(r + dr - tl, maxRadius);
-                            px = ex * rn;
-                            py = ey * rn;
-                        }
-                        else
-                        {
-                            const float left = tl - need;
-                            px = ex * stanceRadius + tx / tl * left;
-                            py = ey * stanceRadius + ty / tl * left;
-                        }
-                    }
-                }
-                else
-                {
-                    // A quick flick across the circle from a stance: a snap cut.
-                    const float speed = std::hypot(mStrokeVX, mStrokeVY);
-                    if (snapSpeed > 0.0f && speed > snapSpeed && r > 0.3f * stanceRadius
-                        && mStrokeVX * px + mStrokeVY * py < 0.0f && mAttackStage == AttackStage::Wind)
-                    {
-                        beginCut(mStrokeVX, mStrokeVY, true, 0.0f);
-                        cut = true;
-                    }
-                    else
-                    {
-                        px += dragRight;
-                        py += dragUp;
-                    }
-                }
-                if (!cut)
-                {
-                    float rn = std::hypot(px, py);
-                    if (rn > maxRadius)
-                    {
-                        px *= maxRadius / rn;
-                        py *= maxRadius / rn;
-                        rn = maxRadius;
-                    }
-                    mStanceX = px;
-                    mStanceY = py;
-                    // A press that has not moved yet stays in the guard (a click).
-                    if (!(mAttackStage == AttackStage::Guard && rn < pickCounts))
-                    {
-                        if (rn > 1.0f)
-                            mAttackAngle = spearThrusts ? osg::PIf * 1.5f : wrap(std::atan2(py, px));
-                        mAttackStage = AttackStage::Wind;
-                        mAttackWind = windAt(rn);
-                        mAttackCut = 0.0f;
-                    }
-                }
-            }
-            else if (stanceMode && held && !blocking && !mAutoAttack && mAttackStage == AttackStage::Cut)
-            {
-                // The cut follows the stroke: its counts along the stroke move it
-                // along the cut (a snap cut 1.6x as fast), and the line turns to
-                // the stroke's own direction, at most an eighth from where the
-                // cut began, at most 3 rad/s (the mouse-driven cut, item 2).
-                mCutAccX += dragRight;
-                mCutAccY += dragUp;
-                const float along = dragRight * mCutStrokeX + dragUp * mCutStrokeY;
-                mAttackCut += along / stanceCutCounts * (mSnapCut ? 1.6f : 1.0f);
-                mLastCutAlong = along;
-                // Steering (aim item 3): the mouse across the
-                // stroke moves the cut's aim that way (counts per radian, most
-                // radians), so a chop pulled right lands further right and a
-                // slash pushed up lands higher.
-                // OPENMW_RAGDOLL_HSC_STEER = "counts per radian, most radians"
-                // (0 = off).
-                static const auto steer_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                    std::array<float, 2> value{ 0.0f, 0.5f };
-                    if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_STEER"))
-                        std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                    return value;
-                });
-                static const auto& steer = steer_tuned.get();
-                if (steer[0] > 0.0f)
-                {
-                    const float across = dragUp * mCutStrokeX - dragRight * mCutStrokeY;
-                    // Across direction (screen): the stroke turned a quarter
-                    // to the left.
-                    mHscSteerWantX += -mCutStrokeY * across / steer[0];
-                    mHscSteerWantY += mCutStrokeX * across / steer[0];
-                    const float length = std::hypot(mHscSteerWantX, mHscSteerWantY);
-                    if (length > steer[1] && length > 0.0f)
-                    {
-                        mHscSteerWantX *= steer[1] / length;
-                        mHscSteerWantY *= steer[1] / length;
-                    }
-                }
-                // A spear's thrust stays a thrust (THRUST_AIM below): turned
-                // toward a curving drag it blended into the diagonal chop's
-                // keys, the wrist ended 100-140 deg off and the thrust bit at
-                // 200-480 u/s (build 61 bookmark 18: "spear is broken").
-                static const auto thrustAimTurn_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_THRUST_AIM", 0.0f) > 0.0f; });
-                static const auto& thrustAimTurn = thrustAimTurn_tuned.get();
-                const bool spearThrustCut
-                    = (spearThrusts || spearSwings) && std::abs(signedDiff(mAttackCutAngle, osg::PIf * 1.5f)) < eighth * 0.5f;
-                if (std::hypot(mCutAccX, mCutAccY) > 80.0f && !(thrustAimTurn && spearThrustCut))
-                {
-                    const float strokeAngle = wrap(std::atan2(-mCutAccY, -mCutAccX));
-                    const float wanted = std::clamp(signedDiff(strokeAngle, mAttackCutAngle), -eighth, eighth);
-                    const float current = signedDiff(mAttackAngle, mAttackCutAngle);
-                    const float rate = 3.0f * duration;
-                    mAttackAngle = wrap(mAttackCutAngle + current + std::clamp(wanted - current, -rate, rate));
-                }
-                // Dragged on past the end of the follow-through (skill 50 up):
-                // the stroke carries on into the next wind-up the same way
-                // (Meyer's square), with the weapon's momentum.
-                if (mAttackCut > 1.0f)
-                    mCutOverflow += (mAttackCut - 1.0f) * stanceCutCounts / (mSnapCut ? 1.6f : 1.0f);
-                else if (along < 0.0f)
-                    mCutOverflow = 0.0f;
-                const float overflow = mCutOverflow;
-                // Also as soon as the cut's input runs out while the stroke is
-                // still fast: waiting for 60 more counts, the route braked into
-                // its end first and the blade nearly stopped (CHAIN-01: 5-14%
-                // of the speed carried).
-                // (Also chaining as soon as the input ran out while still fast
-                // fired on nearly every recorded cut: the user's strokes go on
-                // well past the cut.)
-                if (chain && skill >= 50.0f && runOnCounts > 0.0f && overflow > runOnCounts && mAttackLastPose)
-                {
-                    const float carriedFlow = std::max(0.0f, mFlowV) * momentumShare;
-                    mCutOverflow = 0.0f;
-                    mChainFrom = mAttackLastPose;
-                    mChainTime = 0.0f;
-                    mChainVelocity = mMeasuredHandVelocity * momentumShare;
-                    if (mChainVelocity.Length() > 200.0f)
-                        mChainVelocity *= 200.0f / mChainVelocity.Length();
-                    mChainSpin = JPH::Vec3::sZero();
-                    if (mAttackPrevPose && duration > 0.0f)
-                    {
-                        JPH::Quat delta = (mAttackLastPose->mRotation * mAttackPrevPose->mRotation.Conjugated()).Normalized();
-                        if (delta.GetW() < 0.0f)
-                            delta = -delta;
-                        JPH::Vec3 axis;
-                        float angle = 0.0f;
-                        delta.GetAxisAngle(axis, angle);
-                        if (angle > 1e-5f)
-                            mChainSpin = axis * (std::min(angle / duration, 30.0f) * momentumShare);
-                    }
-                    mChainPrevAngle = mAttackCutAngle;
-                    mChainTiming = 1.0f; // a held stroke running on: all of it
-                    mChainFlowPending = true;
-                    mChainFlowGain = 0.0f;
-                    const float r = std::min(stanceRadius + std::max(overflow - runOnCounts, 0.0f), maxRadius);
-                    mStanceX = mCutStrokeX * r;
-                    mStanceY = mCutStrokeY * r;
-                    mAttackAngle = wrap(std::atan2(mStanceY, mStanceX));
-                    mAttackStage = AttackStage::Wind;
-                    mAttackWind = windAt(r);
-                    mAttackCut = 0.0f;
-                    // The route goes on at the speed it had (the weapon's
-                    // momentum), into the new wind-up.
-                    mFlowU = 0.0f;
-                    mFlowV = carriedFlow;
-                    mCutFrom.reset();
-                    if (RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
-                        Log(Debug::Info) << "RAGDOLL_HSC overflow chain angle=" << osg::RadiansToDegrees(mAttackAngle)
-                                         << " carried_flow=" << carriedFlow;
-                }
-                else if (mAttackCut <= 0.0f)
-                {
-                    // Dragged back: the wind-up again, in its chamber - a
-                    // feint, which costs fatigue (C3).
-                    if (feintSettings()[0] > 0.0f)
-                    {
-                        auto& stats = getPtr().getClass().getCreatureStats(getPtr());
-                        MWMechanics::DynamicStat<float> fatigue = stats.getFatigue();
-                        fatigue.setCurrent(std::max(0.0f, fatigue.getCurrent() - feintSettings()[0]));
-                        stats.setFatigue(fatigue);
-                        ++mFeintCount;
-                    }
-                    mAttackStage = AttackStage::Wind;
-                    mAttackWind = 1.0f;
-                    mAttackCut = 0.0f;
-                    mAttackAngle = mAttackCutAngle;
-                    mStanceX = -mCutStrokeX * maxRadius;
-                    mStanceY = -mCutStrokeY * maxRadius;
-                    mCutFrom.reset();
-                }
-                mAttackCut = std::min(1.0f, mAttackCut);
-            }
-            if (!stanceMode && held && !blocking && mAttackStage == AttackStage::Guard)
-            {
-                mAttackDragRight += dragRight;
-                mAttackDragUp += dragUp;
-                const float length = std::hypot(mAttackDragRight, mAttackDragUp);
-                if (length >= pickCounts)
-                {
-                    // Any drag angle: between two lines the attack blends them.
-                    mAttackAngle = wrap(std::atan2(mAttackDragUp, mAttackDragRight));
-                    mAttackStage = AttackStage::Wind;
-                    mAttackWind = std::clamp(length / counts, 0.0f, 1.0f);
-                    mAttackCut = 0.0f;
-                    mAttackDragRight = mAttackDragUp = 0.0f;
-                }
-            }
-            else if (!stanceMode && held && !blocking
-                && (mAttackStage == AttackStage::Wind || mAttackStage == AttackStage::Cut))
-            {
-                const float dirRight = std::cos(mAttackAngle), dirUp = std::sin(mAttackAngle);
-                const float along = dragRight * dirRight + dragUp * dirUp;
-                const float across = dragUp * dirRight - dragRight * dirUp; // counter-clockwise
-                if (mAttackStage == AttackStage::Wind)
-                {
-                    mAttackAngle = wrap(mAttackAngle + across / ringCounts * eighth);
-                    // Back past the guard: free to pick again.
-                    if (mAttackWind + along / counts <= 0.0f)
-                    {
-                        mAttackStage = AttackStage::Guard;
-                        mAttackWind = 0.0f;
-                    }
-                    else if (mAttackWind >= 1.0f && along < 0.0f)
-                    {
-                        mAttackStage = AttackStage::Cut;
-                        mAttackCutAngle = mAttackAngle;
-                        mAttackCut = std::clamp(-along / cutCounts, 0.0f, 1.0f);
-                    }
-                    else
-                    {
-                        mAttackWind = std::min(1.0f, mAttackWind + along / counts);
-                        // The last stretch snaps into the chamber, so a drag
-                        // back always cuts (LINES-01: a wind-up that stopped at
-                        // 0.98 retraced to the guard and picked the opposite
-                        // attack).
-                        if (mAttackWind >= 0.95f)
-                            mAttackWind = 1.0f;
-                    }
-                }
-                else
-                {
-                    const float bent = std::clamp(signedDiff(mAttackAngle + across / ringCounts * eighth, mAttackCutAngle),
-                        -eighth * 0.5f, eighth * 0.5f);
-                    mAttackAngle = wrap(mAttackCutAngle + bent);
-                    mAttackCut -= along / cutCounts;
-                    if (mAttackCut <= 0.0f)
-                    {
-                        mAttackStage = AttackStage::Wind;
-                        mAttackWind = 1.0f;
-                        mAttackCut = 0.0f;
-                    }
-                    mAttackCut = std::min(1.0f, mAttackCut);
-                }
-            }
-            if (!held)
-                mAttackDragRight = mAttackDragUp = 0.0f;
-            // A cut beginning is an attack: it whooshes and costs a full
-            // attack's fatigue (the committed-stroke path), a click's at full
-            // size. Before, hand control's attacks were silent and free unless
-            // Morrowind's clip ran under a click.
-            if (mAttackStage == AttackStage::Cut && stageBefore == AttackStage::Wind)
-            {
-                mCommitSwishSize = mAutoAttack ? 1.0f : 0.8f;
-                // A chain that flowed pays less (HSC_CHAIN_FLOW).
-                mCommitFatigue = 1.0f - hscChainFlow()[1] * mChainFlowGain;
-                ++mCommitSwishRequests;
-                if (mChainFlowGain > 0.0f || mPlayerRiposte)
-                    Log(Debug::Info) << "RAGDOLL_HSC_COMBO actor=" << getPtr().getCellRef().getRefId()
-                                     << " flow=" << mChainFlowGain << " fatigue=" << mCommitFatigue
-                                     << " riposte=" << mPlayerRiposte << " click=" << mAutoAttack;
-                mChainFlowGain = 0.0f;
-                mChainFlowPending = false;
-                mPlayerRiposte = false;
-            }
-            else if (mAttackStage == AttackStage::Recover || (mAttackStage == AttackStage::Guard && !mChainFrom))
-            {
-                mChainFlowGain = 0.0f;
-                mChainFlowPending = false;
-                mPlayerRiposte = false;
-            }
-            // The weapon follows the mouse along its route through a
-            // critically damped spring with a top speed (goal 2026-10-03,
-            // "smooth, seamless, fluid"): the route position was the mouse's
-            // own, so every burst of mouse counts was a step of the target and
-            // a flick reached the follow-through in two or three steps. The
-            // top speed is the weapon's: a 1.6 kg longsword crosses the cut
-            // (one route unit) in 0.2 s at the most, heavier ones slower by
-            // the square root of their weight. OPENMW_RAGDOLL_HSC_FLOW_SPEED
-            // (route units/s for 1.6 kg, 0 = the mouse's own position) and
-            // OPENMW_RAGDOLL_HSC_FLOW_HZ (the spring).
-            static const auto flowSpeed_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_FLOW_SPEED", 5.0f); });
-            static const auto& flowSpeed = flowSpeed_tuned.get();
-            static const auto flowHz_tuned = RagdollCore::tuned<float>([] { return std::max(0.5f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_FLOW_HZ", 6.0f)); });
-            static const auto& flowHz = flowHz_tuned.get();
-            static const auto flowAccel_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_FLOW_ACCEL", 40.0f); });
-            static const auto& flowAccel = flowAccel_tuned.get();
-            const bool routed = mAttackStage == AttackStage::Wind || mAttackStage == AttackStage::Cut;
-            const float rawU = mAttackStage == AttackStage::Cut ? 1.0f + mAttackCut
-                : mAttackStage == AttackStage::Wind             ? mAttackWind
-                                                                : 0.0f;
-            if (!routed)
-                mFlowU = mFlowV = 0.0f;
-            else if (flowSpeed <= 0.0f)
-            {
-                mFlowU = rawU;
-                mFlowV = 0.0f;
-            }
-            else if (duration > 0.0f && flowAccel > 0.0f)
-            {
-                // Acceleration-limited: speed up at most flowAccel route
-                // units/s^2, never faster than it can still brake to the
-                // mouse's position, at most the top speed. The spring alone
-                // asked a frame or two of huge acceleration whenever the mouse
-                // jumped; the arm fell 10-17 units behind and caught up with a
-                // jolt (FLOW-01 chained attacks: 11-21 blade jolts on the
-                // two-handers). A heavier weapon accelerates less, by its
-                // weight (its inertia). OPENMW_RAGDOLL_HSC_FLOW_ACCEL (route
-                // units/s^2 for 1.6 kg; 0 = the spring alone).
-                const float carried = std::clamp(hscStriker().mWeight * 0.08f, 0.4f, 4.0f);
-                // A riposte's or a flowing chain's wind-up may run as much
-                // faster as its timer does (HSC_RIPOSTE, HSC_CHAIN_FLOW): with
-                // the timer alone halved, the riposte's cut came 0.33 -> 0.28 s
-                // after the press, the route's top speed holding it (RIPOSTE-02).
-                const float comboHaste = mAttackStage == AttackStage::Wind
-                    ? 1.0f / std::max(0.2f, (mPlayerRiposte ? hscRiposte()[1] : 1.0f)
-                            * (1.0f - hscChainFlow()[0] * mChainFlowGain))
-                    : 1.0f;
-                const float top = flowSpeed * attackSpeed * std::sqrt(1.6f / carried) * comboHaste;
-                const float accel = flowAccel * attackSpeed * attackSpeed * (1.6f / carried) * comboHaste * comboHaste;
-                const float remaining = rawU - mFlowU;
-                const float brake = std::sqrt(2.0f * accel * std::abs(remaining));
-                const float wanted = std::copysign(std::min(top, brake), remaining);
-                const float step = accel * duration;
-                const float nextV = mFlowV + std::clamp(wanted - mFlowV, -step, step);
-                float nextU = mFlowU + 0.5f * (mFlowV + nextV) * duration;
-                // Arrived: settle on the mouse's position. Close in, a first
-                // order approach: the braking curve overshot by a step or two
-                // and rang round the target (FLOW-01 holds: 0.99-1.01).
-                if (std::abs(remaining) < 1e-3f && std::abs(nextV) < step)
-                {
-                    nextU = rawU;
-                    mFlowV = 0.0f;
-                }
-                else if (std::abs(remaining) < 0.03f && std::abs(mFlowV) < 1.0f)
-                {
-                    const float k = 1.0f - std::exp(-duration * 25.0f);
-                    nextU = mFlowU + remaining * k;
-                    mFlowV = remaining * k / duration;
-                }
-                else
-                    mFlowV = nextV;
-                mFlowU = std::clamp(nextU, 0.0f, 2.0f);
-            }
-            else if (duration > 0.0f)
-            {
-                const float carried = std::clamp(hscStriker().mWeight * 0.08f, 0.4f, 4.0f);
-                const float top = flowSpeed * std::sqrt(1.6f / carried);
-                const float omega = 2.0f * osg::PIf * flowHz;
-                const float x = mFlowU - rawU, decay = std::exp(-omega * duration);
-                const float nextX = (x + (mFlowV + omega * x) * duration) * decay;
-                float nextV = (mFlowV - omega * (mFlowV + omega * x) * duration) * decay;
-                float nextU = rawU + nextX;
-                const float stepLimit = top * duration;
-                if (std::abs(nextU - mFlowU) > stepLimit)
-                {
-                    nextU = mFlowU + std::copysign(stepLimit, nextU - mFlowU);
-                    nextV = std::copysign(top, nextV);
-                }
-                mFlowU = std::clamp(nextU, 0.0f, 2.0f);
-                mFlowV = std::clamp(nextV, -top, top);
-            }
-            const auto shape = RagdollCore::weaponShapeProfile(hscStriker().mRecordId);
-            const RagdollCore::WeaponStrikeAxes axes{ hscStriker().mBladeAxis, shape ? shape->mEdgeAxis : hscStriker().mEdgeAxis };
-            const auto& guardLine = lines.front();
-            const auto guardRotations = routeRotations(guardLine.mWind, axes, false, std::nullopt);
-            if (!guardRotations)
-                return false;
-            const ChamberPose guardPose = routePose(guardLine.mWind, *guardRotations, 0.0f);
-            const auto blendPose = [](const ChamberPose& a, const ChamberPose& b, float w) {
-                ChamberPose p;
-                p.mHand = a.mHand + (b.mHand - a.mHand) * w;
-                // The elbow turns along the shorter arc: mixed and normalized,
-                // two nearly opposite elbows passed through zero and the pole
-                // flipped in one step (FLOW-01 chained attacks: 14-20 elbow
-                // snaps and 16-21 blade jolts on the two-handers).
-                const JPH::Vec3 poleFrom = a.mPole.NormalizedOr(JPH::Vec3::sAxisZ());
-                const JPH::Vec3 poleTo = b.mPole.NormalizedOr(poleFrom);
-                const float cosine = std::clamp(poleFrom.Dot(poleTo), -1.0f, 1.0f);
-                JPH::Vec3 axis = poleFrom.Cross(poleTo);
-                if (axis.LengthSq() < 1e-8f)
-                {
-                    axis = poleFrom.Cross(JPH::Vec3::sAxisY());
-                    if (axis.LengthSq() < 1e-8f)
-                        axis = poleFrom.Cross(JPH::Vec3::sAxisX());
-                }
-                p.mPole = cosine > 0.9999f
-                    ? (poleFrom * (1.0f - w) + poleTo * w).NormalizedOr(poleFrom)
-                    : (JPH::Quat::sRotation(axis.Normalized(), std::acos(cosine) * w) * poleFrom).Normalized();
-                const JPH::Quat to = a.mRotation.Dot(b.mRotation) < 0.0f ? -b.mRotation : b.mRotation;
-                p.mRotation = a.mRotation.SLERP(to, w).Normalized();
-                p.mTwist = a.mTwist + (b.mTwist - a.mTwist) * w;
-                return p;
-            };
-            // One line's pose at the current stage.
-            // One line's pose at a route position u (0..1 wind-up, 1..2 cut).
-            const auto linePose = [&](std::size_t i, float u) -> std::optional<ChamberPose> {
-                const auto& line = lines[i];
-                const auto cutRotations = routeRotations(line.mCut, axes, true, std::nullopt);
-                if (!cutRotations)
-                    return std::nullopt;
-                if (routed && u > 1.0f)
-                    return routePose(line.mCut, *cutRotations, u - 1.0f);
-                const auto windRotations = routeRotations(line.mWind, axes, false, cutRotations->front());
-                if (!windRotations)
-                    return std::nullopt;
-                return routePose(line.mWind, *windRotations, std::min(u, 1.0f));
-            };
-            // Released: held a second, then back to the guard in 0.6 s from
-            // wherever it was (a blend, not a route).
-            // A stance inside the circle stays when the button comes up
-            // (OPENMW_RAGDOLL_HSC_STANCE_KEEP=0: it returns to the guard too).
-            static const auto keepStance_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_STANCE_KEEP", 1.0f) > 0.0f; });
-            static const auto& keepStance = keepStance_tuned.get();
-            const bool stanceStays = stanceMode && keepStance && !mAutoAttack && !mChainFrom
-                && mAttackStage == AttackStage::Wind && mAttackWind <= 0.5f;
-            // The hold at the end of a released attack before the return (1 s
-            // to build 55). One-handed weapons recover quicker; two-handers keep
-            // 1 s and a 0.6 s return: shorter, the return began while a 1.5x
-            // claymore was still swinging through, its wrist twisted 124 deg and
-            // the left hand let go (GRIP-01 3 of 3 at hold 0.3-0.5 or return
-            // 0.4-0.6; a hold until the hand slowed or the blade caught up did
-            // not help). OPENMW_RAGDOLL_HSC_RELEASE_HOLD / _RELEASE_HOLD_TWO
-            // (seconds).
-            static const auto releaseHoldOne_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_RELEASE_HOLD", 0.3f); });
-            static const auto& releaseHoldOne = releaseHoldOne_tuned.get();
-            static const auto releaseHoldTwo_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_RELEASE_HOLD_TWO", 1.0f); });
-            static const auto& releaseHoldTwo = releaseHoldTwo_tuned.get();
-            const float releaseHold = std::max(shortStriker() && shortPaceSettings()[2] > 0.0f ? shortPaceSettings()[2]
-                    : hscStriker().mTwoHanded                                   ? releaseHoldTwo
-                                                                                : releaseHoldOne,
-                npcTiming ? npcPace[2] : 0.0f);
-            // A committed cut finishes (user bookmark 2, 2026-10-06: "if the cut
-            // has been committed it should go all the way through, not stop
-            // mid-chop or mid-slash"): a dragged cut moved only with the mouse,
-            // so a short drag stopped it halfway, and a release left it there.
-            // Now it goes on at least at the click's own cut speed (0.25 s at
-            // the weapon's pace, x `share`), held or released; a drag back
-            // against the stroke still stops it (the feint, bookmark 3), and a
-            // faster drag still drives it faster. The release's hold and return
-            // wait for the cut's end. OPENMW_RAGDOLL_HSC_CUT_FINISH = share of
-            // the click's speed (0 = off).
-            static const auto cutFinish_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CUT_FINISH", 1.0f); });
-            static const auto& cutFinish = cutFinish_tuned.get();
-            if (cutFinish > 0.0f && stanceMode && !mAutoAttack && !blocking && mAttackStage == AttackStage::Cut
-                && mAttackCut >= 0.0f && mAttackCut < 1.0f && duration > 0.0f && mLastCutAlong >= 0.0f)
-            {
-                const float pace = std::sqrt(std::clamp(hscStriker().mWeight * 0.08f, 0.4f, 4.0f) / 1.6f) / attackSpeed;
-                const float minimum = duration / (0.25f * pace) * cutFinish;
-                const float dragged = held ? mLastCutAlong / stanceCutCounts * (mSnapCut ? 1.6f : 1.0f) : 0.0f;
-                if (dragged < minimum)
-                    mAttackCut = std::min(1.0f, mAttackCut + (minimum - dragged));
-                mHscReleased = 0.0f;
-            }
-            if (!held && mHscReleased > releaseHold
-                && mAttackStage != AttackStage::Guard
-                && mAttackStage != AttackStage::Recover && !stanceStays)
-            {
-                mAttackStage = AttackStage::Recover;
-                mAttackRecover = 0.0f;
-                mAttackRecoverFrom = mAttackLastPose;
-            }
-            std::optional<ChamberPose> pose;
-            // The block (the guard key on the attack path): from wherever the
-            // weapon is, into a high block across the body in 0.12 s - the
-            // blade up and to the left (the tip controller's block, azimuth -20
-            // deg, elevation 55), turned half toward an incoming blade - and
-            // back to the guard through the release's return. Before, the key
-            // handed the arm to the tip controller, whose own weapon drive
-            // snapped the blade (HANDOFF-01: claymore hand jump 5.3-5.6 against
-            // a p99 of 2). OPENMW_RAGDOLL_HSC_BLOCK=0 = the tip controller's.
-            if (blocking)
-            {
-                if (!mHscBlocking)
-                {
-                    mHscBlocking = true;
-                    mHscBlockFrom = mAttackLastPose ? *mAttackLastPose : guardPose;
-                    mHscBlockTime = 0.0f;
-                    mAttackStage = AttackStage::Guard;
-                    mAttackWind = mAttackCut = 0.0f;
-                    mFlowU = mFlowV = 0.0f;
-                    mChainFrom.reset();
-                    mAutoAttack = false;
-                }
-                mHscBlockTime += duration;
-                JPH::Vec3 bladeDir(-0.196f, 0.539f, 0.819f);
-                JPH::Vec3 hand(4.0f, 24.0f, 6.0f);
-                JPH::Vec3 pole(0.5f, 0.1f, -0.85f);
-                float twist = -10.0f;
-                // Guard zones (OPENMW_RAGDOLL_GUARD_ZONES=1): the block where
-                // the zone says - high, the blade across above the head (an
-                // overhead chop); left/right, upright on that side; low, the
-                // point down in front. A new zone blends from where the blade is.
-                static const auto zones_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_GUARD_ZONES", 0.0f) > 0.0f; });
-                static const auto& zones = zones_tuned.get();
-                if (zones)
-                {
-                    const GuardZone zone = guardZone();
-                    if (zone != mHscBlockZone)
-                    {
-                        mHscBlockZone = zone;
-                        if (mAttackLastPose)
-                            mHscBlockFrom = *mAttackLastPose;
-                        mHscBlockTime = 0.0f;
-                    }
-                    switch (zone)
-                    {
-                        case GuardZone::High:
-                            hand = JPH::Vec3(6.0f, 20.0f, 22.0f);
-                            bladeDir = JPH::Vec3(-0.94f, 0.25f, 0.24f);
-                            pole = JPH::Vec3(0.4f, 0.1f, -0.9f);
-                            twist = 0.0f;
-                            break;
-                        case GuardZone::Left:
-                            hand = JPH::Vec3(-8.0f, 24.0f, 4.0f);
-                            bladeDir = JPH::Vec3(-0.15f, 0.3f, 0.94f);
-                            pole = JPH::Vec3(0.2f, 0.1f, -0.97f);
-                            break;
-                        case GuardZone::Right:
-                            hand = JPH::Vec3(16.0f, 22.0f, 2.0f);
-                            bladeDir = JPH::Vec3(0.2f, 0.3f, 0.93f);
-                            pole = JPH::Vec3(0.85f, 0.1f, -0.5f);
-                            break;
-                        case GuardZone::Low:
-                            hand = JPH::Vec3(6.0f, 26.0f, -14.0f);
-                            bladeDir = JPH::Vec3(-0.3f, 0.4f, -0.86f);
-                            pole = JPH::Vec3(0.5f, 0.1f, -0.85f);
-                            break;
-                        case GuardZone::Middle:
-                            break;
-                    }
-                    bladeDir = bladeDir.Normalized();
-                }
-                if (mGuardThreat)
-                {
-                    const JPH::Vec3 toThreat(JPH::Vec3(*mGuardThreat - centre));
-                    const JPH::Vec3 local(toThreat.Dot(frame.mRight), toThreat.Dot(frame.mForward), toThreat.Dot(frame.mUp));
-                    const JPH::Vec3 threat = (local - hand).NormalizedOr(bladeDir);
-                    bladeDir = (bladeDir + threat).NormalizedOr(bladeDir);
-                }
-                ChamberPose block;
-                block.mHand = hand;
-                block.mPole = pole.Normalized();
-                block.mTwist = osg::DegreesToRadians(twist);
-                const JPH::Vec3 edge = JPH::Vec3(0.0f, 1.0f, 0.0f) - bladeDir * bladeDir.GetY();
-                const auto rotation = RagdollCore::alignedStrikeHandRotation(axes, bladeDir, edge.NormalizedOr(JPH::Vec3::sAxisY()));
-                block.mRotation = rotation ? rotation->Normalized() : guardPose.mRotation;
-                const float u = std::clamp(mHscBlockTime / 0.12f, 0.0f, 1.0f);
-                pose = blendPose(mHscBlockFrom, block, u * u * (3.0f - 2.0f * u));
-            }
-            else if (mHscBlocking)
-            {
-                mHscBlocking = false;
-                // GUARD-03: a block the player's attack press ended goes
-                // straight into that attack from the block, as a chain does
-                // (the drag picks the line, a release clicks). Through the
-                // return to the guard (0.4-0.6 s) a click released meanwhile
-                // was lost: a click starts only from the guard.
-                // OPENMW_RAGDOLL_GUARD_TO_ATTACK=0 = the return first.
-                if (guardToAttack() && held && !npcTiming && mAttackLastPose)
-                {
-                    mAttackStage = AttackStage::Guard;
-                    mAttackWind = mAttackCut = 0.0f;
-                    mChainFrom = mAttackLastPose;
-                    mChainTime = 0.0f;
-                    mChainVelocity = mChainSpin = JPH::Vec3::sZero();
-                    mFlowU = mFlowV = 0.0f;
-                    mCutFrom.reset();
-                    if (RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
-                        Log(Debug::Info) << "RAGDOLL_HSC guard to attack step=" << mFixedSteps;
-                }
-                else
-                {
-                    mAttackStage = AttackStage::Recover;
-                    mAttackRecover = 0.0f;
-                    mAttackRecoverFrom = mAttackLastPose;
-                    mHscSinceBlock = 0.0f;
-                }
-            }
-            if (pose)
-            {
-                // The block above.
-            }
-            else if (mAttackStage == AttackStage::Recover)
-            {
-                mAttackRecover += duration;
-                // The return to the guard (0.6 s to build 55; two-handers keep
-                // it, see the release hold). OPENMW_RAGDOLL_HSC_RETURN /
-                // _RETURN_TWO (seconds).
-                static const auto returnOne_tuned = RagdollCore::tuned<float>([] { return std::max(0.05f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_RETURN", 0.4f)); });
-                static const auto& returnOne = returnOne_tuned.get();
-                static const auto returnTwo_tuned = RagdollCore::tuned<float>([] { return std::max(0.05f, weaponDriveSetting("OPENMW_RAGDOLL_HSC_RETURN_TWO", 0.6f)); });
-                static const auto& returnTwo = returnTwo_tuned.get();
-                const float ownReturn = shortStriker() && shortPaceSettings()[3] > 0.0f ? shortPaceSettings()[3]
-                    : hscStriker().mTwoHanded                                       ? returnTwo
-                                                                                    : returnOne;
-                // Low skill recovers slower (user 10-31: "make it depend on the
-                // skill"; the skill design, 09-30): the return takes up to
-                // 1 + `share` times as long at no weapon control (skill,
-                // Agility, Luck, fatigue - DMG-04's control, as the clash knock's
-                // recovery). A level-1 warrior's claymore (Long Blade 30,
-                // Agility 35, Luck 40, rested: control 0.51) returns in 0.6 x
-                // 1.12 = 0.67 s (0.88 s at 0.75 until 10-31: "too large").
-                // OPENMW_RAGDOLL_HSC_RETURN_SKILL = share (0 = off).
-                static const auto returnSkill_tuned = RagdollCore::tuned<float>([] { return std::clamp(weaponDriveSetting("OPENMW_RAGDOLL_HSC_RETURN_SKILL", 0.2f), 0.0f, 3.0f); });
-                static const auto& returnSkill = returnSkill_tuned.get();
-                const float returnLoss = std::clamp((1.0f - mWeaponControl) / 0.8f, 0.0f, 1.0f);
-                const float returnTime = ownReturn * (npcTiming ? std::max(0.1f, npcPace[3]) : 1.0f)
-                    * (1.0f + returnSkill * returnLoss);
-                mHscReturnTime = returnTime;
-                const float u = std::clamp(mAttackRecover / returnTime, 0.0f, 1.0f), w = u * u * (3.0f - 2.0f * u);
-                if (!mAttackRecoverFrom || u >= 1.0f)
-                {
-                    mAttackStage = AttackStage::Guard;
-                    mAttackWind = mAttackCut = 0.0f;
-                    pose = guardPose;
-                }
-                else if (mWaitRecover && u >= hscWaitReturn())
-                {
-                    // The waiting press goes from here (hscWaitReturn), with
-                    // no momentum: below skill 50 nothing is carried.
-                    mAttackStage = AttackStage::Guard;
-                    mAttackWind = mAttackCut = 0.0f;
-                    mChainFrom = blendPose(*mAttackRecoverFrom, guardPose, w);
-                    mChainVelocity = mChainSpin = JPH::Vec3::sZero();
-                    mChainTime = 0.0f;
-                    pose = *mChainFrom;
-                }
-                else
-                    pose = blendPose(*mAttackRecoverFrom, guardPose, w);
-            }
-            else if (mAttackStage == AttackStage::Guard)
-            {
-                pose = mChainFrom ? *mChainFrom : guardPose;
-                // Released without a new drag: back to the guard from there.
-                if (mChainFrom && !held)
-                {
-                    mAttackStage = AttackStage::Recover;
-                    mAttackRecover = 0.0f;
-                    mAttackRecoverFrom = mChainFrom;
-                    mChainFrom.reset();
-                }
-            }
-            else
-            {
-                // The two lines either side of the angle, blended.
-                const float slot = mAttackAngle / eighth;
-                const std::size_t i0 = static_cast<std::size_t>(std::floor(slot)) % lines.size();
-                const std::size_t i1 = (i0 + 1) % lines.size();
-                const float w = slot - std::floor(slot);
-                // A chained attack goes from where the weapon is straight on
-                // to the outer half of its wind-up (Meyer's square: the
-                // follow-through becomes the next wind-up), blended in over
-                // the whole wind-up. Blended over its first half from the
-                // guard key (build 35-37), a forehand chained into a backhand
-                // went back toward the guard first, against its own momentum
-                // (CHAIN-01: 4-8% of the speed carried).
-                // OPENMW_RAGDOLL_HSC_CHAIN_DIRECT=0 = build 37's blend.
-                static const auto chainDirect_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CHAIN_DIRECT", 1.0f) > 0.0f; });
-                static const auto& chainDirect = chainDirect_tuned.get();
-                // Not into a low chamber (the rising cuts): straight on from a
-                // follow-through it swung the arm across low and the wrist went
-                // 55 deg past its limit (FLOW-01 longsword down-left); those
-                // chain through the guard as before.
-                const bool directHere = chainDirect && std::sin(mAttackAngle) > -0.3f;
-                const float chainSpan = directHere ? 1.0f : 0.5f;
-                // Also complete in 0.5 s whatever the route does: a chain into
-                // a stance inside the circle never reached the chamber, and its
-                // blend stayed half done.
-                if (mChainFrom)
-                {
-                    if (mChainTime <= 0.0f)
-                        mChainWayTarget.reset();
-                    mChainTime += duration;
-                }
-                const float chainByTime = std::clamp(mChainTime / 0.5f, 0.0f, 1.0f);
-                // HSC_CHAIN_FLOW: once the chain's new line is known, whether
-                // its wind-up lies where the last cut ended (Meyer's square on
-                // the wheel: a cut ends on the side opposite its wind-up, so the
-                // backhand after a forehand, a rising cut after a chop flow; the
-                // same line again goes back against the blade). The hand's
-                // measured velocity at the chain read 0-0.24 for a forehand run
-                // on into the backhand (COMBO-01): by then the follow-through
-                // has braked.
-                if (mChainFrom && mChainFlowPending && mAttackStage == AttackStage::Wind)
-                {
-                    mChainFlowPending = false;
-                    mChainFlowGain = 0.0f;
-                    if (hscChainFlow()[0] + hscChainFlow()[1] > 0.0f)
-                    {
-                        const float along = -std::cos(mAttackAngle - mChainPrevAngle);
-                        mChainFlowGain = std::clamp(along, 0.0f, 1.0f) * mChainTiming * (0.5f + 0.5f * momentumShare);
-                        if (RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
-                            Log(Debug::Info) << "RAGDOLL_HSC chain flow along=" << along << " timing=" << mChainTiming
-                                             << " gain=" << mChainFlowGain;
-                    }
-                }
-                // Smooth at both ends: the carried momentum gives the start its
-                // speed. Eased out, every chained FLOW-01 attack began with the
-                // blade turning 9 deg a step from rest.
-                // Never faster than the arm can turn the blade: at least 0.12 s
-                // plus 0.2 s per half turn between the chain's start and the new
-                // line's chamber. Driven by the mouse alone, a chain from a
-                // follow-through into a low chamber (the rising cuts) turned the
-                // blade so fast the elbow flipped: FLOW-01 longsword down-right
-                // cut 29 units off (p90), down-left wrist 55 deg past its limit;
-                // without chains 3 and 0. OPENMW_RAGDOLL_HSC_CHAIN_TURN (s per
-                // half turn, 0 = off).
-                static const auto chainTurn_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CHAIN_TURN", 0.2f); });
-                static const auto& chainTurn = chainTurn_tuned.get();
-                float chainCap = 1.0f;
-                if (mChainFrom && chainTurn > 0.0f)
-                {
-                    const auto a1 = linePose(i0, 1.0f), b1 = linePose(i1, 1.0f);
-                    if (a1 && b1)
-                    {
-                        const JPH::Quat chamber = blendPose(*a1, *b1, w).mRotation;
-                        const float turn = 2.0f * std::acos(std::clamp(std::abs(chamber.Dot(mChainFrom->mRotation)), 0.0f, 1.0f));
-                        chainCap = std::clamp(mChainTime / (0.12f + chainTurn * turn / osg::PIf), 0.0f, 1.0f);
-                    }
-                }
-                const float chainProgress = mChainFrom
-                    ? std::max(std::min(std::clamp(mFlowU / chainSpan, 0.0f, 1.0f), chainCap), chainByTime)
-                    : 1.0f;
-                const float chainWeight = mChainFrom ? chainProgress * chainProgress * (3.0f - 2.0f * chainProgress) : 1.0f;
-                // The straight-on remap holds until the chamber (faded with time,
-                // the route stalled and then jumped: FLOW-01 33 deg a step).
-                const float remap = mChainFrom && directHere ? 1.0f : 0.0f;
-                const auto lineAt = [&](float u) -> std::optional<ChamberPose> {
-                    const float routeU = u <= 1.0f ? u + remap * (0.5f - 0.5f * u) : u;
-                    const auto a = linePose(i0, routeU), b = linePose(i1, routeU);
-                    if (!a || !b)
-                        return std::nullopt;
-                    ChamberPose p = blendPose(*a, *b, w);
-                    if (mChainFrom)
-                    {
-                        // The blade turn of the chain takes the way that goes on
-                        // from the last step's blade: the shortest way between a
-                        // follow-through and a nearly opposite wind-up switched
-                        // sides mid-blend, and the commanded blade flipped 100-115
-                        // deg in one step (FLOW-01 chained wind-ups).
-                        ChamberPose blended = blendPose(*mChainFrom, p, chainWeight);
-                        const auto slerpWay = [](JPH::QuatArg from, JPH::QuatArg to, float t) {
-                            const float d = std::clamp(from.Dot(to), -1.0f, 1.0f);
-                            const float angle = std::acos(d);
-                            const float sine = std::sin(angle);
-                            if (sine < 1e-4f)
-                                return (from * (1.0f - t) + to * t).Normalized();
-                            return ((from * (std::sin((1.0f - t) * angle) / sine))
-                                + (to * (std::sin(t * angle) / sine)))
-                                .Normalized();
-                        };
-                        // The way is the shorter one when the chain begins, then the
-                        // target's sign is kept continuous as it moves (chosen by
-                        // nearness to the last pose, both ways start at the same
-                        // blade and the choice could take the long way round).
-                        JPH::Quat target = p.mRotation;
-                        if (!mChainWayTarget)
-                            target = target.Dot(mChainFrom->mRotation) >= 0.0f ? target : -target;
-                        else if (target.Dot(*mChainWayTarget) < 0.0f)
-                            target = -target;
-                        mChainWayTarget = target;
-                        blended.mRotation = slerpWay(mChainFrom->mRotation, target, chainWeight);
-                        p = blended;
-                    }
-                    return p;
-                };
-                // Even speed along the cut (roadmap item 2): the route's keys
-                // are not evenly spaced, so the tip sped up and slowed down
-                // between them at a steady mouse. The cut is retimed by the
-                // tip's arc length, which also ties the blade's turn to the
-                // hand's travel. OPENMW_RAGDOLL_HSC_EVEN_SPEED=0 = by key time.
-                static const auto evenSpeed_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_EVEN_SPEED", 1.0f) > 0.0f; });
-                static const auto& evenSpeed = evenSpeed_tuned.get();
-                const float tipLength = hscStriker().mTip;
-                // How far the foe stands beyond the blade's sweet reach (the
-                // lunge covers only that: stepping in on a foe already in
-                // reach put the dagger's cuts inside it - CONNECT-02 0.25/0.40
-                // 4/6 -> 0/6). Unknown (no foe): no lunge.
-                mHscLungeGap = -1.0f;
-                if (mHscFoe && std::isfinite(centre.GetX()))
-                {
-                    const JPH::Vec3 toFoe(*mHscFoe - centre);
-                    const float flat = std::hypot(toFoe.Dot(frame.mRight), toFoe.Dot(frame.mForward));
-                    mHscLungeGap = flat - (armLength + 0.6f * tipLength + 12.0f);
-                }
-                const auto smoothStep = [](float x) {
-                    x = std::clamp(x, 0.0f, 1.0f);
-                    return x * x * (3.0f - 2.0f * x);
-                };
-                const bool cutting = mAttackStage == AttackStage::Cut && mFlowU > 1.0f;
-                const bool winding = mAttackStage == AttackStage::Wind;
-                // The cut plane (roadmap item 2, "player control should override
-                // everything"): through the chest centre, spanned by the aim and
-                // the stroke. The hand and the blade are put in it, so a
-                // straight-down stroke is an exact vertical chop (chamber D's
-                // keys came down 3-11 units right of the line); the
-                // follow-through leaves it again (down and away: a level
-                // forehand finish hits the own chest). The wind-up's second half
-                // goes into the plane its cut will cut (the stroke back along the
-                // wind-up), so the chamber is already in it: put in only from a
-                // quarter into the cut, the arm's lag left the physical hand of a
-                // chop 7-10 units right of the line through the contact
-                // (CHOP-01). Not for a thrust, nor the low chambers by the hips
-                // (the rising cuts): in the plane they left the wrist 40-54 deg
-                // past its limit (FLOW-01).
-                // OPENMW_RAGDOLL_HSC_CUT_PLANE = share (0 = the keys' own line).
-                static const auto planeShare_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CUT_PLANE", 1.0f); });
-                static const auto& planeShare = planeShare_tuned.get();
-                const float thrustness = std::clamp((-std::sin(mAttackAngle) - 0.85f) / 0.15f, 0.0f, 1.0f);
-                float elevation = -std::clamp(getPtr().getRefData().getPosition().rot[0], -0.6f, 0.6f);
-                // The aim at the crosshair point (user 10-06, aim item 1): the
-                // plane's aim is the way from the chest centre to the point the
-                // crosshair rests on (at the foe's depth, or at the blade's sweet
-                // spot past the chest), not the look's pitch around the chest:
-                // over the shoulder the camera looks down on the chest from
-                // above and behind, so the look's pitch sent the arc above or
-                // below the crosshair, and the plane never turned with the look
-                // sideways. OPENMW_RAGDOLL_HSC_AIM_POINT=1 (off by default).
-                static const auto aimPoint_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_AIM_POINT", 0.0f) > 0.0f; });
-                static const auto& aimPoint = aimPoint_tuned.get();
-                // The low stance (aim item 2) lets the aim go lower.
-                const auto& lowStance = hscLowStance();
-                const float lowest = lowStance[0] > 0.6f ? std::min(lowStance[0], 1.3f) : 0.6f;
-                float baseAzimuth = 0.0f, aimDistance = 0.0f;
-                if (aimPoint && mSwingAimRayOrigin && getPtr() == MWMechanics::getPlayer()
-                    && std::isfinite(centre.GetX()) && std::isfinite(centre.GetZ()))
-                {
-                    // The point is where the ray passes the foe's upright axis
-                    // (or one at the blade's sweet spot ahead of the chest): the
-                    // foe's chest's depth along the ray put a look at the calf
-                    // 20 deg too high (AIM-04: -0.50 for -0.84).
-                    const JPH::Vec3 ray = mSwingAimRayDirection.NormalizedOr(frame.mForward);
-                    const JPH::Vec3 up = frame.mUp;
-                    const JPH::Vec3 flatRay = ray - up * ray.Dot(up);
-                    const float sweet = 35.0f + 0.55f * hscStriker().mTip;
-                    const JPH::RVec3 axis = mHscFoe ? *mHscFoe
-                                                    : centre + JPH::RVec3(flatRay.NormalizedOr(frame.mForward) * sweet);
-                    const JPH::Vec3 toAxis(axis - *mSwingAimRayOrigin);
-                    float depth = toAxis.Dot(ray);
-                    if (flatRay.LengthSq() > 0.01f)
-                        depth = std::min((toAxis - up * toAxis.Dot(up)).Dot(flatRay) / flatRay.LengthSq(),
-                            2.0f * toAxis.Length());
-                    const JPH::RVec3 point = *mSwingAimRayOrigin + JPH::RVec3(ray * std::max(depth, 30.0f));
-                    const JPH::Vec3 toPoint(point - centre);
-                    const JPH::Vec3 local(toPoint.Dot(frame.mRight), toPoint.Dot(frame.mForward), toPoint.Dot(frame.mUp));
-                    const float flat = std::hypot(local.GetX(), local.GetY());
-                    mHscAimPointLocal = local;
-                    mHscAimRayZ = ray.GetZ();
-                    if (local.GetY() > 1.0f && flat > 1.0f)
-                    {
-                        const float azimuth = std::atan2(local.GetX(), local.GetY());
-                        const float pitch = std::atan2(local.GetZ(), flat);
-                        if (std::isfinite(azimuth) && std::isfinite(pitch))
-                        {
-                            baseAzimuth = std::clamp(azimuth, -0.6f, 0.6f);
-                            elevation = std::clamp(pitch, -lowest, 0.6f);
-                            aimDistance = local.Length();
-                        }
-                    }
-                }
-                // The foe assist (user 10-05, build 57: "chops whiff and side
-                // slashes don't connect where they should"; play 10-05/06: 26% of
-                // 46 clicks and 74% of 493 drags with a foe in reach bit, half
-                // the misses passing within 35 units of its body's axis). With a
-                // foe in reach (updateHscFoes) and near the aim, the plane's aim
-                // turns to the foe's side (in full within `full` deg, fading out
-                // by `fade`), and its height is the look's, kept on the foe's body
-                // from the shins to the head. Clicks, which keep their keyed line
-                // otherwise, take the plane at `click` share while a foe is aimed.
-                // OPENMW_RAGDOLL_HSC_AIM_ASSIST = "full deg, fade deg, click
-                // share" (0 = off).
-                static const auto aimAssist_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
-                    std::array<float, 3> value{ 20.0f, 35.0f, 1.0f };
-                    if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_AIM_ASSIST"))
-                        std::sscanf(text, "%f,%f,%f", &value[0], &value[1], &value[2]);
-                    return value;
-                });
-                static const auto& aimAssist = aimAssist_tuned.get();
-                float aimAzimuth = 0.0f, foeAssist = 0.0f;
-                if (aimAssist[0] > 0.0f && mHscFoe && std::isfinite(centre.GetX()) && std::isfinite(centre.GetZ()))
-                {
-                    const JPH::Vec3 toFoe(*mHscFoe - centre);
-                    const JPH::Vec3 foe(toFoe.Dot(frame.mRight), toFoe.Dot(frame.mForward), toFoe.Dot(frame.mUp));
-                    const float flat = std::hypot(foe.GetX(), foe.GetY());
-                    const float reach = hscStriker().mTip + 40.0f;
-                    const float azimuth = std::atan2(foe.GetX(), foe.GetY());
-                    const float full = osg::DegreesToRadians(aimAssist[0]);
-                    const float fade = std::max(full + 1e-3f, osg::DegreesToRadians(aimAssist[1]));
-                    if (flat > 1.0f && flat < reach)
-                    {
-                        // With the aim point, the foe near the crosshair, not
-                        // near the facing.
-                        foeAssist = std::clamp((fade - std::abs(azimuth - baseAzimuth)) / (fade - full), 0.0f, 1.0f);
-                        aimAzimuth = baseAzimuth + (azimuth - baseAzimuth) * foeAssist;
-                        // The foe's body from the shins (95 below its chest) to
-                        // the head (25 above), as seen from the own chest.
-                        const float low = std::atan2(foe.GetZ() - 95.0f, flat);
-                        const float high = std::atan2(foe.GetZ() + 25.0f, flat);
-                        const float kept = std::clamp(elevation, std::max(low, -lowest), std::min(high, 0.6f));
-                        elevation += (kept - elevation) * foeAssist;
-                    }
-                    else
-                        aimAzimuth = baseAzimuth;
-                    if (!std::isfinite(aimAzimuth) || !std::isfinite(elevation) || !std::isfinite(foeAssist))
-                    {
-                        aimAzimuth = foeAssist = 0.0f;
-                        elevation = -std::clamp(getPtr().getRefData().getPosition().rot[0], -0.6f, 0.6f);
-                    }
-                    // AI-02 item 1c: an NPC's aim errs by its control (skill,
-                    // Agility, Luck, fatigue): one draw per attack, azimuth
-                    // and elevation each up to +-`at no control` .. `at full`
-                    // degrees (with AI_AIM the commoner's cuts all landed).
-                    // OPENMW_RAGDOLL_AI_AIM_ERROR = "deg at no control, at full" (unset = none).
-                    static const auto aimError_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                        std::array<float, 2> value{ 0.0f, 0.0f };
-                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_AI_AIM_ERROR"))
-                            std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                        return value;
-                    });
-                    static const auto& aimError = aimError_tuned.get();
-                    if ((aimError[0] > 0.0f || aimError[1] > 0.0f) && getPtr() != MWMechanics::getPlayer())
-                    {
-                        const float control = std::clamp((mWeaponControl - 0.2f) / 0.8f, 0.0f, 1.0f);
-                        const float spread = osg::DegreesToRadians(aimError[0] + (aimError[1] - aimError[0]) * control);
-                        const std::uint64_t hash = (mSerial * 0xD6E8FEB86659FD93ull) ^ (mNpcLineTurn * 0x9E3779B97F4A7C15ull);
-                        const float drawAz = static_cast<float>((hash >> 13) % 2001) / 1000.0f - 1.0f;
-                        const float drawEl = static_cast<float>((hash >> 37) % 2001) / 1000.0f - 1.0f;
-                        aimAzimuth += spread * drawAz * foeAssist;
-                        elevation += spread * drawEl * foeAssist;
-                    }
-                }
-                else
-                    aimAzimuth = baseAzimuth;
-                // Steering (aim item 3): the mouse's offset, given at most 4 rad/s
-                // (all at once, a flick moved the hand 15 units in a step), and
-                // let go outside the cut.
-                {
-                    if (mAttackStage != AttackStage::Cut)
-                        mHscSteerWantX = mHscSteerWantY = 0.0f;
-                    const float rate = 4.0f * duration;
-                    mHscSteerX += std::clamp(mHscSteerWantX - mHscSteerX, -rate, rate);
-                    mHscSteerY += std::clamp(mHscSteerWantY - mHscSteerY, -rate, rate);
-                    if (!std::isfinite(mHscSteerX) || !std::isfinite(mHscSteerY))
-                        mHscSteerX = mHscSteerY = mHscSteerWantX = mHscSteerWantY = 0.0f;
-                    aimAzimuth = std::clamp(aimAzimuth + mHscSteerX, -0.8f, 0.8f);
-                    elevation = std::clamp(elevation + mHscSteerY, -lowest, 0.6f);
-                }
-                mHscAimElevation = elevation;
-                // A low aim takes the low stance (aim item 2): only where the
-                // plane will carry the cut there (a drag, or a click at a foe).
-                if (lowStance[0] > 0.6f)
-                {
-                    const float span = std::max(0.05f, lowest - lowStance[3]);
-                    const bool planed = (!mAutoAttack || foeAssist > 0.0f) && thrustness < 1.0f && planeShare > 0.0f;
-                    mHscLowWant = planed ? smoothStep((-elevation - lowStance[3]) / span) : 0.0f;
-                }
-                else
-                    mHscLowWant = 0.0f;
-                mHscFoeAssist = foeAssist;
-                {
-                    static const auto aimTrace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_AIM_TRACE") != nullptr; });
-                    static const auto& aimTrace = aimTrace_tuned.get();
-                    const bool cutNow = mAttackStage == AttackStage::Cut;
-                    if (aimTrace && cutNow != mHscAimTraced)
-                    {
-                        mHscAimTraced = cutNow;
-                        if (cutNow)
-                        {
-                            JPH::Vec3 foe = JPH::Vec3::sZero();
-                            if (mHscFoe)
-                            {
-                                const JPH::Vec3 toFoe(*mHscFoe - centre);
-                                foe = JPH::Vec3(toFoe.Dot(frame.mRight), toFoe.Dot(frame.mForward), toFoe.Dot(frame.mUp));
-                            }
-                            Log(Debug::Info) << "RAGDOLL_HSC_AIM actor=" << getPtr().getCellRef().getRefId()
-                                             << " foe=" << (mHscFoe ? 1 : 0) << " local=" << foe.GetX() << ","
-                                             << foe.GetY() << "," << foe.GetZ() << " assist=" << foeAssist
-                                             << " az=" << aimAzimuth << " el=" << elevation << " auto=" << mAutoAttack
-                                             << " angle=" << mAttackAngle;
-                        }
-                    }
-                }
-                const JPH::Vec3 aimDirection(std::sin(aimAzimuth) * std::cos(elevation),
-                    std::cos(aimAzimuth) * std::cos(elevation), std::sin(elevation));
-                const JPH::Vec3 planeNormal = [&] {
-                    const float sx = -std::cos(mAttackAngle), sy = -std::sin(mAttackAngle);
-                    // The actor's pitch is positive looking down.
-                    const float ca = std::cos(aimAzimuth), sa = std::sin(aimAzimuth);
-                    const float ce = std::cos(elevation), se = std::sin(elevation);
-                    const JPH::Vec3 aim(sa * ce, ca * ce, se);
-                    const JPH::Vec3 screenRight(ca, -sa, 0.0f);
-                    const JPH::Vec3 screenUp(-sa * se, -ca * se, ce);
-                    const JPH::Vec3 stroke = screenRight * sx + screenUp * sy;
-                    return stroke.Cross(aim).NormalizedOr(JPH::Vec3::sAxisX());
-                }();
-                // The plane's weight at a route position (0..1 wind-up, 1..2 cut).
-                // Only for a dragged stroke: a click has no stroke to take a
-                // plane from, and keeps its line (FIX-08 click and guided
-                // longsword and warhammer: 0-2 of 3 blows bit with it).
-                // (asCut / asWind: the stage it is taken for; the trajectory
-                // preview takes a clicked attack's cut during its wind-up.)
-                const auto planeWeightAs = [&](float u, bool asCut, bool asWind) {
-                    if (planeShare <= 0.0f || thrustness >= 1.0f || (mAutoAttack && foeAssist <= 0.0f))
-                        return 0.0f;
-                    const float share = planeShare * (1.0f - thrustness) * (mAutoAttack ? foeAssist * aimAssist[2] : 1.0f);
-                    // Low chambers stay out of it (see above); their cuts go in
-                    // over the cut's first quarter, from the wind-up's share
-                    // (all at once, the blade jumped 11-15 deg at the start of
-                    // a backhand or rising cut: FLOW-01).
-                    const float low = std::clamp((std::sin(mAttackAngle) + 0.3f) / 0.6f, 0.0f, 1.0f);
-                    // From the cut's first step (at u = 1 exactly the weight fell
-                    // to nothing for a step: a 5 deg blip at every cut start),
-                    // over its first 0.4 (over 0.25 the blade's extra turn into
-                    // the plane made a speed hump: FLOW-01).
-                    if (asCut && u >= 1.0f)
-                    {
-                        const float cu = u - 1.0f;
-                        // OPENMW_RAGDOLL_HSC_PLANE_RISING=0: the rising cuts keep
-                        // their keyed lines through the cut too.
-                        static const auto risingPlane_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_PLANE_RISING", 1.0f) > 0.0f; });
-                        static const auto& risingPlane = risingPlane_tuned.get();
-                        const float rampTo = risingPlane ? 1.0f : low;
-                        // An aimed foe keeps the plane longer: the physical hand
-                        // trails a fast cut by 20 units at its middle (AIM-03
-                        // click chops), so the blade crossed the foe after the
-                        // command had left the plane. OPENMW_RAGDOLL_HSC_AIM_HOLD =
-                        // how much later the plane fades with a foe aimed
-                        // (route share).
-                        static const auto aimHold_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_AIM_HOLD", 0.2f); });
-                        static const auto& aimHold = aimHold_tuned.get();
-                        const float fadeFrom = 0.65f + aimHold * foeAssist;
-                        return share * (low + (rampTo - low) * smoothStep(cu / 0.4f))
-                            * (1.0f - smoothStep((cu - fadeFrom) / 0.25f));
-                    }
-                    if (asWind)
-                        return share * smoothStep((u - 0.5f) / 0.5f) * low;
-                    return 0.0f;
-                };
-                const auto planeWeight = [&](float u) { return planeWeightAs(u, cutting, winding); };
-                const auto inPlane = [&](ChamberPose& p, float weight) {
-                    if (weight <= 0.0f)
-                        return;
-                    const JPH::Vec3 blade = (p.mRotation * hscStriker().mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY());
-                    // The blade only where it already lies near the plane: one
-                    // pointing along its normal (a slash's wind-up holds the
-                    // blade up, across a level plane) flipped 112 deg in a step
-                    // when pressed into it (FLOW-01).
-                    const float across = std::abs(planeNormal.Dot(blade));
-                    const float bladeWeight = weight * smoothStep((0.8f - across) / 0.4f);
-                    const JPH::Vec3 planeBlade
-                        = (blade - planeNormal * (planeNormal.Dot(blade) * bladeWeight)).NormalizedOr(blade);
-                    p.mRotation = (JPH::Quat::sFromTo(blade, planeBlade) * p.mRotation).Normalized();
-                    p.mHand -= planeNormal * (planeNormal.Dot(p.mHand) * weight);
-                    // Reach for the aim point (aim items 1 and 2): where the tip
-                    // points near the aim, the hand goes out along it until the
-                    // tip reaches the point, at most `aimReach` units (the arm's
-                    // own limit still holds): in a steep plane through the
-                    // chest the keys' hand came in to 19 units of the chest, and
-                    // the tip fell 40 short of a calf.
-                    // OPENMW_RAGDOLL_HSC_AIM_REACH = most units (0 = off).
-                    static const auto aimReach_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_AIM_REACH", 0.0f); });
-                    static const auto& aimReach = aimReach_tuned.get();
-                    if (aimReach > 0.0f && aimDistance > 0.0f)
-                    {
-                        const JPH::Vec3 tip = p.mHand + planeBlade * tipLength;
-                        const float along = tip.Dot(aimDirection);
-                        const float align = smoothStep((tip.NormalizedOr(JPH::Vec3::sAxisY()).Dot(aimDirection) - 0.5f) / 0.4f);
-                        const float out = std::clamp(aimDistance - along, 0.0f, aimReach) * align * weight;
-                        if (std::isfinite(out))
-                            p.mHand += aimDirection * out;
-                    }
-                    // Point-blank (the video's top complaint; the dagger's whole
-                    // range): where the tip would end deeper than `depth` past
-                    // the aim point, the hand draws back along the aim, at most
-                    // `most` units, so the edge crosses the foe's surface at
-                    // speed instead of starting buried in it (FIX-08: a guard
-                    // tip 74-81 u forward put 35-unit cuts inside the target).
-                    // OPENMW_RAGDOLL_HSC_AIM_PULL = "depth, most units" (0 = off).
-                    static const auto aimPull_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                        std::array<float, 2> v{ 0.0f, 0.0f };
-                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_AIM_PULL"))
-                            std::sscanf(text, "%f,%f", &v[0], &v[1]);
-                        return v;
-                    });
-                    static const auto& aimPull = aimPull_tuned.get();
-                    if (aimPull[1] > 0.0f && aimDistance > 0.0f)
-                    {
-                        const JPH::Vec3 tip = p.mHand + planeBlade * tipLength;
-                        const float along = tip.Dot(aimDirection);
-                        const float align = smoothStep((tip.NormalizedOr(JPH::Vec3::sAxisY()).Dot(aimDirection) - 0.5f) / 0.4f);
-                        const float in = std::clamp(along - (aimDistance + aimPull[0]), 0.0f, aimPull[1]) * align * weight;
-                        if (std::isfinite(in))
-                            p.mHand -= aimDirection * in;
-                    }
-                };
-                // Even speed along the route (roadmap item 2): the keys are not
-                // evenly spaced, so at a steady mouse the blade turned fast round
-                // one key and slowly between them - built into the command
-                // (FLOW-01: 18-20 extra speed peaks in the commanded blade
-                // alone). The route is retimed by its length as shown, plane
-                // included: the tip's travel (mixing in the blade's turn was no
-                // better: FLOW-01 prominent extra peaks per 18 strokes, means of
-                // 5-7 runs, at 0.7 / 0: claymore 4.1 / 3.2, longsword 3.3 / 3.2,
-                // axe 2.4 / 2.2, warhammer 1.7 / 2.2).
-                // OPENMW_RAGDOLL_HSC_EVEN_SPEED=0 = by key time.
-                const auto evenRoute = [&](float base, float cu) {
-                    constexpr int samples = 16;
-                    std::array<float, samples + 1> length{};
-                    JPH::Vec3 previousTip = JPH::Vec3::sZero();
-                    for (int k = 0; k <= samples; ++k)
-                    {
-                        const float s = static_cast<float>(k) / samples;
-                        const auto a = linePose(i0, base + s), b = linePose(i1, base + s);
-                        if (!a || !b)
-                            return cu;
-                        ChamberPose p = blendPose(*a, *b, w);
-                        inPlane(p, planeWeight(base + s));
-                        const JPH::Vec3 blade = (p.mRotation * hscStriker().mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY());
-                        const JPH::Vec3 tip = p.mHand + blade * tipLength;
-                        const float step = k > 0 ? (tip - previousTip).Length() : 0.0f;
-                        length[static_cast<std::size_t>(k)] = k > 0 ? length[static_cast<std::size_t>(k - 1)] + step : 0.0f;
-                        previousTip = tip;
-                    }
-                    const float total = length[samples];
-                    if (total < 1e-3f)
-                        return cu;
-                    const float target = std::clamp(cu, 0.0f, 1.0f) * total;
-                    int k = 0;
-                    while (k < samples - 1 && length[static_cast<std::size_t>(k + 1)] < target)
-                        ++k;
-                    const float span = length[static_cast<std::size_t>(k + 1)] - length[static_cast<std::size_t>(k)];
-                    const float f = span > 1e-5f ? (target - length[static_cast<std::size_t>(k)]) / span : 0.0f;
-                    return (static_cast<float>(k) + std::clamp(f, 0.0f, 1.0f)) / samples;
-                };
-                const float shownU = !evenSpeed ? mFlowU
-                    : cutting                  ? 1.0f + evenRoute(1.0f, mFlowU - 1.0f)
-                                               : evenRoute(0.0f, std::min(mFlowU, 1.0f));
-                pose = lineAt(shownU);
-                if (!pose)
-                    return false;
-                // A cut along another line than the wind-up's (or a snap cut from
-                // a stance) starts from where the weapon was.
-                if (mCutFrom && mAttackStage == AttackStage::Cut)
-                {
-                    const float c = (mFlowU - 1.0f - mCutFromU) / 0.25f;
-                    pose = blendPose(*mCutFrom, *pose, smoothStep(c));
-                    if (c >= 1.0f)
-                        mCutFrom.reset();
-                }
-                else if (mAttackStage != AttackStage::Cut)
-                    mCutFrom.reset();
-                inPlane(*pose, planeWeight(shownU));
-                // Thrusts aim at the crosshair point too (build 61 bookmark 18;
-                // the cut plane leaves thrusts out): the thrust's pose turns
-                // about the chest by the aim's bearing and height, in full
-                // from the wind-up's second half.
-                // OPENMW_RAGDOLL_HSC_THRUST_AIM=1 (off by default).
-                static const auto thrustAim_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_THRUST_AIM", 0.0f) > 0.0f; });
-                static const auto& thrustAim = thrustAim_tuned.get();
-                const auto thrustTurn = [&](ChamberPose& p, float aimShare) {
-                    if (thrustAim && aimShare > 0.0f && std::isfinite(aimAzimuth) && std::isfinite(elevation))
-                    {
-                        const JPH::Quat turn = (JPH::Quat::sRotation(JPH::Vec3::sAxisZ(), -aimAzimuth * aimShare)
-                            * JPH::Quat::sRotation(JPH::Vec3::sAxisX(), elevation * aimShare))
-                                                   .Normalized();
-                        p.mHand = turn * p.mHand;
-                        p.mRotation = (turn * p.mRotation).Normalized();
-                    }
-                };
-                {
-                    thrustTurn(*pose, thrustness * (cutting ? 1.0f : winding ? smoothStep((shownU - 0.5f) / 0.5f) : 0.0f));
-                    // Fists and daggers: out to the aimed point (SHORT_REACH).
-                    const auto& shortReach = shortReachSettings();
-                    if (shortReach[1] > 0.0f && shortStriker() && cutting && aimDistance > 0.0f && thrustness > 0.0f)
-                    {
-                        const float share = thrustness * smoothStep((shownU - 1.3f) / 0.5f);
-                        const float tipAlong = pose->mHand.Dot(aimDirection) + tipLength;
-                        const float out
-                            = std::clamp(aimDistance + shortReach[0] - tipAlong, 0.0f, shortReach[1]) * share;
-                        if (std::isfinite(out))
-                            pose->mHand += aimDirection * out;
-                    }
-                }
-                // The thrust's drive (THRUST-02, thrustLungeSettings): the body's
-                // share is eased below; the weapon hand's extra reach goes with
-                // the route.
-                const auto& thrustLunge = thrustLungeSettings();
-                // The player's thrusts only for now: NPC thrusts are where the
-                // duels were tuned.
-                const auto thrustDriveAt = [&](float u, bool asCut) {
-                    if (thrustness <= 0.0f || getPtr() != MWMechanics::getPlayer())
-                        return 0.0f;
-                    if (asCut)
-                        return thrustness * smoothStep((u - 1.0f) / 0.5f);
-                    return -thrustness * thrustLunge[3] * smoothStep((u - 0.5f) / 0.5f);
-                };
-                const auto thrustReach = [&](ChamberPose& p, float drive) {
-                    if (thrustLunge[2] <= 0.0f || drive <= 0.0f || shortStriker())
-                        return;
-                    const JPH::Vec3 along = (p.mRotation * hscStriker().mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY());
-                    p.mHand += along * (thrustLunge[2] * drive);
-                };
-                if (cutting || winding)
-                {
-                    mThrustDriveWant = thrustDriveAt(shownU, cutting);
-                    thrustReach(*pose, mThrustDriveWant);
-                }
-                // The swing's trajectory for the reticle (TRAJ-01, user 10-31:
-                // "upon release the crosshair draws the player swing trajectory
-                // so the player gets better feedback on how the aiming works"):
-                // once the player's attack is committed (a click's wind-up, any
-                // cut), the commanded tip along the whole cut as the route will
-                // take it from here - the cut plane, a thrust's aim and reach -
-                // in world space, renewed every step (steering moves it). The
-                // physical tip trails the command by 10-20 units mid-cut
-                // (FLOW-01). OPENMW_RAGDOLL_HUD_TRAJECTORY = points (0 = off).
-                static const auto previewPoints_tuned = RagdollCore::tuned<int>([] {
-                    return std::clamp(static_cast<int>(weaponDriveSetting("OPENMW_RAGDOLL_HUD_TRAJECTORY", 16.0f)), 0, 32);
-                });
-                static const auto& previewPoints = previewPoints_tuned.get();
-                if (previewPoints >= 2 && getPtr() == MWMechanics::getPlayer() && ((winding && mAutoAttack) || cutting))
-                {
-                    for (int k = 0; k < previewPoints; ++k)
-                    {
-                        const float u = 1.0f + static_cast<float>(k) / static_cast<float>(previewPoints - 1);
-                        auto p = lineAt(u);
-                        if (!p)
-                        {
-                            mHscPreview.clear();
-                            break;
-                        }
-                        inPlane(*p, planeWeightAs(u, true, false));
-                        thrustTurn(*p, thrustness);
-                        thrustReach(*p, thrustDriveAt(u, true));
-                        const JPH::Vec3 blade = (p->mRotation * hscStriker().mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY());
-                        const JPH::Vec3 tip = p->mHand + blade * tipLength;
-                        const JPH::Vec3 offset = frame.mRight * tip.GetX() + frame.mForward * tip.GetY() + frame.mUp * tip.GetZ();
-                        if (!std::isfinite(offset.GetX()) || !std::isfinite(offset.GetY()) || !std::isfinite(offset.GetZ()))
-                        {
-                            mHscPreview.clear();
-                            break;
-                        }
-                        mHscPreview.push_back(centre + JPH::RVec3(offset));
-                    }
-                }
-                // A steady NPC keeps its weapon hand in front of its body
-                // (build 59 bookmark 6: "the enemy's arm goes behind its
-                // body"; build 61 play: the duel NPC's hand 15 units behind
-                // its chest in its wind-ups): deeper than 6 units behind the
-                // chest centre is pressed to 30% of the excess.
-                {
-                    static const auto npcSteady_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_NPC_STEADY", 0.0f) > 0.0f; });
-                    static const auto& npcSteady = npcSteady_tuned.get();
-                    if (npcSteady && getPtr() != MWMechanics::getPlayer() && pose->mHand.GetY() < -6.0f)
-                        pose->mHand.SetY(-6.0f + (pose->mHand.GetY() + 6.0f) * 0.3f);
-                }
-                {
-                    static const auto aimTrace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_AIM_TRACE") != nullptr; });
-                    static const auto& aimTrace = aimTrace_tuned.get();
-                    if (aimTrace && mAttackStage == AttackStage::Cut && shownU >= 1.5f && !mHscAimMidTraced)
-                    {
-                        mHscAimMidTraced = true;
-                        const JPH::Vec3 bladeCmd = (pose->mRotation * hscStriker().mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY());
-                        const JPH::Vec3 tipCmd = pose->mHand + bladeCmd * tipLength;
-                        const JPH::Vec3 handNow = mMeasuredHandBody ? *mMeasuredHandBody : JPH::Vec3::sZero();
-                        Log(Debug::Info) << "RAGDOLL_HSC_AIM_MID u=" << shownU << " w=" << planeWeight(shownU)
-                                         << " n=" << planeNormal.GetX() << "," << planeNormal.GetY() << "," << planeNormal.GetZ()
-                                         << " hand_cmd=" << pose->mHand.GetX() << "," << pose->mHand.GetY() << "," << pose->mHand.GetZ()
-                                         << " hand_phys=" << handNow.GetX() << "," << handNow.GetY() << "," << handNow.GetZ()
-                                         << " tip_cmd=" << tipCmd.GetX() << "," << tipCmd.GetY() << "," << tipCmd.GetZ()
-                                         << " az=" << aimAzimuth << " el=" << elevation << " steer=" << mHscSteerX << ","
-                                         << mHscSteerY << " low=" << mHscLow << " point=" << mHscAimPointLocal.GetX() << ","
-                                         << mHscAimPointLocal.GetY() << "," << mHscAimPointLocal.GetZ() << " rayz=" << mHscAimRayZ
-                                         << " centre_z=" << centre.GetZ() << " lean=" << mHscLean
-                                         << " drop=" << footfallRootDrop();
-                    }
-                    if (mAttackStage != AttackStage::Cut)
-                        mHscAimMidTraced = false;
-                }
-                mCutPlaneMiss = cutting
-                    ? std::abs(planeNormal.Dot(pose->mHand + (pose->mRotation * hscStriker().mBladeAxis) * tipLength))
-                    : 0.0f;
-                // A fast cut's hand trails 10-15 units (FLOW-01); commanding
-                // the arm a moment ahead on the route left it unchanged (13 /
-                // 13 / 13 units at 0 / 0.04 / 0.08 s): the lag is the weapon
-                // drive's, not the arm springs' (removed 10-12).
-                // The body leads the arm (roadmap item 2, the kinetic chain): the
-                // chest's turn is taken this far ahead on the route, and the
-                // spine spreads it so the hips lead the chest and the chest the
-                // arm (applySwingBodyPose). OPENMW_RAGDOLL_HSC_BODY_LEAD, seconds.
-                static const auto bodyLead_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_BODY_LEAD", 0.06f); });
-                static const auto& bodyLead = bodyLead_tuned.get();
-                mHscTwistLead = pose->mTwist;
-                if (bodyLead > 0.0f && routed && std::abs(mFlowV) > 1e-3f)
-                {
-                    const float aheadU = std::clamp(shownU + mFlowV * bodyLead, 0.0f, 2.0f);
-                    if (const auto ahead = lineAt(aheadU))
-                        mHscTwistLead = ahead->mTwist;
-                }
-                if (mChainFrom && mFlowU >= chainSpan && chainProgress >= 1.0f)
-                    mChainFrom.reset();
-                mAttackLine = static_cast<int>(w < 0.5f ? i0 : i1);
-                mPlayerAttackType = lines[static_cast<std::size_t>(mAttackLine)].mAttackType;
-            }
-            if (mAttackStage == AttackStage::Guard)
-                mAttackLine = -1;
-            if (mAttackStage == AttackStage::Recover || mHscBlocking
-                || (mAttackStage == AttackStage::Guard && !held))
-            {
-                mStanceX = mStanceY = 0.0f;
-                mCutFrom.reset();
-            }
-            if (!(mAttackStage == AttackStage::Wind || mAttackStage == AttackStage::Cut))
-                mHscTwistLead = pose->mTwist;
-            // The weapon drive's phase (roadmap item 3): stiff while the cut
-            // drives (to two thirds), soft in the follow-through, where the
-            // weapon's weight carries it; eased at 8/s.
-            // OPENMW_RAGDOLL_HSC_CUT_STIFF / OPENMW_RAGDOLL_HSC_FOLLOW_SOFT.
-            {
-                static const auto cutStiff_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CUT_STIFF", 1.5f); });
-                static const auto& cutStiff = cutStiff_tuned.get();
-                static const auto followSoftOne_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_FOLLOW_SOFT", 0.6f); });
-                static const auto& followSoftOne = followSoftOne_tuned.get();
-                // Two-handers keep a firm follow-through: soft, the heavy blade
-                // swung 50-140 deg past the cut's end and the next wind-up had to
-                // haul it back (user 10-05: the warhammer "slows down as it tries
-                // to setup the wrist configuration for right side wind up").
-                // Replays of the 13:41 session, 3 runs: steps held > 90 deg 276 ->
-                // 119, re-seats 9 -> 6; FLOW-01 two-handers 2-3 extra peaks per
-                // 16 strokes (bar 3.2; soft 0.5-2). The longsword stays soft (its
-                // FLOW sits at the bar). OPENMW_RAGDOLL_HSC_FOLLOW_SOFT_TWO.
-                static const auto followSoftTwo_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_FOLLOW_SOFT_TWO", 1.0f); });
-                static const auto& followSoftTwo = followSoftTwo_tuned.get();
-                const float followSoft = hscStriker().mTwoHanded ? followSoftTwo : followSoftOne;
-                float phase = 1.0f;
-                if (mAttackStage == AttackStage::Cut)
-                {
-                    const float cu = mFlowU - 1.0f;
-                    const float f = std::clamp((cu - 0.65f) / 0.25f, 0.0f, 1.0f);
-                    phase = cutStiff + (followSoft - cutStiff) * f;
-                    // ...and firm again once the follow-through has spent itself:
-                    // held at the cut's end (play: the button held after a
-                    // drag), a soft drive let a heavy weapon swing loose on the
-                    // moving body (13:41 session: warhammer over 90 deg in 35-49%
-                    // of held steps, claymore 6-40%), and the next wind-up began
-                    // from there. OPENMW_RAGDOLL_HSC_FOLLOW_HOLD (seconds at the
-                    // cut's end before firming, over as long again; 0: off).
-                    static const auto followHold_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_FOLLOW_HOLD", 0.15f); });
-                    static const auto& followHold = followHold_tuned.get();
-                    mFollowHeld = mFlowU >= 1.99f ? mFollowHeld + duration : 0.0f;
-                    if (followHold > 0.0f)
-                        phase += (1.0f - phase) * std::clamp(mFollowHeld / followHold - 1.0f, 0.0f, 1.0f);
-                    // The cut stays firm until the real blade has caught up
-                    // (CONNECT-01; build 61 play: a fast drag ran the command
-                    // through the whole cut in 0.15 s, the drive went soft
-                    // with the real tip still 150 units back, and the blade
-                    // slowed before it reached the foe). Softens only once the
-                    // physical tip is within `catchUp` units of the command.
-                    // OPENMW_RAGDOLL_HSC_CATCH_UP = units (0 = off).
-                    static const auto catchUp_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_CATCH_UP", 0.0f); });
-                    static const auto& catchUp = catchUp_tuned.get();
-                    if (catchUp > 0.0f && mRightArm)
-                    {
-                        const auto handNow = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mHand);
-                        const auto handTurn = mRagdoll->getWorldBodyRotation(mCurrentPhysicsPose, mRightArm->mHand);
-                        if (handNow && handTurn)
-                        {
-                            const JPH::RVec3 physicalTip = *handNow + JPH::RVec3(*handTurn * hscStriker().mBladeAxis * hscStriker().mTip);
-                            const float gap = static_cast<float>((physicalTip - mHscTip).Length());
-                            if (std::isfinite(gap) && gap > catchUp)
-                                phase = std::max(phase, cutStiff);
-                        }
-                    }
-                }
-                else
-                    mFollowHeld = 0.0f;
-                mHscDrivePhase += std::clamp(phase - mHscDrivePhase, -8.0f * duration, 8.0f * duration);
-            }
-            // The clash recoil (mHscKnock above).
-            if (mHscKnockTime >= 0.0f)
-            {
-                if (mHscKnockAbort && !mHscBlocking
-                    && (mAttackStage == AttackStage::Cut || mAttackStage == AttackStage::Wind))
-                {
-                    // The stroke is spent: it returns to the guard from where
-                    // the clash left it, through the knock below. CLASH-V2 even
-                    // bounce: from the guard stage with the rebound as the chain
-                    // point - a held drag cuts on from it, a released one returns.
-                    mAttackStage = mHscKnockChain ? AttackStage::Guard : AttackStage::Recover;
-                    mAttackRecover = 0.0f;
-                    mAttackRecoverFrom = pose;
-                    if (mHscKnockChain)
-                        mChainFrom = pose;
-                    else
-                        mChainFrom.reset();
-                    mAutoAttack = false;
-                    mFlowU = mFlowV = 0.0f;
-                    mStanceX = mStanceY = 0.0f;
-                    mCutFrom.reset();
-                }
-                mHscKnockAbort = false;
-                mHscKnockTime += duration;
-                constexpr float out = 0.07f;
-                const float t = mHscKnockTime;
-                float envelope = 0.0f;
-                if (t < out)
-                {
-                    const float u = t / out;
-                    envelope = u * (2.0f - u);
-                }
-                else if (t < out + mHscKnockRecovery)
-                {
-                    const float u = (t - out) / mHscKnockRecovery;
-                    envelope = 1.0f - u * u * (3.0f - 2.0f * u);
-                }
-                else
-                    mHscKnockTime = -1.0f;
-                const JPH::Vec3 local(mHscKnock.Dot(frame.mRight), mHscKnock.Dot(frame.mForward), mHscKnock.Dot(frame.mUp));
-                pose->mHand += local * envelope;
-                if (mMeasuredHandBody)
-                {
-                    if (!mHscKnockHandStart)
-                        mHscKnockHandStart = mMeasuredHandBody;
-                    mHscKnockMoved = std::max(mHscKnockMoved,
-                        (*mMeasuredHandBody - *mHscKnockHandStart).Dot(local.NormalizedOr(JPH::Vec3::sZero())));
-                }
-                if (mHscKnockTime < 0.0f)
-                    Log(Debug::Info) << "RAGDOLL_HSC_KNOCK actor=" << getPtr().getCellRef().getRefId()
-                                     << " units=" << mHscKnock.Length() << " moved=" << mHscKnockMoved
-                                     << " ended_stroke=" << mHscKnockEnded;
-                // The blade is let go while it flies, so its own bounce shows.
-                // Two-handers less: a loose heavy blade pulls the support hand off.
-                mHscDrivePhase = std::min(mHscDrivePhase, 1.0f - (hscStriker().mTwoHanded ? 0.3f : 0.5f) * envelope);
-            }
-            mAttackPrevPose = mAttackLastPose;
-            mAttackLastPose = pose;
-            mChamberS = routed ? mFlowU : 0.0f;
             const auto toWorld = [&](JPH::Vec3Arg v) {
                 return frame.mRight * v.GetX() + frame.mForward * v.GetY() + frame.mUp * v.GetZ();
             };
@@ -19354,7 +18206,804 @@
                 JPH::Vec4(frame.mUp, 0.0f), JPH::Vec4(0.0f, 0.0f, 0.0f, 1.0f))
                                               .GetQuaternion()
                                               .Normalized();
-            const JPH::Quat world = (bodyToWorld * pose->mRotation).Normalized();
+            const float dragRight = mSwingInput.mAimRight * 256.0f, dragUp = mSwingInput.mAimUp * 256.0f;
+            mSwingInput.mAimRight = mSwingInput.mAimUp = 0.0f;
+            const auto handNow = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mHand);
+            const auto handTurn = mRagdoll->getWorldBodyRotation(mCurrentPhysicsPose, mRightArm->mHand);
+            if (handNow)
+            {
+                const JPH::Vec3 body = toBody(JPH::Vec3(*handNow - centre));
+                if (mMeasuredHandBody && duration > 0.0f)
+                    mMeasuredHandVelocity += ((body - *mMeasuredHandBody) / duration - mMeasuredHandVelocity)
+                        * std::min(1.0f, duration / 0.05f);
+                mMeasuredHandBody = body;
+            }
+            mNativeStrikePressLatch = false;
+            mRiposteGranted = std::max(0.0f, mRiposteGranted - duration);
+            stepLeftJab(duration);
+            const bool attackIdle = mAnimationAttack.mPhase == MWMechanics::RagdollAttackPhase::Idle;
+            const bool nativeStarted = mHscAttackIdle && !attackIdle;
+            mHscAttackIdle = attackIdle;
+
+            // What swings.
+            static const auto spearThrustSetting_tuned = RagdollCore::tuned<int>(
+                [] { return static_cast<int>(weaponDriveSetting("OPENMW_RAGDOLL_HSC_SPEAR_THRUST", 2.0f)); });
+            const int spearThrustSetting = spearThrustSetting_tuned.get();
+            const HscStriker& own = hscStriker();
+            const bool spear = own.mWideSpearGrip;
+            RagdollCore::WheelStriker striker;
+            // OPENMW_RAGDOLL_K2_SPEAR_SWEEP (registry): the player's spear's own sweep.
+            static const auto spearSweep_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_SPEAR_SWEEP");
+                return text && std::atoi(text) != 0;
+            });
+            // OPENMW_RAGDOLL_K2_SPEAR_THRUST (registry): "player, npc" - a
+            // spear's or staff's own thrust.
+            const bool spearSweep = spear && player && spearSweep_tuned.get();
+            const bool spearThrust = spear && k2SpearThrust()[player ? 0 : 1] > 0.0f;
+            const bool haftSwings = (player || k2HaftNpc()[spear ? 0 : 1] > 0.0f) && !own.mFist && !halfSwordGrip()
+                && ((spear && k2HaftLines()[0] > 0.0f) || (own.mWideStaffGrip && k2HaftLines()[1] > 0.0f));
+            striker.mLines = own.mFist ? &RagdollCore::fistLines()
+                : haftSwings ? &RagdollCore::haftLines(k2HaftChop()[spear ? 0 : 1] > 0.0f, k2HaftThrust()[spear ? 0 : 1] > 0.0f,
+                      k2HaftGuard()[spear ? 0 : 1] > 0.0f)
+                : spearSweep ? &RagdollCore::spearLines()
+                             : &RagdollCore::weaponLines();
+            striker.mPointThrust = spearThrust;
+            striker.mPointGuard = spear && player && k2PointAim()[0] > 0.0f && !halfSwordGrip();
+            const auto shape = RagdollCore::weaponShapeProfile(own.mRecordId);
+            striker.mAxes = { own.mBladeAxis, shape ? shape->mEdgeAxis : own.mEdgeAxis };
+            striker.mBladeAxis = own.mBladeAxis;
+            striker.mTip = own.mTip;
+            striker.mStrikeStart = shape ? shape->mStrikeStart : 0.0f;
+            striker.mWeight = own.mWeight;
+            striker.mTwoHanded = own.mTwoHanded;
+            striker.mShort = shortStriker();
+            striker.mSpearThrusts
+                = (spear && (spearThrustSetting == 1 || (spearThrustSetting >= 2 && !player))) || halfSwordGrip();
+            striker.mSpearSwings = spear && spearThrustSetting >= 2 && player;
+
+            RagdollCore::WheelActor actor;
+            actor.mPlayer = player;
+            {
+                const auto& pointAim = k2PointAim();
+                const auto& pointPose = k2PointPose();
+                actor.mPointCone = osg::DegreesToRadians(pointAim[0]);
+                actor.mPointCounts = pointAim[1];
+                actor.mPointFlick = pointAim[2];
+                actor.mPointHand = JPH::Vec3(pointPose[0], pointPose[1], pointPose[2]);
+                actor.mPointTwist = osg::DegreesToRadians(std::clamp(pointPose[3], -60.0f, 60.0f));
+                actor.mPointDraw = std::clamp(pointPose[4], 0.0f, 20.0f);
+                actor.mPointReach = std::clamp(pointPose[5], 0.0f, 40.0f);
+                actor.mPointGrip = std::clamp(pointPose[6], 0.0f, 60.0f);
+            }
+            static const auto assumedSkill_tuned
+                = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_SKILL", -1.0f); });
+            actor.mSkill = assumedSkill_tuned.get() >= 0.0f ? assumedSkill_tuned.get() : strikerSkill();
+            actor.mControl = mWeaponControl;
+            actor.mResponse = k2WeaponResponse(player);
+            actor.mSerial = mSerial;
+            static const auto sideTurn_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_SIDE_TURN");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 3.0f) : 0.0f;
+            });
+            actor.mSideTurn = sideTurn_tuned.get();
+            static const auto hipShare_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HIP_TURN");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f;
+            });
+            actor.mHipShare = hipShare_tuned.get();
+            static const auto cutLead_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_CUT_LEAD");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 0.3f) : 0.0f;
+            });
+            actor.mCutLead = cutLead_tuned.get();
+            static const auto cutHipCap_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_CUT_HIP_CAP");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 0.6f) : 0.0f;
+            });
+            actor.mCutHipCap = cutHipCap_tuned.get();
+            // "share, elbow units/s" (the switch registry).
+            static const auto cutReach_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_CUT_REACH"))
+                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                value[0] = std::isfinite(value[0]) ? std::clamp(value[0], 0.0f, 1.0f) : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 0.0f, 2000.0f) : 0.0f;
+                return value;
+            });
+            actor.mCutReach = cutReach_tuned.get()[0];
+            static const auto guardThreat_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_GUARD_THREAT");
+                return text && std::atof(text) > 0.0;
+            });
+            actor.mThreatZone = guardThreat_tuned.get();
+            actor.mParrySteer = player ? parrySteerSetting() : 0.0f;
+            static const auto heldRecover_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HELD_RECOVER");
+                return text && std::atof(text) > 0.0;
+            });
+            actor.mHeldRecover = heldRecover_tuned.get();
+            static const auto twoHandReach_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_TWO_HAND_REACH");
+                const float value = text ? static_cast<float>(std::atof(text)) : 1.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.2f, 1.0f) : 1.0f;
+            });
+            actor.mTwoHandReach = twoHandReach_tuned.get();
+            static const auto npcCombo_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_NPC_COMBO"))
+                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                for (float& v : value)
+                    v = std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+                return value;
+            });
+            actor.mComboSecond = npcCombo_tuned.get()[0];
+            actor.mComboThird = npcCombo_tuned.get()[1];
+            // The release's wheel experiments (registry): K2_FLICK_CHAIN,
+            // K2_MOMENTUM_WIND, K2_DAGGER_THRUST, K2_FISTS.
+            static const auto releaseWheel_tuned = RagdollCore::tuned<std::array<float, 4>>([] {
+                std::array<float, 4> value{ 0.0f, 0.0f, 0.0f, 0.0f };
+                const char* names[] = { "OPENMW_RAGDOLL_K2_FLICK_CHAIN", "OPENMW_RAGDOLL_K2_MOMENTUM_WIND",
+                    "OPENMW_RAGDOLL_K2_DAGGER_THRUST", "OPENMW_RAGDOLL_K2_FISTS" };
+                for (std::size_t i = 0; i < value.size(); ++i)
+                    if (const char* text = RagdollCore::tuningText(names[i]))
+                    {
+                        const float v = static_cast<float>(std::atof(text));
+                        value[i] = std::isfinite(v) ? std::clamp(v, 0.0f, 2.0f) : 0.0f;
+                    }
+                return value;
+            });
+            actor.mFlickChain = releaseWheel_tuned.get()[0] > 0.0f;
+            actor.mMomentumWind = releaseWheel_tuned.get()[1];
+            actor.mDaggerThrust = releaseWheel_tuned.get()[2] > 0.0f;
+            actor.mFistSides = releaseWheel_tuned.get()[3] > 0.0f;
+            // OPENMW_RAGDOLL_K2_FIGHT_NIGHT (registry): FIST-05's flick punches.
+            static const auto fightNight_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_FIGHT_NIGHT");
+                return text && std::atoi(text) != 0;
+            });
+            actor.mFightNight = fightNight_tuned.get() && player;
+            const bool fistSteer = player && own.mFist && k2FistSteer()[0] > 0.0f;
+            actor.mFistSteer = fistSteer;
+            if (player && own.mFist && k2FistTrue()[0] > 0.0f)
+            {
+                actor.mFistSnapHold = k2FistTrue()[1];
+                actor.mFistSnapReturn = k2FistTrue()[2];
+                actor.mFistSnapCut = k2FistTrue()[3];
+            }
+            if (player && own.mFist)
+            {
+                actor.mFistWoundCut = k2FistWound()[0];
+                actor.mFistWoundWind = k2FistWound()[1];
+            }
+            // OPENMW_RAGDOLL_K2_THRUST_KEEP (registry): radians.
+            static const auto thrustKeep_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_THRUST_KEEP");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 1.6f) : 0.0f;
+            });
+            actor.mThrustKeep = thrustKeep_tuned.get();
+            // OPENMW_RAGDOLL_K2_SPEAR_THRUST_PACE (registry): wind-up, cut, return s.
+            static const auto spearThrust_tuned = RagdollCore::tuned<std::array<float, 3>>([] {
+                std::array<float, 3> value{ 0.0f, 0.0f, 0.0f };
+                RagdollCore::tuningList("OPENMW_RAGDOLL_K2_SPEAR_THRUST_PACE", value);
+                for (float& v : value)
+                    v = std::isfinite(v) ? std::clamp(v, 0.0f, 2.0f) : 0.0f;
+                return value;
+            });
+            actor.mSpearThrustWind = spearThrust_tuned.get()[0];
+            actor.mSpearThrustCut = spearThrust_tuned.get()[1];
+            actor.mSpearThrustReturn = spearThrust_tuned.get()[2];
+            // OPENMW_RAGDOLL_K2_AIM_PREVIEW (registry): foe radius.
+            static const auto aimPreview_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_AIM_PREVIEW");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 40.0f) : 0.0f;
+            });
+            actor.mPreviewFoeRadius = aimPreview_tuned.get();
+            // OPENMW_RAGDOLL_K2_WINDUP_RADIUS (registry): the player's stance circle.
+            static const auto windupRadius_tuned = RagdollCore::tuned<float>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_WINDUP_RADIUS");
+                const float value = text ? static_cast<float>(std::atof(text)) : 0.0f;
+                return std::isfinite(value) ? std::clamp(value, 0.0f, 1200.0f) : 0.0f;
+            });
+            actor.mStanceRadius = player ? windupRadius_tuned.get() : 0.0f;
+
+            static const auto zones_tuned = RagdollCore::tuned<bool>(
+                [] { return weaponDriveSetting("OPENMW_RAGDOLL_GUARD_ZONES", 0.0f) > 0.0f; });
+            static const auto riposteWindow_tuned = RagdollCore::tuned<float>([] {
+                std::array<float, 4> value{ 0.0f, 0.0f, 0.0f, 1.0f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_AI_RIPOSTE"))
+                    std::sscanf(text, "%f,%f,%f,%f", &value[0], &value[1], &value[2], &value[3]);
+                return value[0];
+            });
+            RagdollCore::WheelInput input;
+            input.mDt = duration;
+            input.mHeld = held;
+            input.mDragRight = dragRight;
+            input.mDragUp = dragUp;
+            input.mBlocking = hscBlocks() && mGuardActive;
+            input.mShove = mShoveArms > 0.0f && shoveArmsSetting();
+            if (input.mShove && mMeasuredHandBody && RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+                Log(Debug::Info) << "RAGDOLL_K2_SHOVE_ARMS wheel actor=" << getPtr().getCellRef().getRefId() << " left="
+                                 << mShoveArms << " hand_fwd=" << mMeasuredHandBody->GetY() << " target_fwd="
+                                 << (mRightArmTarget ? toBody(JPH::Vec3(mRightArmTarget->mWorldTarget - centre)).GetY() : -1.0f)
+                                 << " left_owner=" << armOwnerName(mArmOwner[0]) << " left_brace="
+                                 << (mLeftArmTarget ? mLeftArmTarget->mBrace : false) << " at=" << mShoveAt.has_value();
+            input.mCrouched = getPtr().getClass().getCreatureStats(getPtr()).getStance(
+                MWMechanics::CreatureStats::Stance_Sneak);
+            if (zones_tuned.get())
+                input.mGuardZone = static_cast<RagdollCore::WheelGuardZone>(static_cast<int>(guardZone()));
+            if (mGuardThreat)
+                input.mThreat = toBody(JPH::Vec3(*mGuardThreat - centre));
+            if (mGuardStrike)
+            {
+                input.mThreatStrike = toBody(JPH::Vec3(*mGuardStrike - centre));
+                input.mThreatVelocity = toBody(mGuardStrikeVelocity);
+                if (input.mBlocking && mMeasuredHandBody && RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+                {
+                    static unsigned steerRows = 0;
+                    if ((++steerRows % 6) == 1)
+                        Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_K2_PARRY_STEER strike="
+                                         << input.mThreatStrike->GetX() << "," << input.mThreatStrike->GetY() << ","
+                                         << input.mThreatStrike->GetZ() << " velocity=" << input.mThreatVelocity.GetX()
+                                         << "," << input.mThreatVelocity.GetY() << "," << input.mThreatVelocity.GetZ()
+                                         << " hand=" << mMeasuredHandBody->GetX() << "," << mMeasuredHandBody->GetY() << ","
+                                         << mMeasuredHandBody->GetZ();
+                }
+            }
+            // An NPC's block and the blade it answers (HSC_TRACE; K2_GUARD_THREAT).
+            if (!player && input.mBlocking && input.mThreat && RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+            {
+                static unsigned guardRows = 0;
+                if ((++guardRows % 6) == 1)
+                    Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_K2_GUARD actor=\""
+                                     << getPtr().getCellRef().getRefId() << "\" threat=" << input.mThreat->GetX() << ","
+                                     << input.mThreat->GetY() << "," << input.mThreat->GetZ();
+            }
+            input.mNativeStarted = nativeStarted;
+            input.mArmTrapped = hscArmTrapped();
+            input.mHandVelocity = mMeasuredHandVelocity;
+            input.mArmLength = armLength;
+            if (const auto shoulder = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mShoulder))
+                input.mShoulder = toBody(JPH::Vec3(*shoulder - centre));
+            input.mSinceParryWon = mAiSinceParryWon;
+            input.mNpcRiposteReady = !player && riposteWindow_tuned.get() > 0.0f
+                && mAiSinceParryWon < riposteWindow_tuned.get() && mRiposteGranted > 0.0f;
+            input.mChestFromWorld = bodyToWorld.Conjugated();
+            input.mHand = mMeasuredHandBody;
+            if (handNow && handTurn)
+            {
+                const JPH::RVec3 physicalTip = *handNow + JPH::RVec3(*handTurn * own.mBladeAxis * own.mTip);
+                const float gap = static_cast<float>((physicalTip - mHscTip).Length());
+                if (std::isfinite(gap))
+                    input.mTipGap = gap;
+                input.mPoint = toBody(JPH::Vec3(physicalTip - centre));
+            }
+            input.mSwingSpeed = mSwing.mVelocity.Length();
+            input.mBodyVelocity = mSituationVelocity; // K2_MOMENTUM_WIND
+
+            static const auto aimPoint_tuned = RagdollCore::tuned<bool>(
+                [] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_AIM_POINT", 0.0f) > 0.0f; });
+            RagdollCore::WheelAimInput aim;
+            aim.mLookPitch = getPtr().getRefData().getPosition().rot[0];
+            aim.mPlayer = player;
+            if (aimPoint_tuned.get() && player && mSwingAimRayOrigin)
+            {
+                aim.mRayOrigin = toBody(JPH::Vec3(*mSwingAimRayOrigin - centre));
+                aim.mRayDirection = toBody(mSwingAimRayDirection);
+            }
+            if (mHscFoe)
+                aim.mFoe = toBody(JPH::Vec3(*mHscFoe - centre));
+            aim.mFoeDowned = hscFoeDowned();
+            aim.mArmLength = armLength;
+            const bool fistStep = player && own.mFist && k2FistSteer()[0] >= 3.0f && k2FistStep()[0] > 0.0f;
+            if (fistStep)
+                aim.mAssistReach = k2FistStep()[1] + k2FistStep()[0] + 30.0f;
+            if (striker.mPointThrust)
+                aim.mPointReach = 0.9f * armLength + striker.mTip + 20.0f;
+
+            // FIST-06: the steered fists take both presses. The right
+            // fist's hold and punch go to the wheel, the left fist's to the
+            // free arm's target; the wheel reads no press of its own.
+            mLeftFistHold.reset();
+            mLeftHoldTwist = 0.0f;
+            static const auto fistHud = RagdollCore::tuned<bool>([] {
+                return weaponDriveSetting("OPENMW_RAGDOLL_K2_FIST_HUD", 0.0f) > 0.0f;
+            });
+            mFistHudActive = fistSteer && k2FistSteer()[0] >= 2.0f && fistHud.get();
+            mFistHudCharge = { -1.0f, -1.0f };
+            mFistHudDrag = mFistHudActive && k2FistSteer()[0] >= 4.0f;
+            mFistHudDraw.reset();
+            if (!fistSteer)
+                mFistAimBlend = { 0.0f, 0.0f };
+            if (fistSteer)
+            {
+                RagdollCore::FistSteerInput steer;
+                steer.mDt = duration;
+                steer.mRight.mHeld = held;
+                steer.mRight.mDragRight = dragRight;
+                steer.mRight.mDragUp = dragUp;
+                steer.mRight.mTap = nativeStarted && !held;
+                steer.mRight.mBusy
+                    = mWheel.stage() == RagdollCore::WheelStage::Wind || mWheel.stage() == RagdollCore::WheelStage::Cut;
+                steer.mLeft.mHeld = mLeftFistInput.mHeld;
+                steer.mLeft.mCancel = mLeftFistInput.mCancel;
+                steer.mLeft.mDragRight = mLeftFistInput.mRight;
+                steer.mLeft.mDragUp = mLeftFistInput.mUp;
+                steer.mLeft.mBusy = mLeftFistTime >= 0.0f || mLeftJabTime >= 0.0f;
+                steer.mBlocked = input.mBlocking || input.mShove || mGuardActive || input.mArmTrapped;
+                steer.mCrouched = input.mCrouched;
+                // FIST-07: the movement keys pick the punch. The left
+                // button's hold reaches here 0.16 s old (the tap's window).
+                const auto& movement = getPtr().getClass().getMovementSettings(getPtr());
+                // The keys when a step sees them pressed; else the way the
+                // body is moving (60 u/s reads as a key). The movement
+                // settings are cleared by the character's update before most
+                // physics steps read them: FIST-07's strafing tap read 0,0 on
+                // every punch of four runs, with the keys latched 0.15 s too
+                // (11-16).
+                {
+                    const JPH::Vec3 moving = toBody(mSituationVelocity);
+                    steer.mMoveSide = std::abs(movement.mPosition[0]) > 0.3f ? movement.mPosition[0]
+                        : std::clamp(moving.GetX() / 200.0f, -1.0f, 1.0f);
+                    steer.mMoveForward = std::abs(movement.mPosition[1]) > 0.3f ? movement.mPosition[1]
+                        : std::clamp(moving.GetY() / 200.0f, -1.0f, 1.0f);
+                }
+                steer.mRight.mHoldLead = 0.16f;
+                // FIST-09: where the crosshair is on the foe - the ray's height
+                // at the foe's distance against its chest (the head from 14 u
+                // above it, the belly from 14 u below); no foe: the view's pitch.
+                {
+                    const float pitch = getPtr().getRefData().getPosition().rot[0]; // positive looking down
+                    steer.mAimZone = pitch > 0.25f ? -1 : pitch < -0.17f ? 1 : 0;
+                    if (mHscFoe && mSwingAimRayOrigin && mSwingAimRayDirection.LengthSq() > 1e-6f)
+                    {
+                        const JPH::Vec3 ray = mSwingAimRayDirection.Normalized();
+                        const JPH::Vec3 toFoe(*mHscFoe - *mSwingAimRayOrigin);
+                        const float flatRay = std::hypot(ray.GetX(), ray.GetY());
+                        const float flatFoe = std::hypot(toFoe.GetX(), toFoe.GetY());
+                        if (flatRay > 0.2f && flatFoe > 1.0f && flatFoe < 160.0f)
+                        {
+                            const float over = ray.GetZ() / flatRay * flatFoe - toFoe.GetZ();
+                            steer.mAimZone = over > 14.0f ? 1 : over < -14.0f ? -1 : 0;
+                        }
+                    }
+                }
+                RagdollCore::FistSteerSettings settings;
+                settings.mCounts = k2FistSteer()[1];
+                settings.mFeet = k2FistSteer()[0] == 2.0f;
+                settings.mAim = k2FistSteer()[0] >= 3.0f;
+                settings.mDrag = k2FistSteer()[0] >= 4.0f;
+                settings.mSwing = k2FistSteer()[2];
+                settings.mRelease = k2FistSteer()[3] > 0.0f;
+                settings.mChargeDraw = k2FistCharge()[0];
+                settings.mChargeCoil = k2FistCharge()[1];
+                const RagdollCore::FistSteerOutput steered = mFistSteer.step(steer, settings);
+                mFistHudCharge = steered.mCharge;
+                mFistHudKind = steered.mKind;
+                if (mFistHudDrag)
+                    for (std::size_t side : { std::size_t(1), std::size_t(0) })
+                        if (!mFistHudDraw && steered.mCharge[side] >= 0.0f)
+                            mFistHudDraw = { steered.mDrawRight[side], steered.mDrawUp[side] };
+                input.mHeld = false;
+                input.mDragRight = input.mDragUp = 0.0f;
+                input.mNativeStarted = false;
+                input.mFistHold = steered.mRight;
+                input.mFistPunch = steered.mRightPunch;
+                mFistHeldNow = steered.mLeft.has_value() || steered.mRight.has_value();
+                if (steered.mRightPunch)
+                    mFistPower[1] = steered.mRightPunch->mWound ? steered.mRightPunch->mPower : 0.0f;
+                // The left shoulder against the right's mirror (eased over ~0.2 s).
+                if (mLeftArm && input.mShoulder)
+                    if (const auto left = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mLeftArm->mShoulder))
+                    {
+                        const JPH::Vec3 l = toBody(JPH::Vec3(*left - centre));
+                        JPH::Vec3 shift(l.GetX() + input.mShoulder->GetX(), l.GetY() - input.mShoulder->GetY(),
+                            l.GetZ() - input.mShoulder->GetZ());
+                        if (shift.Length() > 30.0f)
+                            shift *= 30.0f / shift.Length();
+                        if (!shift.IsNaN())
+                            mLeftFistShift += (shift - mLeftFistShift) * std::min(1.0f, duration / 0.2f);
+                    }
+                if (mLeftArm)
+                    mLeftFistHold = steered.mLeft;
+                if (mLeftFistHold)
+                    mLeftFistHold->mHand += mLeftFistShift;
+                if (mLeftFistHold)
+                    mLeftHoldTwist = mLeftFistHold->mTwist * k2LeftPunch()[0];
+                if (steered.mLeftPunch && startLeftSteerPunch(*steered.mLeftPunch))
+                    Log(Debug::Info) << "RAGDOLL_FIST_PUNCH actor=" << getPtr().getCellRef().getRefId()
+                                     << " hand=left kind=" << RagdollCore::fistLines()[steered.mLeftPunch->mLine].mName
+                                     << " power=" << steered.mLeftPunch->mPower << " wound=" << steered.mLeftPunch->mWound
+                                     << " steer=1";
+                if (steered.mRightPunch)
+                    Log(Debug::Info) << "RAGDOLL_FIST_STEER actor=" << getPtr().getCellRef().getRefId()
+                                     << " hand=right line=" << RagdollCore::fistLines()[steered.mRightPunch->mLine].mName
+                                     << " power=" << steered.mRightPunch->mPower << " wound="
+                                     << steered.mRightPunch->mWound << " move=" << steer.mMoveSide << ","
+                                     << steer.mMoveForward << " zone=" << steer.mAimZone;
+                // The held fists (HSC_TRACE): where each is asked, 10x a second.
+                if ((steered.mLeft || steered.mRight) && RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+                {
+                    static unsigned holdRows = 0;
+                    if ((++holdRows % 6) == 1)
+                        for (int side = 0; side < 2; ++side)
+                            if (const auto& hold = side == 0 ? steered.mLeft : steered.mRight)
+                            {
+                                // (and the physical hand, the same frame)
+                                JPH::Vec3 real = JPH::Vec3::sNaN();
+                                const auto& arm = side == 0 ? mLeftArm : mRightArm;
+                                if (arm)
+                                    if (const auto at = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, arm->mHand))
+                                        real = toBody(JPH::Vec3(*at - centre));
+                                Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_FIST_HOLD hand="
+                                                 << (side == 0 ? "left" : "right") << " at=" << hold->mHand.GetX() << ","
+                                                 << hold->mHand.GetY() << "," << hold->mHand.GetZ() << " real="
+                                                 << real.GetX() << "," << real.GetY() << "," << real.GetZ()
+                                                 << std::setprecision(2) << " angle=" << hold->mAngle
+                                                 << " amount=" << hold->mAmount << " owner="
+                                                 << armOwnerName(mArmOwner[side == 0 ? 0 : 1]) << " applied="
+                                                 << (side == 0 && mLeftArmTarget ? mLeftArmTarget->mApplied : true)
+                                                 << " reach_error="
+                                                 << (side == 0 && mLeftArmTarget ? mLeftArmTarget->mReachError : 0.0f);
+                            }
+                }
+            }
+            // FIST-08 (K2_PALM_PARRY): under the two-button guard the bare
+            // hands are the palm parry's - they wait open where the zone puts
+            // them and the hand on an incoming blow's side goes out to the
+            // foe's weapon. The right hand's place goes to the wheel as a
+            // held fist (no block pose), the left's to the free arm's target.
+            if (fistSteer && player && palmParrySettings().mOn)
+            {
+                RagdollCore::PalmParryInput palm;
+                palm.mDt = duration;
+                palm.mGuard = mGuardActive && !input.mShove && !input.mArmTrapped && mLeftArm;
+                palm.mZone = static_cast<RagdollCore::WheelGuardZone>(static_cast<int>(guardZone()));
+                if (mGuardStrike)
+                {
+                    RagdollCore::PalmThreat threat;
+                    threat.mStrike = toBody(JPH::Vec3(*mGuardStrike - centre));
+                    threat.mVelocity = toBody(mGuardStrikeVelocity);
+                    threat.mHand = toBody(JPH::Vec3(mGuardStrikeHand - centre));
+                    threat.mStage = mGuardStrikeStage;
+                    threat.mAttacking = mGuardStrikeAi;
+                    palm.mThreat = threat;
+                }
+                if (input.mShoulder)
+                    palm.mShoulder[1] = *input.mShoulder;
+                palm.mArmLength = { armLength, armLength };
+                if (mLeftArm)
+                    if (const auto left = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mLeftArm->mShoulder))
+                        palm.mShoulder[0] = toBody(JPH::Vec3(*left - centre));
+                {
+                    const auto& stats = getPtr().getClass().getCreatureStats(getPtr());
+                    RagdollCore::PalmParryStats skill;
+                    skill.mHandToHand = static_cast<float>(getPtr().getClass().getSkill(getPtr(), ESM::Skill::HandToHand));
+                    skill.mAgility = stats.getAttribute(ESM::Attribute::Agility).getModified();
+                    skill.mLuck = stats.getAttribute(ESM::Attribute::Luck).getModified();
+                    const auto& fatigue = stats.getFatigue();
+                    skill.mFatigue = fatigue.getModified() > 0.0f ? fatigue.getCurrent() / fatigue.getModified() : 1.0f;
+                    mPalmSkill = RagdollCore::palmParrySkill(skill);
+                }
+                palm.mSkill = mPalmSkill;
+                const RagdollCore::PalmParryOutput out = mPalmParry.step(palm, palmParrySettings());
+                if (out.mPhase != RagdollCore::PalmPhase::Down && out.mHand[0] && out.mHand[1])
+                {
+                    input.mBlocking = false;
+                    input.mFistPunch.reset();
+                    RagdollCore::FistSteerHold right;
+                    right.mHand = *out.mHand[1];
+                    right.mPole = out.mPole[1];
+                    input.mFistHold = right;
+                    RagdollCore::FistSteerHold left;
+                    left.mHand = *out.mHand[0];
+                    left.mPole = out.mPole[0];
+                    mLeftFistHold = left;
+                    mLeftHoldTwist = 0.0f;
+                    if (out.mLaunched)
+                        Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_PALM_PARRY launch hand="
+                                         << (out.mPalm == 0 ? "left" : "right") << " committed=" << out.mCommitted
+                                         << " zone=" << guardZoneName(guardZone()) << std::setprecision(2)
+                                         << " skill=" << mPalmSkill << " seen=" << mPalmParry.seen()
+                                         << " stage=" << mGuardStrikeStage << " ai=" << mGuardStrikeAi
+                                         << std::setprecision(1) << " strike=" << palm.mThreat->mStrike.GetX() << ","
+                                         << palm.mThreat->mStrike.GetY() << "," << palm.mThreat->mStrike.GetZ()
+                                         << " velocity=" << palm.mThreat->mVelocity.GetX() << ","
+                                         << palm.mThreat->mVelocity.GetY() << "," << palm.mThreat->mVelocity.GetZ();
+                    // The hands (HSC_TRACE): asked and real, 10x a second.
+                    if (RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+                    {
+                        static unsigned palmRows = 0;
+                        if ((++palmRows % 6) == 1 || out.mPhase == RagdollCore::PalmPhase::Reach)
+                            for (int side = 0; side < 2; ++side)
+                            {
+                                JPH::Vec3 real = JPH::Vec3::sNaN();
+                                const auto& arm = side == 0 ? mLeftArm : mRightArm;
+                                if (arm)
+                                    if (const auto at = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, arm->mHand))
+                                        real = toBody(JPH::Vec3(*at - centre));
+                                const JPH::Vec3& want = *out.mHand[static_cast<std::size_t>(side)];
+                                Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_PALM_HAND hand="
+                                                 << (side == 0 ? "left" : "right") << " phase="
+                                                 << RagdollCore::palmPhaseName(out.mPhase) << " live=" << out.mLive
+                                                 << " palm=" << out.mPalm << " at=" << want.GetX() << "," << want.GetY()
+                                                 << "," << want.GetZ() << " real=" << real.GetX() << "," << real.GetY()
+                                                 << "," << real.GetZ();
+                            }
+                    }
+                }
+            }
+            else if (mPalmParry.phase() != RagdollCore::PalmPhase::Down)
+                mPalmParry.step({}, {});
+            mLeftFistInput.mRight = mLeftFistInput.mUp = 0.0f;
+            mLeftFistInput.mCancel = false;
+
+            RagdollCore::WheelHooks hooks;
+            hooks.mClickLine = [&] {
+                return wheelClickLine(centre, frame, nativeStarted, striker.mSpearThrusts, striker.mSpearSwings);
+            };
+            hooks.mLeftJab = [&] { return startLeftJab(); };
+            hooks.mLeftPunch = [&] { return startLeftJab(true); };
+            hooks.mLeftFistPunch
+                = [&](RagdollCore::PunchKind kind, float power) { return startLeftFistPunch(kind, power); };
+
+            RagdollCore::WheelEvents events;
+            RagdollCore::ChamberPose pose = mWheel.step(input, striker, actor, hooks, &aim, events);
+            // The point guard and its thrust (HSC_TRACE; K2_POINT_AIM): the
+            // point's offset, the commanded and the physical hand and point
+            // (chest-centre frame), the grip's distance from the shoulder.
+            if (player && (mWheel.pointing() || mWheel.pointThrusting())
+                && RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+            {
+                static unsigned pointRows = 0;
+                if ((++pointRows % 3) == 1)
+                {
+                    const JPH::Vec3 point
+                        = pose.mHand + (pose.mRotation * striker.mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY()) * striker.mTip;
+                    JPH::Vec3 realPoint = JPH::Vec3::sNaN(), realHand = JPH::Vec3::sNaN();
+                    if (handNow && handTurn)
+                    {
+                        realHand = toBody(JPH::Vec3(*handNow - centre));
+                        realPoint = toBody(JPH::Vec3(*handNow + JPH::RVec3(*handTurn * own.mBladeAxis * own.mTip) - centre));
+                    }
+                    Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_K2_POINT_AIM "
+                                     << (mWheel.pointing() ? "guard" : "thrust") << " u=" << std::setprecision(2)
+                                     << mWheel.shownU() << " at=" << mWheel.pointX() << "," << mWheel.pointY()
+                                     << " trim=" << mWheel.pointTrimX() << "," << mWheel.pointTrimY()
+                                     << std::setprecision(1) << " hand=" << pose.mHand.GetX() << "," << pose.mHand.GetY() << ","
+                                     << pose.mHand.GetZ() << " real_hand=" << realHand.GetX() << "," << realHand.GetY()
+                                     << "," << realHand.GetZ() << " point=" << point.GetX() << "," << point.GetY() << ","
+                                     << point.GetZ() << " real_point=" << realPoint.GetX() << "," << realPoint.GetY()
+                                     << "," << realPoint.GetZ() << " aim=" << mWheel.aim().mAzimuth << ","
+                                     << mWheel.aim().mElevation << " arm=" << armLength << " shoulder="
+                                     << (input.mShoulder ? (pose.mHand - *input.mShoulder).Length() : -1.0f);
+                }
+            }
+            // K2_CUT_REACH: the elbow may open faster through a one-handed cut
+            // (ARM_ELBOW_SPEED's 250 units/s let the arm's target open ~10 deg
+            // a step, so a 5-step cut struck on a bent arm).
+            mK2CutElbowSpeed = mWheel.stage() == RagdollCore::WheelStage::Cut && actor.mCutReach > 0.0f
+                    && !striker.mTwoHanded && !striker.mShort && !striker.mSpearThrusts
+                ? cutReach_tuned.get()[1]
+                : 0.0f;
+            // The player's arm through an attack, every step (HSC_TRACE; K2_CUT_REACH):
+            // the commanded grip's and the physical hand's distance from the
+            // shoulder, and the physical elbow's angle (180 = straight).
+            if (player && mWheel.stage() != RagdollCore::WheelStage::Guard && input.mShoulder
+                && RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+            {
+                const auto s = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mShoulder);
+                const auto e = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mElbow);
+                const auto h = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mHand);
+                if (s && e && h)
+                {
+                    const JPH::Vec3 upper(*s - *e), fore(*h - *e);
+                    const float elbow = osg::RadiansToDegrees(std::acos(std::clamp(
+                        upper.NormalizedOr(JPH::Vec3::sAxisX()).Dot(fore.NormalizedOr(JPH::Vec3::sAxisX())), -1.0f, 1.0f)));
+                    // Each wrist past its joint's limit (degrees; B1 11-04: the
+                    // weapon wrist twisted past its limit, K2-WEAPON-phase1.md).
+                    std::array<float, 2> wristExcess{ -1.0f, -1.0f };
+                    for (int side = 0; side < 2; ++side)
+                    {
+                        const auto& arm = side == 0 ? mLeftArm : mRightArm;
+                        const auto& bodies = mCurrentPhysicsPose.mBodyTransforms;
+                        if (!arm || arm->mHand >= bodies.size() || arm->mElbow >= bodies.size())
+                            continue;
+                        const auto geometry = mRagdoll->getSwingTwistJointGeometry(arm->mHand);
+                        if (!geometry)
+                            continue;
+                        const JPH::Quat child = bodies[arm->mHand].mRotation;
+                        if (const auto clamped = RagdollCore::clampSwingTwistJointOrientation(
+                                *geometry, bodies[arm->mElbow].mRotation, child))
+                            wristExcess[side] = osg::RadiansToDegrees(
+                                2.0f * std::acos(std::clamp(std::abs(clamped->Dot(child)), 0.0f, 1.0f)));
+                    }
+                    Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_K2_REACH stage="
+                                     << static_cast<int>(mWheel.stage()) << " u="
+                                     << std::setprecision(2) << mWheel.shownU() << std::setprecision(1)
+                                     << " angle=" << mWheel.cutAngle() << " cmd=" << (pose.mHand - *input.mShoulder).Length()
+                                     << " phys=" << JPH::Vec3(*h - *s).Length() << " elbow=" << elbow
+                                     << " arm=" << armLength << " two=" << striker.mTwoHanded
+                                     << " wrist_l=" << wristExcess[0] << " wrist_r=" << wristExcess[1]
+                                     << std::setprecision(0) << " wrist_torque=" << mK2TraceWristTorque
+                                     << " assist_torque=" << mK2TraceAssistTorque << std::setprecision(2)
+                                     << " wrist_util=" << mK2TraceWristUtil
+                                     // The blade's up component, commanded (the pose's
+                                     // hand rotation) and physical (AIM-02).
+                                     << " blade_up_cmd=" << (pose.mRotation * striker.mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY()).GetZ()
+                                     << " blade_up_phys=" << [&] {
+                                            const auto turn = mRagdoll->getWorldBodyRotation(mCurrentPhysicsPose, mRightArm->mHand);
+                                            return turn ? (*turn * striker.mBladeAxis).NormalizedOr(JPH::Vec3::sAxisY()).GetZ() : -9.0f;
+                                        }();
+                }
+            }
+
+            if (events.mPunch && events.mPunchHand == RagdollCore::FistHand::Right)
+                mRightPunchFatigue = RagdollCore::punchTiming(events.mPunchKind, events.mPunchPower, mWeaponControl).mFatigue;
+            if (events.mPunch)
+                Log(Debug::Info) << "RAGDOLL_FIST_PUNCH actor=" << getPtr().getCellRef().getRefId()
+                                 << " hand=" << (events.mPunchHand == RagdollCore::FistHand::Left ? "left" : "right")
+                                 << " kind=" << RagdollCore::fistLineName(events.mPunchKind)
+                                 << " power=" << events.mPunchPower;
+            if (events.mCutStarted)
+            {
+                mCommitSwishSize = events.mSwishSize;
+                mCommitFatigue = events.mFatigueShare * mRightPunchFatigue;
+                mRightPunchFatigue = 1.0f;
+                ++mCommitSwishRequests;
+                if (events.mFlowGain > 0.0f || events.mRiposte)
+                    Log(Debug::Info) << "RAGDOLL_HSC_COMBO actor=" << getPtr().getCellRef().getRefId()
+                                     << " flow=" << events.mFlowGain << " fatigue=" << events.mFatigueShare
+                                     << " riposte=" << events.mRiposte << " k2=1";
+            }
+            if (events.mFeintFatigue > 0.0f)
+            {
+                auto& stats = getPtr().getClass().getCreatureStats(getPtr());
+                MWMechanics::DynamicStat<float> fatigue = stats.getFatigue();
+                fatigue.setCurrent(std::max(0.0f, fatigue.getCurrent() - events.mFeintFatigue));
+                stats.setFatigue(fatigue);
+                ++mFeintCount;
+            }
+            if (events.mNpcFeint)
+                ++mFeintCount;
+            // An NPC's click and the combo drawn for it (HSC_TRACE), and the
+            // combo chaining its next cut (K2_NPC_COMBO).
+            if (!player && events.mClick && RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+                Log(Debug::Info) << "RAGDOLL_K2_NPC_CLICK actor=\"" << getPtr().getCellRef().getRefId()
+                                 << "\" angle=" << events.mClickAngle << " combo=" << mWheel.comboLeft()
+                                 << " skill=" << actor.mSkill;
+            if (!player && events.mChained)
+                Log(Debug::Info) << "RAGDOLL_K2_COMBO actor=\"" << getPtr().getCellRef().getRefId() << "\" swing="
+                                 << mWheel.cutAngle();
+
+            // Published where the rest of this file reads the wheel.
+            using Stage = RagdollCore::WheelStage;
+            const Stage stage = mWheel.stage();
+            mAttackStage = stage == Stage::Wind ? AttackStage::Wind
+                : stage == Stage::Cut           ? AttackStage::Cut
+                : stage == Stage::Recover       ? AttackStage::Recover
+                                                : AttackStage::Guard;
+            const auto toOld = [](const RagdollCore::ChamberPose& p) {
+                ChamberPose result;
+                result.mHand = p.mHand;
+                result.mPole = p.mPole;
+                result.mRotation = p.mRotation;
+                result.mTwist = p.mTwist;
+                return result;
+            };
+            // K2_FIST_STEP: a punch at a foe out of reach lunges at it.
+            {
+                const bool rightPunch = mWheel.stage() == RagdollCore::WheelStage::Wind
+                    || mWheel.stage() == RagdollCore::WheelStage::Cut;
+                const bool leftPunch = mLeftFistTime >= 0.0f && mLeftFistTime < mLeftFistTiming.mWind + mLeftFistTiming.mCut;
+                const bool punching = fistStep && (rightPunch || leftPunch) && !input.mBlocking;
+                if (punching && !mFistStepping && mHscFoe)
+                {
+                    JPH::Vec3 toFoe(*mHscFoe - centre);
+                    toFoe.SetZ(0.0f);
+                    const float flat = toFoe.Length();
+                    const float gap = flat - k2FistStep()[1];
+                    JPH::Vec3 look = mSwingAimRayDirection.LengthSq() > 1e-6f ? mSwingAimRayDirection : frame.mForward;
+                    look.SetZ(0.0f);
+                    const bool ahead = flat > 1.0f && look.LengthSq() > 1e-6f
+                        && toFoe.Dot(look.Normalized()) / flat > 0.82f; // 35 degrees
+                    if (ahead && gap > 2.0f && gap <= k2FistStep()[0] + 20.0f)
+                    {
+                        mFistStepping = true;
+                        mFistStepGap = gap;
+                        Log(Debug::Info) << "RAGDOLL_FIST_STEP actor=" << getPtr().getCellRef().getRefId()
+                                         << " hand=" << (rightPunch ? "right" : "left") << " foe=" << flat
+                                         << " gap=" << gap;
+                    }
+                }
+                else if (!punching)
+                    mFistStepping = false;
+            }
+            mAttackAngle = mWheel.angle();
+            mAttackCutAngle = mWheel.cutAngle();
+            mAttackWind = mWheel.wind();
+            mAttackCut = mWheel.cut();
+            mFlowU = mWheel.flow().mU;
+            mFlowV = mWheel.flow().mV;
+            mAutoAttack = mWheel.autoAttack();
+            mChainFrom = mWheel.chainFrom() ? std::optional<ChamberPose>(toOld(*mWheel.chainFrom())) : std::nullopt;
+            mAttackLastPose = toOld(pose);
+            mStanceX = mWheel.stanceX();
+            mStanceY = mWheel.stanceY();
+            mSnapCut = mWheel.snapCut();
+            mPlayerRiposte = mWheel.playerRiposte();
+            mChainFlowGain = mWheel.chainFlowGain();
+            mHscReleased = mWheel.sinceRelease();
+            mHscReturnTime = mWheel.returnTime();
+            mAttackLine = mWheel.line();
+            const bool routed = stage == Stage::Wind || stage == Stage::Cut;
+            mChamberS = routed ? mWheel.flow().mU : 0.0f;
+            mHscDrivePhase = mWheel.drivePhase();
+            mCutPlaneMiss = mWheel.cutPlaneMiss();
+            mHscChainsFree = actor.mSkill >= 50.0f;
+            mThrustDriveWant = mWheel.thrustDriveWant();
+            if (routed)
+            {
+                mHscLowWant = mWheel.aim().mLowWant;
+                mHscFoeAssist = mWheel.aim().mFoeAssist;
+                mHscAimElevation = mWheel.aim().mElevation;
+                mHscLungeGap = mWheel.aim().mLungeGap;
+                mHscSteerX = mWheel.steerX();
+                mHscSteerY = mWheel.steerY();
+            }
+            mHscPreview.clear();
+            for (const JPH::Vec3& point : mWheel.preview())
+                mHscPreview.push_back(centre + JPH::RVec3(toWorld(point)));
+            mHscMark.reset();
+            if (const auto& mark = mWheel.mark())
+            {
+                mHscMark = centre + JPH::RVec3(toWorld(mark->mPoint));
+                mHscMarkHit = mark->mHit;
+                mHscMarkGap = mark->mGap;
+            }
+
+            if (mFistHudActive)
+            {
+                mHscPreview.clear();
+                mHscMark.reset();
+            }
+
+            // The arm request (the old drive).
+            RagdollCore::ChamberPose armPose = pose;
+            if (player && MWBase::Environment::get().getWorld()->isFirstPerson())
+            {
+                static const auto fpClear_tuned = RagdollCore::tuned<bool>(
+                    [] { return weaponDriveSetting("OPENMW_RAGDOLL_FP_CLEAR", 0.0f) > 0.0f; });
+                if (fpClear_tuned.get() && !mWheel.pointing())
+                    RagdollCore::clearFirstPersonView(armPose, stage, mWheel.wind());
+            }
+            mHaftClearTurn = 0.0f;
+            if (mWeapon && mWeapon->mAttached && !own.mFist && haftClearSettings()[0] > 0.0f
+                && !(haftSwings && k2HaftGuard()[spear ? 0 : 1] > 0.0f))
+                mHaftClearTurn = RagdollCore::keepHaftOutOfBody(
+                    armPose, own.mBladeAxis, mWeapon->mLength - std::max(mWeapon->tipDistanceFromHand(), 0.0f));
+            // K2_HAFT_PIVOT: a two-handed haft turns about the point between
+            // the hands, the guard's turn the reference.
+            mHaftPivotShift = 0.0f;
+            if (own.mWideSpearGrip && !halfSwordGrip() && k2HaftPivot() > 0.0f && mSupportGrip
+                && mSupportGrip->attached() && mSupportGripFrame && mWeapon && mWeapon->mAttached)
+                if (const auto guard = RagdollCore::guardPose(*striker.mLines, striker.mAxes))
+                {
+                    // The support grip along the blade (weapon body frame).
+                    const float support
+                        = (mSupportGripFrame->mOffset - weaponHandPoint()).Dot(mWeapon->mBladeAxis.NormalizedOr(
+                              JPH::Vec3::sAxisY()))
+                        * mSupportGripFrame->mScale;
+                    mHaftPivotShift = RagdollCore::pivotBetweenHands(
+                        armPose, guard->mRotation, own.mBladeAxis, support, k2HaftPivot())
+                                          .Length();
+                }
             auto& request = mRightArmTarget;
             if (!request)
                 request.emplace();
@@ -19363,184 +19012,47 @@
             request->mReleasing = false;
             request->mRequestedWeight = 1.0f;
             request->mBlendRate = 12.0f;
-            // A clear first-person view (build 59 bookmark 15: "keep the first
-            // person view unblocked"; FPV-01: in the guard the blade stood 40 px
-            // right of the crosshair): in first person the guard and the return
-            // to it turn the weapon `degrees` right about the chest and lean the
-            // blade's tip out to the right, faded out over the wind-up.
-            // OPENMW_RAGDOLL_FP_CLEAR = degrees (0 = off).
-            {
-                static const auto fpClear_tuned = RagdollCore::tuned<float>([] { return osg::DegreesToRadians(weaponDriveSetting("OPENMW_RAGDOLL_FP_CLEAR", 0.0f)); });
-                static const auto& fpClear = fpClear_tuned.get();
-                if (fpClear > 0.0f && getPtr() == MWMechanics::getPlayer()
-                    && MWBase::Environment::get().getWorld()->isFirstPerson())
-                {
-                    const float share = mAttackStage == AttackStage::Guard || mAttackStage == AttackStage::Recover ? 1.0f
-                        : mAttackStage == AttackStage::Wind ? std::clamp(1.0f - 2.0f * mAttackWind, 0.0f, 1.0f) : 0.0f;
-                    if (share > 0.0f)
-                    {
-                        const JPH::Quat turn = JPH::Quat::sRotation(JPH::Vec3::sAxisZ(), -fpClear * share);
-                        const JPH::Quat lean = JPH::Quat::sRotation(JPH::Vec3::sAxisY(), 1.5f * fpClear * share);
-                        pose->mHand = turn * pose->mHand;
-                        pose->mRotation = (lean * turn * pose->mRotation).Normalized();
-                    }
-                }
-            }
-            keepHaftOutOfBody(*pose);
-            const ChamberPose& armPose = *pose;
-            JPH::Quat armWorld = (bodyToWorld * armPose.mRotation).Normalized();
             claimArm(*request, ArmOwner::HandControl);
             request->mWorldTarget = centre + JPH::RVec3(toWorld(armPose.mHand));
-            // A steady NPC guard (build 61 bookmarks 9-10: "enemies' weapons
-            // bounce too much in their hand ... they should have much more
-            // control"; the recording: an NPC's weapon tip moved 319 u/s
-            // median about its own pelvis out of its attacks, the player's
-            // guard 55): out of an attack the NPC's guard is held in the
-            // world, following the wobbly body only over `seconds`.
-            // OPENMW_RAGDOLL_NPC_STEADY = "seconds" (0 = off).
-            JPH::RVec3 steadyShift = JPH::RVec3::sZero();
+            mFistArmLength = armLength;
+            const bool fistTrue = player && own.mFist && k2FistTrue()[0] > 0.0f;
+            if (fistTrue)
+                request->mWorldTarget = fistWithinReach(request->mWorldTarget, mRightArm);
+            if (fistTrue)
+                request->mWorldTarget = aimFist(1, request->mWorldTarget,
+                    stage == Stage::Cut ? mWheel.cut() : -1.0f, duration);
+            JPH::Quat armWorld = (bodyToWorld * armPose.mRotation).Normalized();
+            const JPH::Quat world = (bodyToWorld * pose.mRotation).Normalized();
+            // A steady NPC guard, held in the actor's frame out of an attack.
+            JPH::Vec3 steadyShift = JPH::Vec3::sZero();
             {
-                static const auto steadySeconds_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_NPC_STEADY", 0.0f); });
-                static const auto& steadySeconds = steadySeconds_tuned.get();
-                const bool resting = mAttackStage == AttackStage::Guard || mAttackStage == AttackStage::Recover;
-                // Held in the actor's own frame (OPENMW_RAGDOLL_NPC_STEADY_ROOT=1,
-                // user 10-07: "the enemies still wiggle their heads and weapons
-                // too much, especially when running"): the world hold re-snapped
-                // whenever the target got 45 units away - every few frames at a
-                // run (~230 u/s), so a running NPC's guard rode its bouncing
-                // chest. In the frame of the actor's position and facing the run
-                // is carried and only the body's bob is smoothed.
-                static const auto steadyRoot_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_NPC_STEADY_ROOT", 0.0f) > 0.0f; });
-                static const auto& steadyRoot = steadyRoot_tuned.get();
-                if (steadyRoot && steadySeconds > 0.0f && resting && getPtr() != MWMechanics::getPlayer() && duration > 0.0f)
-                {
-                    const auto& place = getPtr().getRefData().getPosition();
-                    const JPH::RVec3 rootPos(place.pos[0], place.pos[1], place.pos[2]);
-                    const JPH::Quat rootTurn = JPH::Quat::sRotation(JPH::Vec3::sAxisZ(), -place.rot[2]);
-                    const JPH::Quat toLocal = rootTurn.Conjugated();
-                    const JPH::Vec3 wantedLocal = toLocal * JPH::Vec3(request->mWorldTarget - rootPos);
-                    const JPH::Quat turnLocal = (toLocal * armWorld).Normalized();
-                    if (!mNpcSteadyLocal || (wantedLocal - *mNpcSteadyLocal).Length() > 45.0f)
-                    {
-                        mNpcSteadyLocal = wantedLocal;
-                        mNpcSteadyTurn = turnLocal;
-                    }
-                    const float k = std::min(1.0f, duration / steadySeconds);
-                    *mNpcSteadyLocal += (wantedLocal - *mNpcSteadyLocal) * k;
-                    mNpcSteadyTurn = mNpcSteadyTurn.SLERP(turnLocal, k).Normalized();
-                    const JPH::RVec3 held = rootPos + JPH::RVec3(rootTurn * *mNpcSteadyLocal);
-                    steadyShift = held - request->mWorldTarget;
-                    request->mWorldTarget = held;
-                    armWorld = (rootTurn * mNpcSteadyTurn).Normalized();
-                    mNpcSteadyHand.reset();
-                }
-                else if (steadySeconds > 0.0f && resting && getPtr() != MWMechanics::getPlayer() && duration > 0.0f)
-                {
-                    mNpcSteadyLocal.reset();
-                    const JPH::RVec3 wanted = request->mWorldTarget;
-                    if (!mNpcSteadyHand || (wanted - *mNpcSteadyHand).Length() > 45.0)
-                    {
-                        mNpcSteadyHand = wanted;
-                        mNpcSteadyTurn = armWorld;
-                    }
-                    const float k = std::min(1.0f, duration / steadySeconds);
-                    *mNpcSteadyHand += (wanted - *mNpcSteadyHand) * k;
-                    mNpcSteadyTurn = mNpcSteadyTurn.SLERP(armWorld, k).Normalized();
-                    steadyShift = *mNpcSteadyHand - wanted;
-                    request->mWorldTarget = *mNpcSteadyHand;
-                    armWorld = mNpcSteadyTurn;
-                }
-                else
-                {
-                    mNpcSteadyHand.reset();
-                    mNpcSteadyLocal.reset();
-                }
-                // Diagnostics: the NPC's physical weapon tip about its pelvis
-                // out of its attacks (u/s), mean and share over 300, per 10 s.
-                static const auto steadyTrace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_NPC_STEADY_TRACE") != nullptr; });
-                static const auto& steadyTrace = steadyTrace_tuned.get();
-                if (steadyTrace && getPtr() != MWMechanics::getPlayer() && mPelvisBodyIndex && mRightArm && duration > 0.0f)
-                {
-                    const auto handNow = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mHand);
-                    const auto handTurn = mRagdoll->getWorldBodyRotation(mCurrentPhysicsPose, mRightArm->mHand);
-                    const auto pelvisNow = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex);
-                    if (handNow && handTurn && pelvisNow)
-                    {
-                        const JPH::Vec3 rel(*handNow + JPH::RVec3(*handTurn * hscStriker().mBladeAxis
-                            * hscStriker().mTip) - *pelvisNow);
-                        if (resting && mSteadyPrevTip)
-                        {
-                            const float speed = (rel - *mSteadyPrevTip).Length() / duration;
-                            if (std::isfinite(speed))
-                            {
-                                mSteadySum += speed;
-                                mSteadyOver += speed > 300.0f ? 1.0f : 0.0f;
-                                mSteadyCount += 1.0f;
-                            }
-                        }
-                        mSteadyPrevTip = resting ? std::optional<JPH::Vec3>(rel) : std::nullopt;
-                    }
-                    mSteadyClock += duration;
-                    if (mSteadyClock >= 10.0f && mSteadyCount > 0.0f)
-                    {
-                        Log(Debug::Info) << "RAGDOLL_NPC_STEADY actor=" << getPtr().getCellRef().getRefId()
-                                         << " mean=" << mSteadySum / mSteadyCount << " over300=" << mSteadyOver / mSteadyCount
-                                         << " steps=" << mSteadyCount;
-                        mSteadyClock = mSteadySum = mSteadyOver = mSteadyCount = 0.0f;
-                    }
-                }
+                static const auto steadySeconds_tuned = RagdollCore::tuned<float>(
+                    [] { return weaponDriveSetting("OPENMW_RAGDOLL_NPC_STEADY", 0.0f); });
+                // Not a raised block (K2_GUARD_THREAT): held steady, an NPC's
+                // block crept up ~1 u a step - its arm's target stayed by the
+                // hand - and chops landed before it got there (CLASH-02 11-05).
+                // Nor a shove's thrust (K2_SHOVE_ARMS: it crept out 9 u in 0.25 s).
+                const bool blockRaised = (actor.mThreatZone && input.mBlocking) || input.mShove;
+                const bool resting = (stage == Stage::Guard || stage == Stage::Recover) && !blockRaised;
+                const auto& place = getPtr().getRefData().getPosition();
+                steadyShift = mWheelHold.step(!player && resting && steadySeconds_tuned.get() > 0.0f, duration,
+                    JPH::RVec3(place.pos[0], place.pos[1], place.pos[2]), place.rot[2], request->mWorldTarget, armWorld);
             }
             request->mWorldBend = toWorld(armPose.mPole);
             const auto model = mRagdoll->getModelRotation(armWorld);
             request->mHandRotation = model;
-            const float tipDistance = hscStriker().mTip;
-            const JPH::Vec3 blade = (world * hscStriker().mBladeAxis).NormalizedOr(frame.mForward);
-            if (const auto tip = mRagdoll->getModelVector(blade * tipDistance); tip && model)
-                request->mHandAimOffset = axes.mLongAxis * tip->Length();
+            const JPH::Vec3 blade = (world * own.mBladeAxis).NormalizedOr(frame.mForward);
+            if (const auto tipVector = mRagdoll->getModelVector(blade * own.mTip); tipVector && model)
+                request->mHandAimOffset = striker.mAxes.mLongAxis * tipVector->Length();
             else
                 request->mHandAimOffset = JPH::Vec3::sZero();
-            mHscGrip = centre + JPH::RVec3(toWorld(pose->mHand)) + steadyShift;
-            mHscWorldRotation = mNpcSteadyHand ? mNpcSteadyTurn : world;
+            mHscGrip = centre + JPH::RVec3(toWorld(pose.mHand)) + JPH::RVec3(steadyShift);
+            if (fistTrue)
+                // The motor drive and arm solve must agree on the corrected target.
+                mHscGrip = request->mWorldTarget;
+            mHscWorldRotation = steadyShift.IsNearZero() ? world : armWorld;
             mHscBlade = blade;
             routeArmFromBehind(*request, duration);
-            static const auto pathTrace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE") != nullptr; });
-            static const auto& pathTrace = pathTrace_tuned.get();
-            static unsigned pathRows = 0;
-            if (pathTrace && pathRows < 3000 && (++pathRows % 10) == 0)
-            {
-                const auto shoulder = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mShoulder);
-                const auto hand = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mHand);
-                const auto geometry = mRagdoll->getHingeLegGeometry(mRightArm->mShoulder, mRightArm->mElbow, mRightArm->mHand);
-                const auto range = geometry ? RagdollCore::hingeChainReachRange(*geometry) : std::nullopt;
-                const auto unit = mRagdoll->getWorldVector(JPH::Vec3::sAxisX());
-                if (shoulder && hand && range && unit)
-                    Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_HSC_PATH s=" << mChamberS
-                                     << " reach_min=" << range->first * unit->Length()
-                                     << " reach_max=" << range->second * unit->Length() << " target_from_shoulder="
-                                     << JPH::Vec3(request->mWorldTarget - *shoulder).Length()
-                                     << " hand_from_shoulder=" << JPH::Vec3(*hand - *shoulder).Length()
-                                     << " hand_err=" << mChamberHandError << " wrist_err=" << mChamberWristError
-                                     << " solver_reach_err=" << request->mReachError << " weight=" << request->mWeight
-                                     << " applied=" << request->mApplied << " actor_yaw="
-                                     << osg::RadiansToDegrees(getPtr().getRefData().getPosition().rot[2]) << " frame_yaw="
-                                     << osg::RadiansToDegrees(std::atan2(frame.mForward.GetX(), frame.mForward.GetY()))
-                                     << [&] {
-                                            std::ostringstream o;
-                                            o << std::fixed << std::setprecision(1);
-                                            for (const auto* pose : { &mCurrentPhysicsPose, &mManualMotorPose })
-                                            {
-                                                const auto l = mLeftArm ? mRagdoll->getWorldBodyPosition(*pose, mLeftArm->mShoulder) : std::nullopt;
-                                                const auto r = mRagdoll->getWorldBodyPosition(*pose, mRightArm->mShoulder);
-                                                if (l && r)
-                                                {
-                                                    const JPH::Vec3 line(*r - *l);
-                                                    o << (pose == &mCurrentPhysicsPose ? " phys_chest_yaw=" : " pose_chest_yaw=")
-                                                      << osg::RadiansToDegrees(std::atan2(-line.GetY(), line.GetX()));
-                                                }
-                                            }
-                                            return o.str();
-                                        }();
-            }
             if (mReseatEase > 0.0f)
             {
                 auto strong = profile;
@@ -19550,228 +19062,50 @@
             else
                 requestArmMotors(rigProfile, *mRightArm, profile, true);
             mSwingMotorsActive = true;
-            // OPENMW_RAGDOLL_HSC_PATH_TWIST = share of the keys' chest turn.
-            static const auto twistShare_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_PATH_TWIST", 1.0f); });
-            static const auto& twistShare = twistShare_tuned.get();
-            mHscTwist = pose->mTwist * twistShare;
-            mHscTwistLead *= twistShare;
-            mHscLean = 0.0f;
-            mHscRoll = 0.0f;
-            // The thrust's drive in the trunk (THRUST-02): bent forward as it
-            // drives, back a little in its wind-up. Positive lean bends back.
+
+            // The trunk.
+            const RagdollCore::WheelTrunk& trunk = mWheel.trunk();
+            mHscTwist = trunk.mTwist + mLeftFistTwist + mLeftHoldTwist;
+            mHscTwistLead = trunk.mTwistLead + mLeftFistTwist + mLeftHoldTwist;
+            mHscLean = trunk.mLean;
+            mHscRoll = trunk.mRoll;
+            mThrustDrive = trunk.mThrustDrive;
+            mHscLow = trunk.mLow;
+            mHscAssistTwist = trunk.mAssistTwist;
+            mHscAssistLean = trunk.mAssistLean;
+            mHscAssistRoll = trunk.mAssistRoll;
+            // RAGDOLL_K2_TRUNK (HSC_TRACE, the player's, out of the guard): the
+            // commanded chest turn against the physical shoulder line's, both
+            // from the actor's frame (degrees; positive = toward the right).
+            if (player && mWheel.stage() != Stage::Guard && mLeftArm
+                && RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
             {
-                const float rate = (std::abs(mThrustDriveWant) > std::abs(mThrustDrive) ? 10.0f : 3.0f) * duration;
-                mThrustDrive += std::clamp(mThrustDriveWant - mThrustDrive, -rate, rate);
-                if (!std::isfinite(mThrustDrive))
-                    mThrustDrive = 0.0f;
-                mHscLean -= mThrustDrive * thrustLungeSettings()[1];
-            }
-            // The cut's momentum turns the trunk past its end (user 10-30
-            // bookmark: "a weapon swing end point should turn the torso a bit,
-            // dragging it with its momentum"): when a cut reaches its end, the
-            // chest turns on the way the blade travelled across (a forehand
-            // brings the right shoulder round, a backhand takes it back), up
-            // to `degrees` at a 1200 u/s tip (from 30% of it), in 0.08 s, and
-            // eases back over `seconds`. Chops and thrusts (no sideways travel)
-            // stay square. OPENMW_RAGDOLL_HSC_FOLLOW_TURN = "degrees, seconds"
-            // (0 = off).
-            {
-                static const auto followTurn_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                    std::array<float, 2> v{ 0.0f, 0.6f };
-                    if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_FOLLOW_TURN"))
-                        std::sscanf(text, "%f,%f", &v[0], &v[1]);
-                    return v;
-                });
-                const auto& followTurn = followTurn_tuned.get();
-                const bool cutEnded = mAttackStage == AttackStage::Cut && mFollowTurnPrevCut < 1.0f && mAttackCut >= 1.0f;
-                mFollowTurnPrevCut = mAttackStage == AttackStage::Cut ? mAttackCut : 0.0f;
-                if (cutEnded && followTurn[0] > 0.0f)
+                static unsigned rows = 0;
+                const auto l = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mLeftArm->mShoulder);
+                const auto r = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mShoulder);
+                if (l && r && rows < 20000)
                 {
-                    const float across = -std::cos(mAttackCutAngle);
-                    const float speed = mSwing.mVelocity.Length();
-                    if (std::abs(across) > 0.2f && std::isfinite(speed))
-                    {
-                        mFollowTurnAmplitude = osg::DegreesToRadians(followTurn[0]) * across
-                            * std::clamp(speed / 1200.0f, 0.3f, 1.0f);
-                        mFollowTurnTime = 0.0f;
-                    }
-                }
-                if (mFollowTurnAmplitude != 0.0f)
-                {
-                    mFollowTurnTime += duration;
-                    const float t = mFollowTurnTime, rise = 0.08f, fall = std::max(0.1f, followTurn[1] - rise);
-                    float envelope = t < rise ? t / rise : 1.0f - std::clamp((t - rise) / fall, 0.0f, 1.0f);
-                    envelope = envelope * envelope * (3.0f - 2.0f * envelope);
-                    mHscTwist += mFollowTurnAmplitude * envelope;
-                    mHscTwistLead += mFollowTurnAmplitude * envelope;
-                    if (t >= rise + fall || !std::isfinite(mFollowTurnAmplitude))
-                        mFollowTurnAmplitude = 0.0f;
+                    ++rows;
+                    const JPH::Vec3 line(*r - *l);
+                    float turned = std::atan2(-line.GetY(), line.GetX())
+                        - std::atan2(frame.mForward.GetX(), frame.mForward.GetY());
+                    while (turned > osg::PI)
+                        turned -= 2.0f * osg::PI;
+                    while (turned < -osg::PI)
+                        turned += 2.0f * osg::PI;
+                    Log(Debug::Info) << std::fixed << std::setprecision(1) << "RAGDOLL_K2_TRUNK stage="
+                                     << static_cast<int>(mWheel.stage()) << " angle="
+                                     << osg::RadiansToDegrees(mWheel.angle()) << " cmd="
+                                     << osg::RadiansToDegrees(trunk.mTwist) << " lead="
+                                     << osg::RadiansToDegrees(trunk.mTwistLead) << " hip="
+                                     << osg::RadiansToDegrees(trunk.mHipTurn) << " phys="
+                                     << osg::RadiansToDegrees(turned);
                 }
             }
-            // The torso helps the hand reach (design: "When a pose is out of
-            // reach", user 2026-10-03: "before going illegal try solving the
-            // position by adding torso pitch, yaw or roll"). While the physical
-            // hand trails its target by more than 2 units, the chest turns
-            // toward the target's bearing round the chest centre and bends
-            // toward its height, at most 0.5 rad of turn and 0.35 of bend, at
-            // 1.5 rad/s; on target it returns to the key's chest. The height
-            // can also tilt the chest sideways, raising or dropping the sword
-            // shoulder (the tennis serve's lateral trunk tilt; trunk side
-            // bend about 35 deg, AAOS), at most 0.35 rad. Off: the keys hang
-            // from the measured shoulders, so the tilt moved its own targets
-            // and the rising follow-throughs missed 15-19 units (3.4 without).
-            // OPENMW_RAGDOLL_HSC_TORSO_ASSIST=0 = off. From the shoulders (no
-            // pelvis frame) there is no side tilt.
-            static const auto torsoAssist_tuned = RagdollCore::tuned<bool>([] { return weaponDriveSetting("OPENMW_RAGDOLL_HSC_TORSO_ASSIST", 1.0f) > 0.0f; });
-            static const auto& torsoAssist = torsoAssist_tuned.get();
-            if (torsoAssist)
-            {
-                const auto handNow = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mHand);
-                if (handNow)
-                {
-                    const auto toBody = [&](JPH::Vec3Arg v) {
-                        return JPH::Vec3(v.Dot(frame.mRight), v.Dot(frame.mForward), v.Dot(frame.mUp));
-                    };
-                    const JPH::Vec3 t = toBody(JPH::Vec3(request->mWorldTarget - centre));
-                    const JPH::Vec3 h = toBody(JPH::Vec3(*handNow - centre));
-                    const float miss = (t - h).Length();
-                    const auto wrapPi = [](float a) {
-                        while (a > osg::PIf)
-                            a -= 2.0f * osg::PIf;
-                        while (a < -osg::PIf)
-                            a += 2.0f * osg::PIf;
-                        return a;
-                    };
-                    const float bearing = wrapPi(std::atan2(t.GetX(), t.GetY()) - std::atan2(h.GetX(), h.GetY()));
-                    const float height = std::atan2(t.GetZ(), std::hypot(t.GetX(), t.GetY()))
-                        - std::atan2(h.GetZ(), std::hypot(h.GetX(), h.GetY()));
-                    const float rate = 1.5f * duration;
-                    // In the pelvis frame the trunk really carries the shoulder,
-                    // so each motion does what it does anatomically: the turn
-                    // follows the bearing; bending forward reaches forward and
-                    // down (bending back took the shoulder away from a high
-                    // forward target: LINES-01 down-right follow-through 21.5
-                    // units off); the side tilt raises or drops the sword
-                    // shoulder for height. Positive lean bends back.
-                    static const bool anatomical = pelvisFrameActive();
-                    // (Helping only past the arm's comfortable reach, by the
-                    // trunk's Jacobian transpose, missed more: the misses are
-                    // joint limits more than reach - rising follow-throughs
-                    // 19-22 units off. Removed 10-12.)
-                    // Only in an attack: in the guard and on the way back the
-                    // trunk is the gait's and balance's (a guard hand lagging
-                    // while walking or getting up bent the trunk: sentinel
-                    // warhammer powered lying, end lean 42-48 deg).
-                    const bool attacking = mAttackStage == AttackStage::Wind || mAttackStage == AttackStage::Cut;
-                    if (!attacking)
-                    {
-                        mHscAssistTwist -= std::clamp(mHscAssistTwist, -rate, rate);
-                        mHscAssistLean -= std::clamp(mHscAssistLean, -rate, rate);
-                        mHscAssistRoll -= std::clamp(mHscAssistRoll, -rate, rate);
-                    }
-                    else if (miss > 2.0f)
-                    {
-                        mHscAssistTwist += std::clamp(0.5f * bearing, -rate, rate);
-                        if (anatomical)
-                        {
-                            const float forward = (t.GetY() - h.GetY()) - (t.GetZ() - h.GetZ());
-                            mHscAssistLean += std::clamp(-0.02f * forward, -rate, rate);
-                            mHscAssistRoll += std::clamp(0.5f * height, -rate, rate);
-                        }
-                        else
-                        {
-                            mHscAssistLean += std::clamp(0.5f * height, -rate, rate);
-                        }
-                    }
-                    else
-                    {
-                        mHscAssistTwist -= std::clamp(mHscAssistTwist, -rate, rate);
-                        mHscAssistLean -= std::clamp(mHscAssistLean, -rate, rate);
-                        mHscAssistRoll -= std::clamp(mHscAssistRoll, -rate, rate);
-                    }
-                    mHscAssistTwist = std::clamp(mHscAssistTwist, -0.5f, 0.5f);
-                    // Bending back is the trunk's smallest range (AAOS: about 25
-                    // deg against 80 forward).
-                    mHscAssistLean = std::clamp(mHscAssistLean, -0.35f, anatomical ? 0.15f : 0.35f);
-                    mHscAssistRoll = std::clamp(mHscAssistRoll, -0.35f, 0.35f);
-                }
-                mHscTwist += mHscAssistTwist;
-                mHscTwistLead += mHscAssistTwist;
-                mHscLean += mHscAssistLean;
-                mHscRoll += mHscAssistRoll;
-            }
-            // The body follows the foe assist (the cut plane above): in an
-            // attack the chest turns toward an aimed foe's side (a right-handed
-            // chop could not reach a foe 15-25 deg to the left: AIM-03 0 of 8
-            // with the plane turned alone) and bends forward toward one past
-            // the blade's sweet spot (0.55 of the blade beyond the hand's 35
-            // units) but in reach, at 3 rad/s, at most 0.4 rad of turn and 0.3
-            // of bend.
-            // OPENMW_RAGDOLL_HSC_FOE_BODY = "turn share, bend per unit past the
-            // sweet spot" (0 = off).
-            {
-                static const auto foeBody_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
-                    std::array<float, 2> value{ 1.0f, 0.006f };
-                    if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_FOE_BODY"))
-                        std::sscanf(text, "%f,%f", &value[0], &value[1]);
-                    return value;
-                });
-                static const auto& foeBody = foeBody_tuned.get();
-                float wantTwist = 0.0f, wantLean = 0.0f;
-                const bool attacking = mAttackStage == AttackStage::Wind || mAttackStage == AttackStage::Cut;
-                if (attacking && mHscFoe && mHscFoeAssist > 0.0f)
-                {
-                    const JPH::Vec3 toFoe(*mHscFoe - centre);
-                    const float fx = toFoe.Dot(frame.mRight), fy = toFoe.Dot(frame.mForward);
-                    const float flat = std::hypot(fx, fy);
-                    wantTwist = std::clamp(foeBody[0] * std::atan2(fx, fy) * mHscFoeAssist, -0.4f, 0.4f);
-                    const float sweet = 35.0f + 0.55f * tipDistance;
-                    // Positive lean bends back. Only a foe a little past the sweet
-                    // spot: the bend grows over 25 units past it and is gone 45
-                    // past (an out-of-reach claymore click reached a target 136
-                    // units away: FIX-08's miss check).
-                    const float excess = flat - sweet;
-                    const float window = excess < 25.0f ? excess : std::max(0.0f, 25.0f - (excess - 25.0f) * 1.25f);
-                    wantLean = -std::clamp(foeBody[1] * window * mHscFoeAssist, 0.0f, 0.3f);
-                }
-                const float rate = 3.0f * duration;
-                if (!std::isfinite(wantTwist) || !std::isfinite(wantLean))
-                    wantTwist = wantLean = 0.0f;
-                mHscFoeTwist += std::clamp(wantTwist - mHscFoeTwist, -rate, rate);
-                mHscFoeLean += std::clamp(wantLean - mHscFoeLean, -rate, rate);
-                if (!std::isfinite(mHscFoeTwist) || !std::isfinite(mHscFoeLean))
-                    mHscFoeTwist = mHscFoeLean = 0.0f;
-                mHscTwist += mHscFoeTwist;
-                mHscTwistLead += mHscFoeTwist;
-                mHscLean += mHscFoeLean;
-                // The low stance (aim item 2): the trunk bends further forward
-                // for a low cut, and Footfall crouches (its input, below), at
-                // 2.5 per second, let go outside an attack.
-                const auto& lowStance = hscLowStance();
-                const float lowWant = attacking && lowStance[0] > 0.6f ? mHscLowWant : 0.0f;
-                mHscLow += std::clamp(lowWant - mHscLow, -2.5f * duration, 2.5f * duration);
-                if (!std::isfinite(mHscLow))
-                    mHscLow = 0.0f;
-                mHscLean -= mHscLow * lowStance[2];
-            }
-            // Contacts are priced by the commanded tip's speed.
-            const JPH::RVec3 tip = mHscGrip + JPH::RVec3(blade * tipDistance);
-            // A click plays its cut on its own for about a second, and a
-            // committed cut finishes after the button is let go (CUT_FINISH);
-            // both kept swinging only 0.4 s past the release, so their later
-            // contacts failed the strike's intent gate (build 63 play: a click
-            // chop met the foe 0.6 s after the click - contact, no blow).
-            // OPENMW_RAGDOLL_CUT_INTENT=1: the cut stage swings too (0 = off).
-            // Only the cut stage: a click's mAutoAttack can outlive its cut,
-            // and an NPC that never stopped "swinging" never attacked again
-            // (NPCHIT-01 guard: 0 blows with mAutoAttack in the rule).
-            static const auto cutIntent_tuned = RagdollCore::tuned<bool>([] {
-                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_CUT_INTENT");
-                return text && std::atoi(text) != 0;
-            });
-            static const auto& cutIntent = cutIntent_tuned.get();
-            const bool swinging = held || mHscReleased < 0.4f
-                || (cutIntent && mAttackStage == AttackStage::Cut);
+
+            // Contacts: priced by the commanded tip's speed.
+            const JPH::RVec3 tip = mHscGrip + JPH::RVec3(blade * own.mTip);
+            const bool swinging = mWheel.swinging(held);
             if (duration > 0.0f && mSwing.mSwinging && swinging)
             {
                 const JPH::Vec3 velocity((tip - mHscTip) / duration);
@@ -19784,15 +19118,12 @@
             mSwing.mSwinging = swinging;
             mSwing.mHeld = held;
             mSwingArmIsRight = true;
-            // A fist on the wheel strikes with its right hand (the contact
-            // callback publishes it like a blade) while the punch is out.
-            mHscFistStrike = hscStriker().mFist && swinging;
-            if (mHscFistStrike && getPtr() == MWMechanics::getPlayer())
+            mHscFistStrike = own.mFist && swinging;
+            if (mHscFistStrike && player)
                 mPlayerStrikeActive = true;
-            // Each line hits as Morrowind's matching attack type.
-            mPlayerAttackType = mAttackLine >= 0 ? (hscStriker().mFist ? fistLines() : attackLines())[static_cast<std::size_t>(mAttackLine)].mAttackType
-                                                 : "slash";
-            (void)armLength;
+            mPlayerAttackType = mWheel.line() >= 0
+                ? std::string((*striker.mLines)[static_cast<std::size_t>(mWheel.line())].mAttackType)
+                : std::string("slash");
             return true;
         }
 
@@ -19807,7 +19138,9 @@
             mFistDriving = false;
             mSinceInterrupt += duration;
             mCoverTime = std::max(0.0f, mCoverTime - duration);
-            if (getPtr() == MWMechanics::getPlayer())
+            const bool countedPlayer = getPtr() == MWMechanics::getPlayer();
+            RagdollCore::countPath(RagdollCore::CountedPath::Steps, countedPlayer);
+            if (countedPlayer)
             {
                 stepPlayerWalkCarry(duration);
                 stepPlayMetrics(duration);
@@ -19817,7 +19150,10 @@
             if (stepHalfSwordControl(duration, profile, rigProfile))
                 return;
             if (stepPlayerTipControl(duration, profile, rigProfile))
+            {
+                RagdollCore::countPath(RagdollCore::CountedPath::TipControl, countedPlayer);
                 return;
+            }
             using AttackPhase = MWMechanics::RagdollAttackPhase;
             // A native attack that has ended must hand its right arm back to
             // the holding pose; the aimed request only exists while the blow
@@ -21120,7 +20456,14 @@
                 stepSupportGripAcquisition(physics, duration, physicsStep, swing, gripReady);
                 if (!mSupportGripFrame)
                     return;
-                if (gripRejudge && mSupportGripReadySample && mSupportGrip && mSupportGrip->attached())
+                // K2_HAFT_GRIP's slide owns a spear's or staff's support point:
+                // the rejudge below snapped every slid unit back to the
+                // authored grip, each step, and re-seated the anchor each time
+                // (11-07: the slide never moved past 1 u; the steel spear's
+                // chop ran at 39% of its kind's turn, 100% with the slide off).
+                const bool haftSlides = hscGrip && !halfSword && hscStriker().mWideSpearGrip
+                    && k2HaftGripSettings().mShare > 0.0f;
+                if (gripRejudge && !haftSlides && mSupportGripReadySample && mSupportGrip && mSupportGrip->attached())
                 {
                     auto& frame = *mSupportGripFrame;
                     const auto reachable = reachableOffset(authoredOffset);
@@ -21133,6 +20476,45 @@
                     {
                         frame.mFinalOffset = *reachable;
                         frame.mCandidateReady = false;
+                    }
+                }
+                // K2_HAFT_GRIP (ragdollcore wheeloutput haftGripTarget): on a
+                // long haft under hand control the support point slides along
+                // it toward the support shoulder; the anchor's walk below
+                // carries it there.
+                if (hscGrip && !halfSword && hscStriker().mWideSpearGrip && mSupportGrip && mSupportGrip->attached())
+                {
+                    const RagdollCore::HaftGripSettings& slide = k2HaftGripSettings();
+                    const auto& physicalWeapon = measured[mWeapon->mWeaponBody];
+                    const auto& shoulder = measured[mLeftArm->mShoulder];
+                    if (slide.mShare > 0.0f)
+                    {
+                        auto& frame = *mSupportGripFrame;
+                        const JPH::Vec3 primary = weaponHandPoint();
+                        const JPH::Vec3 shoulderLocal = physicalWeapon.mRotation.Conjugated()
+                            * (shoulder.mTranslation - physicalWeapon.mTranslation);
+                        const float reach = (measured[mLeftArm->mElbow].mTranslation - shoulder.mTranslation).Length()
+                            + (measured[mLeftArm->mHand].mTranslation - measured[mLeftArm->mElbow].mTranslation).Length();
+                        const JPH::Vec3 along = authoredOffset - primary;
+                        const float authoredSpacing = along.Length();
+                        if (authoredSpacing > 1e-3f)
+                        {
+                            const JPH::Vec3 axis = along / authoredSpacing;
+                            const float butt = mWeapon->mLength / std::max(frame.mScale, 1e-3f)
+                                - std::max(mWeapon->tipDistanceFromHand(), 0.0f) / std::max(frame.mScale, 1e-3f)
+                                - 3.0f;
+                            const float target = RagdollCore::haftGripTarget(
+                                slide, primary, authoredOffset, shoulderLocal, reach, butt);
+                            const float current = (frame.mFinalOffset - primary).Dot(axis);
+                            const float next = RagdollCore::haftGripStep(
+                                current, target, slide.mSpeed / std::max(frame.mScale, 1e-3f), duration);
+                            const JPH::Vec3 wanted = primary + axis * next;
+                            if ((wanted - frame.mFinalOffset).Length() * frame.mScale > 0.05f)
+                            {
+                                frame.mFinalOffset = wanted;
+                                frame.mCandidateReady = false;
+                            }
+                        }
                     }
                 }
                 if (mSupportGrip && mSupportGrip->attached()
@@ -21586,6 +20968,7 @@
             const float yaw = getPtr().getRefData().getPosition().rot[2];
             const JPH::Vec3 forward(std::sin(yaw), std::cos(yaw), 0);
             const JPH::Vec3 right = forward.Cross(JPH::Vec3::sAxisZ());
+            mLeftFistTarget.reset();
             for (unsigned side = 0; side < 2; ++side)
             {
                 const bool isRight = side == 1;
@@ -21634,11 +21017,17 @@
                     continue;
                 }
                 mPlayerGuardMotors[side] = true;
+                // K2_SHOVE_ARMS: a shove has the arm (this guard took it back
+                // every step: a sword's free hand went out 1 u past the lunge).
+                if (mShoveArms > 0.0f && mShoveAt && shoveArmsSetting())
+                    continue;
                 // FIST-02: the jab owns the left arm while it is out.
-                const bool jabbing = !isRight && bareFists && mLeftJabTime >= 0.0f;
-                if (fistClip && request && !request->mBrace && !jabbing)
+                const bool jabbing = !isRight && bareFists && (mLeftJabTime >= 0.0f || mLeftFistTime >= 0.0f);
+                // FIST-06: the left fist held where the mouse has it.
+                const bool steered = !isRight && bareFists && !jabbing && mLeftFistHold && mFistCentre;
+                if (fistClip && request && !request->mBrace && !jabbing && !steered)
                     request->mReleasing = true;
-                if (attacking && !jabbing) continue;
+                if (attacking && !jabbing && !steered) continue;
                 const auto shoulder = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, arm->mShoulder);
                 const auto geometry = mRagdoll->getHingeLegGeometry(arm->mShoulder, arm->mElbow, arm->mHand);
                 const auto reach = geometry ? RagdollCore::hingeChainReachRange(*geometry) : std::nullopt;
@@ -21723,7 +21112,116 @@
                 // FIST-02: the jab - from the guard straight at the foe's head
                 // (its chest point raised a head; ahead at shoulder height with
                 // no foe), past the arm's reach: a punch is thrown through.
-                if (jabbing)
+                if (!(jabbing && mLeftFistTime >= 0.0f))
+                    mLeftStraightFrom.reset();
+                // K2_FIST_TRUE: the left straight goes from where the fist is
+                // straight at the crosshair (the ray at the foe's distance,
+                // else an arm ahead) and straight back. On its mirrored line
+                // it first drew back 20 u to the shoulder and 13 u up, then
+                // went out round a loop (user 11-16: "wobbly ... not straight";
+                // the path 2.2-2.7x its straight line, 14 u off it).
+                if (jabbing && mLeftFistTime >= 0.0f && bareFists && fistsTrue()
+                    && mLeftFistKind == RagdollCore::PunchKind::Straight)
+                {
+                    const JPH::Vec3 guardAt(request->mWorldTarget - *shoulder);
+                    const bool straightStarts = !mLeftStraightFrom;
+                    if (!mLeftStraightFrom)
+                        mLeftStraightFrom = mLeftFistLast ? *mLeftFistLast : guardAt;
+                    JPH::Vec3 aim = forward;
+                    if (mSwingAimRayOrigin && mSwingAimRayDirection.LengthSq() > 1e-6f)
+                    {
+                        const JPH::Vec3 ray = mSwingAimRayDirection.Normalized();
+                        const JPH::Vec3 fromEye(*shoulder - *mSwingAimRayOrigin);
+                        float along = fromEye.Dot(ray) + length;
+                        if (mHscFoe)
+                            along = std::max(fromEye.Dot(ray) + 0.5f * length,
+                                JPH::Vec3(*mHscFoe - *mSwingAimRayOrigin).Dot(ray));
+                        JPH::RVec3 point = *mSwingAimRayOrigin + JPH::RVec3(ray * along);
+                        // K2_FIST_STEP: onto the foe by the wheel's assist
+                        // (its upright axis, at the crosshair's height).
+                        if (mHscFoe && mHscFoeAssist > 0.0f && k2FistSteer()[0] >= 3.0f && k2FistStep()[0] > 0.0f)
+                        {
+                            const JPH::RVec3 onFoe(mHscFoe->GetX(), mHscFoe->GetY(), point.GetZ());
+                            point = point + (onFoe - point) * static_cast<double>(std::clamp(mHscFoeAssist, 0.0f, 1.0f));
+                        }
+                        const JPH::Vec3 toPoint(point - *shoulder);
+                        if (toPoint.LengthSq() > 1.0f && toPoint.Dot(forward) > 0.0f)
+                            aim = toPoint;
+                    }
+                    const JPH::Vec3 strike = aim.NormalizedOr(forward) * (k2FistTrue()[0] * length);
+                    const float wind = mLeftFistTiming.mWind, cut = mLeftFistTiming.mCut;
+                    const float hold = 0.04f;
+                    const float t = mLeftFistTime;
+                    // The wind-up: 5 u back along its own line (the tell, and
+                    // the run-up); the strike in the right fist's share of
+                    // the time, fastest at its end.
+                    const JPH::Vec3 line = strike - *mLeftStraightFrom;
+                    const JPH::Vec3 cocked = *mLeftStraightFrom - line.NormalizedOr(forward) * 5.0f;
+                    // A charged fist starts further back (K2_FIST_CHARGE): its
+                    // strike takes the time its run needs at 420 u/s, at most
+                    // 0.3 s (FIST-09: the charged left, drawn 21 u, had not
+                    // reached the dummy when its strike's window shut).
+                    if (straightStarts)
+                    {
+                        const float needed = (strike - cocked).Length() / 420.0f;
+                        if (needed > mLeftFistTiming.mCut * k2FistTrue()[3])
+                            mLeftFistTiming.mCut = std::min(0.3f, needed / k2FistTrue()[3]);
+                    }
+                    JPH::Vec3 at;
+                    if (t < wind)
+                    {
+                        const float u = std::clamp(t / std::max(1e-3f, wind), 0.0f, 1.0f);
+                        at = *mLeftStraightFrom + (cocked - *mLeftStraightFrom) * (u * u * (3.0f - 2.0f * u));
+                    }
+                    else if (t < wind + cut)
+                    {
+                        const float u = std::clamp((t - wind) / std::max(1e-3f, cut * k2FistTrue()[3]), 0.0f, 1.0f);
+                        at = cocked + (strike - cocked) * (u * u);
+                    }
+                    else
+                    {
+                        const float u = std::clamp(
+                            (t - wind - cut - hold) / std::max(0.05f, mLeftFistTiming.mBack - hold), 0.0f, 1.0f);
+                        at = strike + (guardAt - strike) * (u * u * (3.0f - 2.0f * u));
+                    }
+                    request->mWorldTarget = *shoulder + JPH::RVec3(at);
+                    request->mWorldBend = (-right * 0.2f - JPH::Vec3::sAxisZ()).Normalized();
+                    request->mBlendRate = std::max(request->mBlendRate, 25.0f);
+                }
+                else if (jabbing && mLeftFistTime >= 0.0f && mFistCentre)
+                {
+                    // FIST-05: the left fist on its punch's mirrored line.
+                    auto pose = leftFistPose(mLeftFistTime);
+                    pose.mHand += leftPunchShift(mLeftFistTime);
+                    const auto toWorld = [&](JPH::Vec3Arg v) {
+                        return mFistRight * v.GetX() + mFistForward * v.GetY() + mFistUp * v.GetZ();
+                    };
+                    // K2_LEFT_PUNCH: the line turns to where the crosshair
+                    // points (about the chest centre, at most 0.6 rad either
+                    // way) by how far the fist is out of its guard.
+                    JPH::Quat aimTurn = JPH::Quat::sIdentity();
+                    if (k2LeftPunch()[1] > 0.0f && mSwingAimRayDirection.LengthSq() > 1e-6f)
+                    {
+                        const JPH::Vec3 ray = mSwingAimRayDirection.Normalized();
+                        const float flat = std::hypot(ray.Dot(mFistForward), ray.Dot(mFistRight));
+                        if (ray.Dot(mFistForward) > 0.0f && flat > 1e-3f)
+                        {
+                            const RagdollCore::FistPunchPose guard = leftFistPose(0.0f, false);
+                            const float out = std::clamp((pose.mHand.GetY() - guard.mHand.GetY()) / 15.0f, 0.0f, 1.0f);
+                            const float azimuth
+                                = std::clamp(std::atan2(ray.Dot(mFistRight), ray.Dot(mFistForward)), -0.6f, 0.6f) * out;
+                            const float elevation = std::clamp(std::atan2(ray.Dot(mFistUp), flat), -0.6f, 0.6f) * out;
+                            // The chest frame: x right, y forward, z up.
+                            aimTurn = JPH::Quat::sRotation(JPH::Vec3::sAxisZ(), -azimuth)
+                                * JPH::Quat::sRotation(JPH::Vec3::sAxisX(), elevation);
+                        }
+                    }
+                    request->mWorldTarget = *mFistCentre + JPH::RVec3(toWorld(aimTurn * pose.mHand));
+                    mLeftPunchTarget = request->mWorldTarget;
+                    request->mWorldBend = toWorld(aimTurn * pose.mPole).NormalizedOr(-JPH::Vec3::sAxisZ());
+                    request->mBlendRate = std::max(request->mBlendRate, 25.0f);
+                }
+                else if (jabbing)
                 {
                     JPH::Vec3 aim = forward + right * 0.08f;
                     if (mHscFoe)
@@ -21732,12 +21230,77 @@
                         if (toFoe.LengthSq() > 1.0f && toFoe.Dot(forward) > 0.0f)
                             aim = toFoe;
                     }
-                    const JPH::RVec3 strike = *shoulder + JPH::RVec3(aim.NormalizedOr(forward) * (1.1f * length));
+                    // K2_FISTS (user 11-05: "its impossible to aim"): the fist goes
+                    // where the crosshair points - the crosshair ray at the foe's
+                    // distance (else an arm ahead) - and stops just through it,
+                    // not flung past the arm's reach.
+                    float throughReach = 1.1f * length;
+                    static const auto fistAim_tuned = RagdollCore::tuned<bool>([] {
+                        const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_FISTS");
+                        return text && std::atof(text) > 0.0;
+                    });
+                    if (fistAim_tuned.get() && mSwingAimRayOrigin && mSwingAimRayDirection.LengthSq() > 1e-6f)
+                    {
+                        const JPH::Vec3 ray = mSwingAimRayDirection.Normalized();
+                        const JPH::Vec3 fromEye(*shoulder - *mSwingAimRayOrigin);
+                        float along = fromEye.Dot(ray) + length;
+                        if (mHscFoe)
+                            along = std::max(fromEye.Dot(ray) + 0.3f * length,
+                                JPH::Vec3(*mHscFoe - *mSwingAimRayOrigin).Dot(ray));
+                        const JPH::RVec3 point = *mSwingAimRayOrigin + JPH::RVec3(ray * along);
+                        const JPH::Vec3 toPoint(point - *shoulder);
+                        if (toPoint.LengthSq() > 1.0f && toPoint.Dot(forward) > 0.0f)
+                        {
+                            aim = toPoint;
+                            throughReach = std::min(throughReach, toPoint.Length() + 8.0f);
+                        }
+                    }
+                    const JPH::RVec3 strike = *shoulder + JPH::RVec3(aim.NormalizedOr(forward) * throughReach);
                     const float out = leftJabExtension();
                     request->mWorldTarget = request->mWorldTarget + (strike - request->mWorldTarget) * static_cast<double>(out);
                     request->mWorldBend = (-right * 0.3f - JPH::Vec3::sAxisZ()).Normalized();
                     request->mBlendRate = std::max(request->mBlendRate, 25.0f);
                 }
+                else if (steered)
+                {
+                    const auto toWorld = [&](JPH::Vec3Arg v) {
+                        return mFistRight * v.GetX() + mFistForward * v.GetY() + mFistUp * v.GetZ();
+                    };
+                    // K2_FIST_EASE: from where the punch left the fist.
+                    JPH::Vec3 held = mLeftFistHold->mHand;
+                    if (mLeftFistEaseFrom && mLeftFistEaseTime < k2FistEase())
+                    {
+                        held = RagdollCore::easeFistToHold(*mLeftFistEaseFrom, held, mLeftFistEaseTime, k2FistEase());
+                        mLeftFistEaseTime += mArmStepDuration;
+                    }
+                    else
+                        mLeftFistEaseFrom.reset();
+                    request->mWorldTarget = *mFistCentre + JPH::RVec3(toWorld(held));
+                    request->mWorldBend = toWorld(mLeftFistHold->mPole).NormalizedOr(-JPH::Vec3::sAxisZ());
+                    request->mBlendRate = std::max(request->mBlendRate, 25.0f);
+                }
+                // K2_FIST_EASE: a running punch's command, for the hold after it.
+                if (!isRight && jabbing && mLeftFistTime >= 0.0f && mFistCentre && k2FistEase() > 0.0f)
+                {
+                    const JPH::Vec3 at(request->mWorldTarget - *mFistCentre);
+                    mLeftFistEaseFrom = JPH::Vec3(at.Dot(mFistRight), at.Dot(mFistForward), at.Dot(mFistUp));
+                    mLeftFistEaseTime = 0.0f;
+                }
+                else if (!isRight && !steered)
+                    mLeftFistEaseFrom.reset();
+                if (!isRight && bareFists && fistsTrue())
+                {
+                    request->mWorldTarget = fistWithinReach(request->mWorldTarget, arm);
+                    const float punchTime = mLeftFistTime - mLeftFistTiming.mWind;
+                    const float cut = jabbing && mLeftFistTime >= 0.0f && punchTime >= 0.0f
+                            && punchTime < mLeftFistTiming.mCut
+                        ? punchTime / std::max(1e-3f, mLeftFistTiming.mCut) : -1.0f;
+                    request->mWorldTarget = aimFist(0, request->mWorldTarget, cut, mArmStepDuration);
+                    mLeftFistTarget = request->mWorldTarget;
+                    mLeftFistLast = JPH::Vec3(request->mWorldTarget - *shoulder);
+                }
+                else if (!isRight)
+                    mLeftFistLast.reset();
                 requestArmMotors(profile, *arm, swing, true,
                     mRagdoll->isRootKinematic() && supportFrameStrengthened());
             }
@@ -21841,6 +21404,7 @@
         // OPENMW_RAGDOLL_ARM_RANGE = "wrist cone, wrist plane, wrist twist,
         // clavicle cone, clavicle plane" radians (first 0 = off).
         bool mWeaponArmRangeOpen = false;
+        bool mForearmRollOpen = false; // K2_FOREARM_ROLL's wrist twist open
         bool mHscElbowOpen = false;
         std::optional<std::pair<float, float>> mHscElbowAuthored;
         void updateWeaponArmRange(const RagdollCore::RagdollProfile& profile)
@@ -21855,13 +21419,22 @@
             });
             static const auto& range = range_tuned.get();
             const bool wanted = range[0] > 0.0f && (mTip.mActive || mHscActive) && mWeapon && mWeapon->mAttached;
+            // K2_FOREARM_ROLL (user 11-06, spear and staff: "a forearm roll
+            // joint"): the elbow is a hinge and the wrist rolls 17 deg, so a
+            // turned haft twisted the whole upper arm and the elbows crossed
+            // (the 18:19 staff: forearms crossed in 9.5% of frames). While hand
+            // control holds a weapon both wrists roll this far each way (a
+            // forearm turns ~80 deg) on the wrist's torque below; the arm solve
+            // clamps to the live limits, so it opens with them.
+            const float forearmRoll = k2ForearmRoll();
+            const bool rollWanted = forearmRoll > 0.0f && mHscActive && mWeapon && mWeapon->mAttached;
             // The wrist is too weak to turn a blade (RAGDOLL_ARM_JOINTS: wrist
             // never clipped but lagged its target 27-114 degrees, claymore
             // worst): while open it gets this many times its authored torque,
             // every step (the swing motors reset it). OPENMW_RAGDOLL_WRIST_TORQUE.
             static const auto wristTorque_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_WRIST_TORQUE", 12.0f); });
             static const auto& wristTorque = wristTorque_tuned.get();
-            if (wanted && mRagdoll && wristTorque > 1.0f)
+            if ((wanted || rollWanted) && mRagdoll && wristTorque > 1.0f)
                 for (const auto* arm : { &mLeftArm, &mRightArm })
                     if (*arm && (*arm)->mHand < profile.mBodies.size() && profile.mBodies[(*arm)->mHand].mConstraint)
                         mRagdoll->setMotorMaximumTorque((*arm)->mHand,
@@ -21922,10 +21495,12 @@
                     mHscElbowOpen = false;
                 }
             }
-            if (wanted == mWeaponArmRangeOpen || !mRagdoll)
+            if ((wanted == mWeaponArmRangeOpen && rollWanted == mForearmRollOpen) || !mRagdoll)
                 return;
             mWeaponArmRangeOpen = wanted;
-            Log(Debug::Info) << "RAGDOLL_ARM_RANGE actor=" << getPtr().getCellRef().getRefId() << " open=" << wanted;
+            mForearmRollOpen = rollWanted;
+            Log(Debug::Info) << "RAGDOLL_ARM_RANGE actor=" << getPtr().getCellRef().getRefId() << " open=" << wanted
+                             << " forearm_roll=" << (rollWanted ? forearmRoll : 0.0f);
             for (const auto* arm : { &mLeftArm, &mRightArm })
             {
                 if (!*arm)
@@ -21936,10 +21511,12 @@
                         continue;
                     const auto& authored = *profile.mBodies[body].mConstraint;
                     const bool wrist = body == (*arm)->mHand;
-                    if (wanted && wrist)
-                        mRagdoll->setSwingTwistJointLimits(body, std::max(authored.mNormalHalfConeAngle, range[0]),
-                            std::max(authored.mPlaneHalfConeAngle, range[1]), std::min(authored.mTwistMinAngle, -range[2]),
-                            std::max(authored.mTwistMaxAngle, range[2]));
+                    const float twist = std::max(wanted ? range[2] : 0.0f, rollWanted ? forearmRoll : 0.0f);
+                    if ((wanted || rollWanted) && wrist)
+                        mRagdoll->setSwingTwistJointLimits(body,
+                            wanted ? std::max(authored.mNormalHalfConeAngle, range[0]) : authored.mNormalHalfConeAngle,
+                            wanted ? std::max(authored.mPlaneHalfConeAngle, range[1]) : authored.mPlaneHalfConeAngle,
+                            std::min(authored.mTwistMinAngle, -twist), std::max(authored.mTwistMaxAngle, twist));
                     else if (wanted)
                         mRagdoll->setSwingTwistJointLimits(body, std::max(authored.mNormalHalfConeAngle, range[3]),
                             std::max(authored.mPlaneHalfConeAngle, range[4]), authored.mTwistMinAngle,
@@ -22228,44 +21805,24 @@
                     arm.mTouching = arm.mTouching || floor || surface;
                 }
             }
-            // Anything but the feet near the floor is the first contact.
-            for (std::size_t i = 0; i < profile.mBodies.size() && i < mBodyRegions.size(); ++i)
+            // The contact radii through ragdollcore fallprotectpose: anything
+            // but the feet near the floor is the first contact (a knee down
+            // is no catch yet; OPENMW_RAGDOLL_FALL_PROTECT=2 counts the legs).
+            bool k2NonFoot = false, k2Body = false;
             {
-                using R = RagdollCore::AnatomicalRegion;
-                const R region = mBodyRegions[i];
-                if (region == R::Unknown || region == R::LeftFoot || region == R::RightFoot)
-                    continue;
-                // A knee down is no catch yet: the arms still brace the trunk
-                // (FALL-01 leg sweep: the knee touched 0.15 s in and the brace
-                // never ran). OPENMW_RAGDOLL_FALL_PROTECT=2 counts the legs too.
-                static const auto legContacts_tuned = RagdollCore::tuned<bool>([] {
+                static const auto legs_tuned = RagdollCore::tuned<bool>([] {
                     const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_FALL_PROTECT");
                     return text && std::atoi(text) == 2;
                 });
-                static const auto& legContacts = legContacts_tuned.get();
-                if (!legContacts
-                    && (region == R::LeftCalf || region == R::RightCalf || region == R::LeftThigh
-                        || region == R::RightThigh))
-                    continue;
-                const float radius = region == R::Head ? 9.0f
-                    : region == R::LeftHand || region == R::RightHand || region == R::LeftForearm
-                        || region == R::RightForearm ? 4.0f
-                    : region == R::LeftCalf || region == R::RightCalf || region == R::LeftUpperArm
-                        || region == R::RightUpperArm ? 5.0f
-                    : region == R::LeftThigh || region == R::RightThigh ? 6.0f : 10.0f;
-                if (static_cast<float>(now.mBodies[i].mCenterOfMass.GetZ()) - mFallProtectFloor < radius)
-                {
-                    static const auto contactTrace_tuned = RagdollCore::tuned<bool>([] { return RagdollCore::tuningText("OPENMW_RAGDOLL_FALL_TRACE") != nullptr; });
-                    static const auto& contactTrace = contactTrace_tuned.get();
-                    if (contactTrace && !input.mNonFootContact && mFallProtect.phase() != RagdollCore::FallPhase::Impact
-                        && mFallProtect.phase() != RagdollCore::FallPhase::Settled)
-                        Log(Debug::Info) << "RAGDOLL_FALL_CONTACT body=" << profile.mBodies[i].mName
-                                         << " z=" << now.mBodies[i].mCenterOfMass.GetZ() << " floor=" << mFallProtectFloor;
-                    input.mNonFootContact = true;
-                    if (region != R::LeftHand && region != R::RightHand && region != R::LeftForearm
-                        && region != R::RightForearm)
-                        input.mBodyContact = true;
-                }
+                for (std::size_t i = 0; i < profile.mBodies.size() && i < mBodyRegions.size(); ++i)
+                    if (const auto radius = RagdollCore::fallContactRadius(mBodyRegions[i], legs_tuned.get());
+                        radius && static_cast<float>(now.mBodies[i].mCenterOfMass.GetZ()) - mFallProtectFloor < *radius)
+                    {
+                        k2NonFoot = true;
+                        k2Body = k2Body || RagdollCore::fallBodyContact(mBodyRegions[i]);
+                    }
+                input.mNonFootContact = k2NonFoot;
+                input.mBodyContact = k2Body;
             }
             const MWWorld::Ptr ptr = getPtr();
             if (!ptr.isEmpty() && ptr.getClass().isActor())
@@ -22326,64 +21883,25 @@
                 stopFallProtect(profile);
                 return false;
             }
-            JPH::Vec3 modelForward = JPH::Vec3::sAxisY();
+            RagdollCore::FallPoseChains chains;
+            chains.mSpine = spine;
+            chains.mHead = *head;
+            chains.mNeck = neck;
+            for (std::size_t side = 0; side < 2; ++side)
             {
-                JPH::Vec3 across = target[arms[1]->mFrame].mTranslation - target[arms[0]->mFrame].mTranslation;
-                across.SetZ(0.0f);
-                if (!across.IsNearZero())
-                    modelForward = JPH::Vec3::sAxisZ().Cross(across.Normalized());
+                chains.mArms[side] = { arms[side]->mFrame, arms[side]->mShoulder, arms[side]->mElbow, arms[side]->mHand };
+                chains.mLegs[side] = { legs[side]->mHip, legs[side]->mKnee, legs[side]->mFoot };
             }
-            const JPH::Vec3 bend = JPH::Vec3::sAxisZ().Cross(modelForward);
-            const auto turn = [&](std::size_t index, const JPH::Quat& q, JPH::Vec3Arg pivot) {
-                auto& transform = target[index];
-                transform.mTranslation = pivot + q * (transform.mTranslation - pivot);
-                transform.mRotation = (q * transform.mRotation).Normalized();
-            };
-            const auto armPart = [&](std::size_t i) {
+            const auto armPartOf = [&](std::size_t i) {
                 for (const auto* arm : arms)
                     if (i == arm->mShoulder || i == arm->mElbow || i == arm->mHand)
                         return true;
                 return false;
             };
-            if (command.mSpineCurl != 0.0f)
-            {
-                const JPH::Quat full = JPH::Quat::sRotation(bend, command.mSpineCurl);
-                const JPH::Vec3 pivot = target[spine.front()].mTranslation;
-                for (std::size_t k = 0; k < spine.size(); ++k)
-                    turn(spine[k],
-                        JPH::Quat::sIdentity().SLERP(full, static_cast<float>(k + 1) / static_cast<float>(spine.size())),
-                        pivot);
-                for (std::size_t i = 0; i < target.size() && i < profile.mBodies.size(); ++i)
-                    if (i == *head || (neck && i == *neck) || armPart(i) || i == arms[0]->mFrame || i == arms[1]->mFrame)
-                        turn(i, full, pivot);
-            }
-            for (const auto* leg : legs)
-            {
-                if (command.mHipBend != 0.0f)
-                {
-                    const JPH::Quat q = JPH::Quat::sRotation(bend, -command.mHipBend);
-                    const JPH::Vec3 pivot = target[leg->mHip].mTranslation;
-                    for (const std::size_t index : { leg->mHip, leg->mKnee, leg->mFoot })
-                        turn(index, q, pivot);
-                }
-                if (command.mKneeBend != 0.0f)
-                {
-                    const JPH::Quat q = JPH::Quat::sRotation(bend, command.mKneeBend);
-                    const JPH::Vec3 pivot = target[leg->mKnee].mTranslation;
-                    for (const std::size_t index : { leg->mKnee, leg->mFoot })
-                        turn(index, q, pivot);
-                }
-            }
-            if (command.mHeadPitch != 0.0f && neck)
-                turn(*head, JPH::Quat::sRotation(bend, command.mHeadPitch), target[*neck].mTranslation);
-            // The arms toward the command's world direction, seen from the
-            // chest as it is now; the shoulder cone opened as for a swing.
-            const std::size_t chest = spine.back();
-            const JPH::Quat worldToModel = target[chest].mRotation * now.mBodies[chest].mRotation.Conjugated();
+            RagdollCore::applyFallProtectPose(target, command, chains, now.mBodies[spine.back()].mRotation);
             for (std::size_t side = 0; side < 2; ++side)
             {
-                const float weight = command.mArmWeight[side];
-                const bool open = weight > 0.0f;
+                const bool open = command.mArmWeight[side] > 0.0f;
                 if (open != mFallShoulderOpen[side])
                 {
                     if (open)
@@ -22394,19 +21912,6 @@
                     else
                         restoreFallShoulder(profile, side);
                 }
-                const RagdollCore::FallVec3& own = command.mArmDirections[side];
-                const JPH::Vec3 reach = worldToModel * JPH::Vec3(own.mX, own.mY, own.mZ);
-                const JPH::Vec3 axis = target[arms[side]->mElbow].mTranslation - target[arms[side]->mShoulder].mTranslation;
-                if (weight <= 0.0f || axis.IsNearZero())
-                    continue;
-                const JPH::Vec3 from = axis.Normalized();
-                const JPH::Vec3 blend = from * (1.0f - weight) + reach * weight;
-                if (blend.IsNearZero())
-                    continue;
-                const JPH::Quat q = JPH::Quat::sFromTo(from, blend.Normalized());
-                const JPH::Vec3 pivot = target[arms[side]->mShoulder].mTranslation;
-                for (const std::size_t index : { arms[side]->mShoulder, arms[side]->mElbow, arms[side]->mHand })
-                    turn(index, q, pivot);
             }
             // Springs: arms, legs and the rest by the command's stiffness.
             for (std::size_t i = 0; i < profile.mBodies.size() && i < mBodyRegions.size(); ++i)
@@ -22417,8 +21922,7 @@
                 const bool leg = i == legs[0]->mHip || i == legs[0]->mKnee || i == legs[0]->mFoot
                     || i == legs[1]->mHip || i == legs[1]->mKnee || i == legs[1]->mFoot;
                 const bool leftArm = i == arms[0]->mShoulder || i == arms[0]->mElbow || i == arms[0]->mHand;
-                const float scale = armPart(i) ? command.mArmStiffnesses[leftArm ? 0 : 1]
-                    : leg ? command.mLegStiffness : command.mUpperStiffness;
+                const float scale = RagdollCore::fallSpringScale(command, armPartOf(i), leftArm, leg);
                 // Jolt reads a zero frequency as a rigid spring: keep a floor.
                 mRagdoll->setMotorSpring(i, std::max(0.5f, motor.mFrequency * scale), motor.mDamping);
             }
@@ -22619,36 +22123,33 @@
 
         void updateBraceArms(const RagdollCore::ActiveControllerProfile& profile)
         {
-            const bool fallingEntry = mControllerOutput && mRagdoll && !mRagdoll->isRootKinematic()
-                && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Falling
-                && mControllerOutput->mTimeInMode <= 0.20f;
-            // Not while still Fallen: the press-up ran at full arm strength
-            // before the get-up clip started, threw the lying body up at
-            // 170-300 u/s and flipped it, back into Falling - the get-up
-            // retry loop (2026-09-24 N10, R5).
-            // OPENMW_RAGDOLL_FALLEN_BRACE=1 restores it.
+            // The decision through ragdollcore fallprotectpose. Not while still
+            // Fallen: the press-up ran at full arm strength before the get-up
+            // clip started, threw the lying body up at 170-300 u/s and flipped
+            // it, back into Falling - the get-up retry loop (2026-09-24 N10,
+            // R5). OPENMW_RAGDOLL_FALLEN_BRACE=1 restores it.
             static const auto fallenBrace_tuned = RagdollCore::tuned<bool>([] {
                 const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_FALLEN_BRACE");
                 return text && std::atoi(text) != 0;
             });
             static const auto& fallenBrace = fallenBrace_tuned.get();
-            const bool supportedRecovery = mSupportEstimate && mSupportEstimate->hasGroundContact()
-                && mControllerOutput
-                && (mControllerOutput->mMode == RagdollCore::ActiveControllerMode::GettingUp
-                    || (fallenBrace && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Fallen
-                        && mRecoveryRequested));
-            const bool wanted = profile.mBracingArms && mPowered && mCurrentPhysicsPoseCaptured
-                && mPelvisBodyIndex && (fallingEntry || supportedRecovery);
-            const bool protectiveFall = wanted
-                && mControllerOutput->mMode == RagdollCore::ActiveControllerMode::Falling;
-            JPH::Vec3 fallDirection = JPH::Vec3::sZero();
-            if (protectiveFall && mControllerInput)
+            RagdollCore::BraceInput in;
+            in.mEnabled = profile.mBracingArms && mPowered && mCurrentPhysicsPoseCaptured && mPelvisBodyIndex;
+            if (mControllerOutput)
             {
-                fallDirection = JPH::Vec3(mControllerInput->mCenterOfMassVelocity.GetX(),
-                    mControllerInput->mCenterOfMassVelocity.GetY(), 0.0f);
-                if (!fallDirection.IsNearZero())
-                    fallDirection = fallDirection.Normalized();
+                in.mMode = mControllerOutput->mMode;
+                in.mTimeInMode = mControllerOutput->mTimeInMode;
             }
+            in.mRootKinematic = !mRagdoll || mRagdoll->isRootKinematic();
+            in.mGroundContact = mSupportEstimate && mSupportEstimate->hasGroundContact();
+            in.mFallenBrace = fallenBrace;
+            in.mRecoveryRequested = mRecoveryRequested;
+            if (mControllerInput)
+                in.mCenterOfMassVelocity = mControllerInput->mCenterOfMassVelocity;
+            const RagdollCore::BraceDecision decision = RagdollCore::decideBraceArms(in);
+            const bool wanted = decision.mWanted;
+            const bool protectiveFall = decision.mProtectiveFall;
+            const JPH::Vec3 fallDirection = decision.mFallDirection;
             const auto pelvisWorld
                 = wanted ? mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, *mPelvisBodyIndex) : std::nullopt;
             const auto brace = [&](std::optional<RagdollArmRequest>& request,
@@ -22847,14 +22348,16 @@
         // point leads its feet by its speed, which is not a loss of balance.
         // Comfortable within half the stance plus 10 u of the feet's middle,
         // tipping 35 u beyond that.
-        std::array<float, 3> hudBalance() const
+        // The capture point's offset from the feet's middle (world, flat) and
+        // the feet's span.
+        std::optional<std::pair<JPH::Vec3, float>> balanceOffset() const
         {
             if (!mSituationKnown || !mRagdoll || !mLeftLeg || !mRightLeg || !mCurrentPhysicsPoseCaptured)
-                return { 0.0f, 0.0f, 0.0f };
+                return std::nullopt;
             const auto left = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mLeftLeg->mFoot);
             const auto right = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightLeg->mFoot);
             if (!left || !right)
-                return { 0.0f, 0.0f, 0.0f };
+                return std::nullopt;
             const JPH::RVec3 mid = (*left + *right) * 0.5;
             const float span = std::hypot(static_cast<float>(left->GetX() - right->GetX()),
                 static_cast<float>(left->GetY() - right->GetY()));
@@ -22863,8 +22366,51 @@
             JPH::Vec3 own(mSituationVelocity.GetX(), mSituationVelocity.GetY(), 0.0f);
             if (std::isfinite(mTargetHorizontalVelocity.GetX()) && std::isfinite(mTargetHorizontalVelocity.GetY()))
                 own -= JPH::Vec3(mTargetHorizontalVelocity.GetX(), mTargetHorizontalVelocity.GetY(), 0.0f);
-            const JPH::Vec3 off(static_cast<float>(mSituationCom.GetX() - mid.GetX()) + own.GetX() / omega,
-                static_cast<float>(mSituationCom.GetY() - mid.GetY()) + own.GetY() / omega, 0.0f);
+            return std::pair{ JPH::Vec3(static_cast<float>(mSituationCom.GetX() - mid.GetX()) + own.GetX() / omega,
+                                  static_cast<float>(mSituationCom.GetY() - mid.GetY()) + own.GetY() / omega, 0.0f),
+                span };
+        }
+        // HUD-02 weight cue (user B21, 11-03: "the direction towards which
+        // the weight is being shifted over, like the overall body vector, and
+        // be under the crosshair"): the same capture point offset, always
+        // (walking unscaled), in the actor's frame: { right u, forward u, the
+        // tipping edge u (half the stance + 45, where hudBalance reads 1) };
+        // all 0 in a jump or a real drop (the situation's airborne alone hid
+        // it between a walk's strides, 41 frames in 8 s).
+        std::array<float, 3> hudWeightShift() const
+        {
+            const auto balance = balanceOffset();
+            if (!balance || inRealDrop())
+                return { 0.0f, 0.0f, 0.0f };
+            const JPH::Vec3 forward = reactionForward();
+            const JPH::Vec3 rightward = forward.Cross(JPH::Vec3::sAxisZ());
+            return { balance->first.Dot(rightward), balance->first.Dot(forward), 0.5f * balance->second + 45.0f };
+        }
+        // K2_BALANCE_SIGIL: the stance as the balance sigil draws it
+        // (RagdollCore::balanceSigil); unknown in a jump or a real drop.
+        RagdollCore::BalanceSigil hudBalanceSigil() const
+        {
+            const auto balance = balanceOffset();
+            if (!balance || inRealDrop())
+                return {};
+            const auto left = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mLeftLeg->mFoot);
+            const auto right = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightLeg->mFoot);
+            if (!left || !right)
+                return {};
+            return RagdollCore::balanceSigil(*left, *right, mSituationCom, balance->first, reactionForward(),
+                mSupportEstimate && mSupportEstimate->mLeftFootSupported,
+                mSupportEstimate && mSupportEstimate->mRightFootSupported);
+        }
+        // The sigil's dazed sense: 1 while a blow's stun holds the body, 0.6
+        // through a stagger, else 0.
+        float hudDaze() const { return mHitStun.active() ? 1.0f : (mStaggerPlan.active() ? 0.6f : 0.0f); }
+        std::array<float, 3> hudBalance() const
+        {
+            const auto balance = balanceOffset();
+            if (!balance)
+                return { 0.0f, 0.0f, 0.0f };
+            const JPH::Vec3 off = balance->first;
+            const float span = balance->second;
             const float distance = off.Length();
             float tip = std::clamp((distance - (0.5f * span + 10.0f)) / 35.0f, 0.0f, 1.0f);
             // Walking on its own (no hit, no stagger), a stride carries the
@@ -22886,6 +22432,18 @@
         // by the physics system); the push itself lands when they arrive
         // (PhysicsSystem::shovePassiveRagdoll).
         float mShoveArms = 0.0f;
+        // OPENMW_RAGDOLL_K2_SHOVE_ARMS (registry): the weapon hand thrusts
+        // too, the arm guarding beside the weapon joins, and a shove at
+        // nobody still throws the arms out (mShoveAhead: its facing).
+        static bool shoveArmsSetting()
+        {
+            static const auto on_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_SHOVE_ARMS");
+                return text && std::atof(text) > 0.0;
+            });
+            return on_tuned.get();
+        }
+        std::optional<JPH::Vec3> mShoveAhead;
         float mShoveCooldown = 0.0f;
         const void* mShoveTarget = nullptr;
         std::optional<std::pair<JPH::RVec3, JPH::Vec3>> mShoveAt;
@@ -22938,9 +22496,15 @@
                 };
                 // A held arm (the wheel, a guard, a protective fall's brace)
                 // keeps its job.
-                const bool busy = mArmOwner[side] == ArmOwner::HandControl || mArmOwner[side] == ArmOwner::Guard
+                // (K2_SHOVE_ARMS: a shove takes the arm guarding beside the
+                // weapon - the double click's first click raised that guard.)
+                const bool busy = mArmOwner[side] == ArmOwner::HandControl
+                    || (mArmOwner[side] == ArmOwner::Guard && !(shoving && shoveArmsSetting()))
                     || mArmOwner[side] == ArmOwner::Tip || mArmOwner[side] == ArmOwner::Support
                     || (request && request->mBrace && !mSupportReaching[side]);
+                if (shoving && busy && RagdollCore::tuningText("OPENMW_RAGDOLL_HSC_TRACE"))
+                    Log(Debug::Info) << "RAGDOLL_K2_SHOVE_ARMS busy actor=" << getPtr().getCellRef().getRefId()
+                                     << " side=" << side << " owner=" << armOwnerName(mArmOwner[side]);
                 if (!want || busy || !arm || !pelvisWorld)
                 {
                     release();
@@ -23431,6 +22995,29 @@
         // JUMP-01 x2 knee bend in the air 51-53 -> 74-77 deg (high jump),
         // failures 4,4 -> 3,3.
         float mJumpAirTime = 0.0f;
+        // JUMP_POSE (user B17, 11-03: "we just need better jump animations";
+        // the even tuck folded both shins back under straight thighs, a
+        // kneeling doll in the air): the tuck folds at the hips instead -
+        // each foot goes toward a point `fwd` of the leg in front of its hip
+        // and `drop` of it below (knees up and forward, as ACRO-01's roll
+        // tuck). A jump that travels forward (60 u/s or more, within 60 deg
+        // of the facing) leaps: the leg whose foot was ahead goes `lead` of
+        // the leg further along the travel, the other stays long behind,
+        // `trail` of the leg back and nearly straight. Both fade with the
+        // tuck (the fall, the landing reach), so the feet come under the body
+        // to land. OPENMW_RAGDOLL_JUMP_POSE = "fwd, drop, lead, trail"
+        // (unset = off: the old tuck).
+        static const std::array<float, 4>& jumpPoseSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 4>>([] {
+                std::array<float, 4> v{ 0.0f, 0.0f, 0.0f, 0.0f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_JUMP_POSE"))
+                    std::sscanf(text, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]);
+                return v;
+            });
+            return value_tuned.get();
+        }
+        int mJumpLeadLeg = -1; // 0 left, 1 right; -1 none yet this jump
         // PGC-03 C8, the legs reach for the ground: in the last `window`
         // seconds before the situation's predicted touchdown the jump tuck
         // lets go (it otherwise only fades with the fall speed, so a low jump
@@ -23543,6 +23130,8 @@
             if (entryTrace && (mSoftRootJumpWindow > 0.0f || mJumpAirborne))
                 Log(Debug::Info) << "RAGDOLL_TUCK_ENTRY airborne=" << mJumpAirborne << " window=" << mSoftRootJumpWindow;
             mJumpAirTime = airborne ? mJumpAirTime + dt : 0.0f;
+            if (!airborne)
+                mJumpLeadLeg = -1;
             if (!(tuck > 0.0f) || !airborne || !mRagdoll || !mLeftLeg || !mRightLeg || getPtr().isEmpty())
                 return;
             // In over 0.15 s; out as the fall passes 100 units/s, gone by 400.
@@ -23579,8 +23168,29 @@
             }
             if (!forward || !up || forward->IsNearZero() || up->IsNearZero())
                 return;
-            for (const RagdollLegChain* leg : { &*mLeftLeg, &*mRightLeg })
+            // JUMP_POSE: the hip fold, and the leap of a jump that travels.
+            const auto& pose = jumpPoseSettings();
+            const bool hipFold = !rolling && pose[1] > 0.0f;
+            std::optional<JPH::Vec3> travel;
+            if (hipFold)
             {
+                const JPH::Vec3 flat(mSituationVelocity.GetX(), mSituationVelocity.GetY(), 0.0f);
+                const float speed = flat.Length();
+                if (speed >= 60.0f)
+                    if (const auto way = mRagdoll->getModelVector(flat / speed);
+                        way && !way->IsNearZero() && way->Normalized().Dot(forward->Normalized()) >= 0.5f)
+                        travel = way->Normalized();
+                if (travel && mJumpLeadLeg < 0 && mLeftLeg->mFoot < drive.mBodyTransforms.size()
+                    && mRightLeg->mFoot < drive.mBodyTransforms.size())
+                    mJumpLeadLeg = drive.mBodyTransforms[mRightLeg->mFoot].mTranslation.Dot(*travel)
+                            >= drive.mBodyTransforms[mLeftLeg->mFoot].mTranslation.Dot(*travel)
+                        ? 1
+                        : 0;
+            }
+            const std::array<const RagdollLegChain*, 2> legs{ &*mLeftLeg, &*mRightLeg };
+            for (std::size_t side = 0; side < legs.size(); ++side)
+            {
+                const RagdollLegChain* leg = legs[side];
                 if (std::max({ leg->mHip, leg->mKnee, leg->mFoot }) >= drive.mBodyTransforms.size())
                     continue;
                 const auto geometry = mRagdoll->getHingeLegGeometry(leg->mHip, leg->mKnee, leg->mFoot);
@@ -23592,16 +23202,195 @@
                 input.mKneeBodyIndex = leg->mKnee;
                 input.mFootBodyIndex = leg->mFoot;
                 const JPH::Vec3 foot = drive.mBodyTransforms[leg->mFoot].mTranslation;
-                input.mTargetFootPosition = acroTuck
-                    ? foot + (drive.mBodyTransforms[leg->mHip].mTranslation
-                                 + forward->Normalized() * (acro.mTuckForward * reach)
-                                 - up->Normalized() * (tuckDrop * reach) - foot)
-                        * weight
-                    : foot + up->Normalized() * (share * reach * weight) + forward->Normalized() * (0.1f * reach * weight);
+                if (hipFold)
+                {
+                    const JPH::Vec3 hip = drive.mBodyTransforms[leg->mHip].mTranslation;
+                    JPH::Vec3 point = hip + forward->Normalized() * (pose[0] * reach) - up->Normalized() * (pose[1] * reach);
+                    if (travel && static_cast<int>(side) == mJumpLeadLeg)
+                        point += *travel * (pose[2] * reach);
+                    else if (travel)
+                        point = hip - *travel * (pose[3] * reach) - up->Normalized() * (0.85f * reach);
+                    input.mTargetFootPosition = foot + (point - foot) * weight;
+                }
+                else
+                    input.mTargetFootPosition = acroTuck
+                        ? foot + (drive.mBodyTransforms[leg->mHip].mTranslation
+                                     + forward->Normalized() * (acro.mTuckForward * reach)
+                                     - up->Normalized() * (tuckDrop * reach) - foot)
+                            * weight
+                        : foot + up->Normalized() * (share * reach * weight)
+                            + forward->Normalized() * (0.1f * reach * weight);
                 input.mPreferredBendDirection = forward->Normalized();
                 input.mHingeGeometry = geometry;
                 RagdollCore::applyTwoBoneLegTarget(std::span<RagdollCore::Transform>(drive.mBodyTransforms), input);
             }
+        }
+        // KICK-01 (user 11-03 bookmark 13: "lets make mouse button click to be
+        // a kick :) with good pushback"; the middle button, user 11-03). The
+        // kicking leg (the right; the left when the right is the one standing
+        // under the body) is drawn up, driven out at the target's middle and
+        // drawn back, over the pose Footfall wrote - nothing else of the
+        // stepping changes, and only while a kick runs. Its hip and knee
+        // springs are `stiffness` x Footfall's during the kick, and the leg's
+        // muscles pull the foot to the same points (`drive` Hz, a spring on
+        // the foot and shin with the pelvis pushed the other way, so the body's
+        // momentum is unchanged; KICK-01: with the pose alone the foot rose
+        // 18 u and never reached a body 62 u away). The blow lands when the
+        // foot touches the target (PhysicsSystem::stepKicks).
+        // OPENMW_RAGDOLL_KICK = "on, reach u, cone deg, chamber s, strike s,
+        // recover s, push u/s, push kg, cooldown s, fatigue x attack,
+        // stiffness, drive Hz" (off in the code; on 0 = the middle button is
+        // Physical thrust again).
+        struct KickSettings
+        {
+            bool mOn = false;
+            float mReach = 90.0f, mCone = 45.0f, mChamber = 0.14f, mStrike = 0.16f, mRecover = 0.3f;
+            float mSpeed = 240.0f, mMass = 14.0f, mCooldown = 0.9f, mFatigue = 3.0f, mStiffness = 1.6f;
+            float mDrive = 6.0f;
+        };
+        static const KickSettings& kickSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<KickSettings>([] {
+                KickSettings v;
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_KICK"))
+                {
+                    float on = 1.0f;
+                    std::sscanf(text, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", &on, &v.mReach, &v.mCone,
+                        &v.mChamber, &v.mStrike, &v.mRecover, &v.mSpeed, &v.mMass, &v.mCooldown, &v.mFatigue,
+                        &v.mStiffness, &v.mDrive);
+                    v.mOn = on > 0.0f;
+                    v.mChamber = std::max(0.02f, v.mChamber);
+                    v.mStrike = std::max(0.02f, v.mStrike);
+                    v.mRecover = std::max(0.02f, v.mRecover);
+                }
+                return v;
+            });
+            return value_tuned.get();
+        }
+        float mKickTime = -1.0f; // s into the kick; < 0 none
+        float mKickCooldown = 0.0f;
+        bool mKickRight = true;
+        bool mKickLanded = false;
+        bool mKickSprings = false; // the kick leg's springs are raised
+        const void* mKickTarget = nullptr; // LiveCellRefBase of the target, or none
+        std::optional<JPH::RVec3> mKickAim; // world point the foot drives at
+        float mKickFootSpeed = 0.0f; // the foot's peak speed in the strike (u/s)
+        unsigned mKickCount = 0, mKickHitCount = 0;
+        bool kicking() const { return mKickTime >= 0.0f; }
+        bool kickStriking() const
+        {
+            const auto& k = kickSettings();
+            return mKickTime >= k.mChamber * 0.6f && mKickTime <= k.mChamber + k.mStrike + 0.05f;
+        }
+        const RagdollLegChain* kickLeg() const
+        {
+            const auto& leg = mKickRight ? mRightLeg : mLeftLeg;
+            return leg ? &*leg : nullptr;
+        }
+        // Back to Footfall's springs (as applyFootfallLibrarySprings sets them).
+        void restoreKickSprings()
+        {
+            if (!mKickSprings || !mRagdoll || !mRuntimeProfile)
+                return;
+            mKickSprings = false;
+            const RagdollLegChain* leg = kickLeg();
+            if (!leg)
+                return;
+            const auto& springs = mFootfallLibrarySprings[mKickRight ? 1 : 0];
+            for (const std::size_t body : { leg->mHip, leg->mKnee })
+                if (body < mRuntimeProfile->mBodies.size() && mRuntimeProfile->mBodies[body].mConstraint)
+                {
+                    const auto& motor = mRuntimeProfile->mBodies[body].mConstraint->mMotor;
+                    const float give = body == leg->mKnee ? springs.mKneeGive : 1.0f;
+                    mRagdoll->setMotorSpring(
+                        body, motor.mFrequency * springs.mStiffness * give, motor.mDamping * springs.mDamping);
+                }
+        }
+        void endKick()
+        {
+            restoreKickSprings();
+            mKickTime = -1.0f;
+            mKickAim.reset();
+            mKickTarget = nullptr;
+        }
+        // The leg's pose for the kick's time (PhysicsSystem::stepKicks keeps
+        // the time and ends it).
+        void applyKickLeg(RagdollCore::RagdollPose& drive)
+        {
+            if (!kicking())
+                return;
+            const auto& k = kickSettings();
+            const RagdollLegChain* leg = kickLeg();
+            if (!leg || !mRagdoll || getPtr().isEmpty()
+                || std::max({ leg->mHip, leg->mKnee, leg->mFoot }) >= drive.mBodyTransforms.size())
+                return;
+            const auto geometry = mRagdoll->getHingeLegGeometry(leg->mHip, leg->mKnee, leg->mFoot);
+            const float yaw = getPtr().getRefData().getPosition().rot[2];
+            const auto forward = mRagdoll->getModelVector(JPH::Vec3(std::sin(yaw), std::cos(yaw), 0.0f));
+            const auto up = mRagdoll->getModelVector(JPH::Vec3::sAxisZ());
+            if (!geometry || !forward || !up || forward->IsNearZero() || up->IsNearZero())
+                return;
+            const JPH::Vec3 fwd = forward->Normalized();
+            const JPH::Vec3 upward = up->Normalized();
+            const float reach = geometry->mUpperOffset.Length() + geometry->mLowerOffset.Length();
+            const JPH::Vec3 hip = drive.mBodyTransforms[leg->mHip].mTranslation;
+            const JPH::Vec3 footNow = drive.mBodyTransforms[leg->mFoot].mTranslation;
+            // The knee up and forward, the foot under it.
+            const JPH::Vec3 chamber = hip + fwd * (0.35f * reach) - upward * (0.5f * reach);
+            // Out at the aim (its middle), or straight ahead at hip height
+            // with nobody there; never past the straight leg.
+            JPH::Vec3 strike = hip + fwd * (0.95f * reach) - upward * (0.3f * reach);
+            if (mKickAim)
+                if (const auto aim = mRagdoll->getModelPosition(*mKickAim))
+                {
+                    JPH::Vec3 out = *aim - hip;
+                    const float length = out.Length();
+                    if (length > 1e-3f)
+                        strike = hip + out * (std::min(length, 0.98f * reach) / length);
+                }
+            JPH::Vec3 target;
+            float weight;
+            if (mKickTime < k.mChamber)
+            {
+                const float s = mKickTime / k.mChamber;
+                weight = std::min(1.0f, s * 1.5f);
+                target = footNow + (chamber - footNow) * s;
+            }
+            else if (mKickTime < k.mChamber + k.mStrike)
+            {
+                const float s = (mKickTime - k.mChamber) / k.mStrike;
+                weight = 1.0f;
+                target = chamber + (strike - chamber) * std::min(1.0f, s * 1.6f);
+            }
+            else
+            {
+                const float s = (mKickTime - k.mChamber - k.mStrike) / k.mRecover;
+                weight = 1.0f - s;
+                target = strike + (chamber - strike) * std::min(1.0f, s * 2.0f);
+            }
+            RagdollCore::TwoBoneLegTargetInput input;
+            input.mHipBodyIndex = leg->mHip;
+            input.mKneeBodyIndex = leg->mKnee;
+            input.mFootBodyIndex = leg->mFoot;
+            input.mTargetFootPosition = footNow + (target - footNow) * weight;
+            input.mPreferredBendDirection = fwd;
+            input.mHingeGeometry = geometry;
+            RagdollCore::applyTwoBoneLegTarget(std::span<RagdollCore::Transform>(drive.mBodyTransforms), input);
+            // A snappier leg while it kicks.
+            if (k.mStiffness != 1.0f && mRuntimeProfile && mKickTime < k.mChamber + k.mStrike)
+            {
+                const auto& springs = mFootfallLibrarySprings[mKickRight ? 1 : 0];
+                for (const std::size_t body : { leg->mHip, leg->mKnee })
+                    if (body < mRuntimeProfile->mBodies.size() && mRuntimeProfile->mBodies[body].mConstraint)
+                    {
+                        const auto& motor = mRuntimeProfile->mBodies[body].mConstraint->mMotor;
+                        mRagdoll->setMotorSpring(body, motor.mFrequency * springs.mStiffness * k.mStiffness,
+                            motor.mDamping * springs.mDamping);
+                    }
+                mKickSprings = true;
+            }
+            else
+                restoreKickSprings();
         }
         void applyGetUpLunge(RagdollCore::RagdollPose& drive)
         {
@@ -23892,6 +23681,63 @@
             const auto forward = mRagdoll->getModelVector(frame.mForward);
             if (!up || !right || !forward)
                 return;
+            // K2_FIST_STANCE: the player's fists keep their stance on the
+            // move - the shoulders' line of the clip's pose is turned to the
+            // stance's and its side tilt taken out, before the punch's own turn.
+            {
+                const bool stance = halfSword && hscStriker().mFist && getPtr() == MWMechanics::getPlayer()
+                    && (k2FistStance()[1] > 0.0f || k2FistStance()[2] > 0.0f) && mLeftArm && mRightArm
+                    && mLeftArm->mShoulder < pose.mBodyTransforms.size()
+                    && mRightArm->mShoulder < pose.mBodyTransforms.size();
+                mFistStanceBlend = stance ? std::min(1.0f, mFistStanceBlend + mArmStepDuration / 0.3f) : 0.0f;
+                if (!stance)
+                    mFistStanceTrim = 0.0f;
+                if (stance)
+                {
+                    const JPH::Vec3 line = pose.mBodyTransforms[mRightArm->mShoulder].mTranslation
+                        - pose.mBodyTransforms[mLeftArm->mShoulder].mTranslation;
+                    const float across = line.Dot(right->Normalized()), along = line.Dot(forward->Normalized());
+                    const float flat = std::hypot(across, along);
+                    if (flat > 1e-3f && std::isfinite(flat))
+                    {
+                        const float blend = mFistStanceBlend * mFistStanceBlend * (3.0f - 2.0f * mFistStanceBlend);
+                        // (a turn to the right takes the right shoulder back: the line's angle falls)
+                        // The body's own line trims it: 3/s of what is left,
+                        // held through a punch (which turns the chest itself).
+                        if (mFistStanceStep != mCurrentContactPhysicsStep && mCurrentPhysicsPoseCaptured)
+                        {
+                            mFistStanceStep = mCurrentContactPhysicsStep;
+                            const auto l = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mLeftArm->mShoulder);
+                            const auto r = mRagdoll->getWorldBodyPosition(mCurrentPhysicsPose, mRightArm->mShoulder);
+                            const bool punching = mWheel.stage() == RagdollCore::WheelStage::Wind
+                                || mWheel.stage() == RagdollCore::WheelStage::Cut || mLeftFistTime >= 0.0f
+                                || mGuardActive || mFistHeldNow; // (a charge coils the chest too)
+                            if (l && r && !punching)
+                            {
+                                const JPH::Vec3 real(*r - *l);
+                                const float realAcross = real.Dot(frame.mRight), realAlong = real.Dot(frame.mForward);
+                                if (std::hypot(realAcross, realAlong) > 1e-3f)
+                                {
+                                    float left = std::atan2(realAlong, realAcross)
+                                        - osg::DegreesToRadians(k2FistStance()[0]);
+                                    left = std::atan2(std::sin(left), std::cos(left));
+                                    if (std::isfinite(left))
+                                        mFistStanceTrim = std::clamp(
+                                            mFistStanceTrim + 3.0f * left * mArmStepDuration, -1.0f, 1.0f);
+                                }
+                            }
+                        }
+                        const float turn = (std::clamp(
+                            std::atan2(along, across) - osg::DegreesToRadians(k2FistStance()[0]), -1.2f, 1.2f)
+                            + mFistStanceTrim)
+                            * k2FistStance()[1] * blend;
+                        bodyTwist += turn;
+                        leadTwist += turn;
+                        const float tilt = std::clamp(std::atan2(line.Dot(up->Normalized()), flat), -0.4f, 0.4f);
+                        bodyRoll -= tilt * k2FistStance()[2] * blend;
+                    }
+                }
+            }
             const auto turned = [&](float twist) {
                 return (JPH::Quat::sRotation(up->Normalized(), -twist)
                     * JPH::Quat::sRotation(right->Normalized(), bodyLean)
@@ -24218,6 +24064,18 @@
                     input.mRollContinuityWeight = sArmRollContinuityWeight;
                     input.mTwistContinuityWeight = sArmTwistContinuityWeight;
                     input.mMaximumElbowStep = 250.0f * mArmStepDuration;
+                    // With continuity and only the tie-break pole, the free
+                    // elbow stayed wherever a step had put it: tucked across
+                    // the chest beside a one-handed weapon (user 11-03 bookmark
+                    // 2, "the elbow is pointing too much inside"; that session's
+                    // commands held it a median 6-9 units inside the left
+                    // shoulder with a dagger or longsword, the clip 8 outside).
+                    // The pole now pulls it back out as on the released weapon
+                    // arm. OPENMW_RAGDOLL_FREE_ARM_BEND = weight (1; 0 = the
+                    // tie-break only).
+                    static const auto freeArmBend_tuned = RagdollCore::tuned<float>([] { return weaponDriveSetting("OPENMW_RAGDOLL_FREE_ARM_BEND", sArmReleasedBendWeight); });
+                    if (freeArmBend_tuned.get() > 0.0f)
+                        input.mBendPreferenceWeight = std::max(input.mBendPreferenceWeight, freeArmBend_tuned.get());
                 }
                 if (!request->mBrace && mSwing.mSwinging && RagdollCore::tuningText("OPENMW_RAGDOLL_ARM_WORKSPACE"))
                     input.mPreservedPositionAxis = mRagdoll->getModelVector(mSwingBasisForward);
@@ -24277,6 +24135,8 @@
                     });
                     static const auto& elbowSpeed = elbowSpeed_tuned.get();
                     input.mMaximumElbowStep = elbowSpeed * mArmStepDuration;
+                    if (mHscActive && &arm == &mRightArm && mK2CutElbowSpeed > elbowSpeed)
+                        input.mMaximumElbowStep = mK2CutElbowSpeed * mArmStepDuration;
                     // The chamber path gives the elbow with every point (a
                     // key pole, splined), so the arm needs no memory of where
                     // its elbow was: continuity to the measured forearm kept
@@ -24778,15 +24638,8 @@
         };
         std::vector<BloodBurst> mPendingBlood;
         std::vector<Bleed> mBleeds;
-        std::uint64_t mNpcFeintDecided = 0; // the swing an NPC feint was drawn for (C3)
-        bool mNpcFeinting = false, mNpcFeintedLast = false;
         std::uint64_t mFeintCount = 0; // diagnostics
         std::optional<JPH::RVec3> mGuardThreatLatch; // an NPC block's held line (C3)
-        std::optional<JPH::RVec3> mNpcSteadyHand; // the steady NPC guard's world hand (NPC_STEADY)
-        std::optional<JPH::Vec3> mNpcSteadyLocal; // NPC_STEADY_ROOT: the held hand in the actor frame
-        JPH::Quat mNpcSteadyTurn = JPH::Quat::sIdentity();
-        std::optional<JPH::Vec3> mSteadyPrevTip;
-        float mSteadyClock = 0.0f, mSteadySum = 0.0f, mSteadyOver = 0.0f, mSteadyCount = 0.0f;
         RagdollCore::ContactDamageTracker mContactDamage{ contactWorkProfileFromEnvironment() };
         // WPN-07: one counted hit per target per cooldown window. Sits on top
         // of the swing/contact aggregation so a blow that keeps touching cannot

@@ -61,8 +61,13 @@ for /f %%t in ('powershell -NoProfile -Command "[DateTime]::UtcNow.ToString('yyy
 set "RECORDING=%RECORDINGS%\runtime-GAME-manual-playthrough-%STAMP%"
 set "OPENMW_MANUAL_DIAGNOSTICS=%RECORDING%\manual-recording"
 set OPENMW_RAGDOLL_FOOTFALL_TRACE=1
+set OPENMW_RAGDOLL_CORPSE_TRACE=1
 set OPENMW_RAGDOLL_DAMAGE_TRACE=1
 set OPENMW_RAGDOLL_SWING_TRACE=1
+rem The hub's traces too (Run-Game-MotionBricks.cmd): arms, blows, the held fists.
+set OPENMW_RAGDOLL_ARM_TRACE=1
+set OPENMW_RAGDOLL_K2_BLOW_TRACE=1
+set OPENMW_RAGDOLL_HSC_TRACE=1
 echo Recording: %RECORDING%
 echo B bookmarks a moment and opens a note box.
 :play

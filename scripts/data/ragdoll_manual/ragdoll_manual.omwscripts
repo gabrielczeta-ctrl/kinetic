@@ -5,3 +5,4 @@ PLAYER: ragdoll_manual_player.lua
 MENU: kinetic_settings_menu.lua
 PLAYER: kinetic_settings.lua
 GLOBAL: kinetic_stranded.lua
+PLAYER: kinetic_ammo.lua

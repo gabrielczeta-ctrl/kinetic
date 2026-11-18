@@ -332,6 +332,27 @@ namespace RagdollCore
             part.mObjectLayer = options.mObjectLayer;
             part.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
             part.mMassPropertiesOverride.mMass = options.mTotalMass * body.mMassFraction;
+            if (body.mShape.mType == ShapeType::ConvexHull && body.mShape.mBoundsInertia)
+            {
+                JPH::MassProperties box;
+                box.SetMassAndInertiaOfSolidBox(shape->GetLocalBounds().GetSize(), 1.0f);
+                box.ScaleToMass(part.mMassPropertiesOverride.mMass);
+                if (body.mShape.mRollInertiaFloor > 0.0f)
+                {
+                    // The long axis is the box's longest side.
+                    const JPH::Vec3 size = shape->GetLocalBounds().GetSize();
+                    const int along = size.GetX() > size.GetY() ? (size.GetX() > size.GetZ() ? 0 : 2)
+                                                                : (size.GetY() > size.GetZ() ? 1 : 2);
+                    float cross = 0.0f;
+                    for (int axis = 0; axis < 3; ++axis)
+                        if (axis != along)
+                            cross += 0.5f * box.mInertia(axis, axis);
+                    box.mInertia(along, along)
+                        = std::max(box.mInertia(along, along), body.mShape.mRollInertiaFloor * cross);
+                }
+                part.mOverrideMassProperties = JPH::EOverrideMassProperties::MassAndInertiaProvided;
+                part.mMassPropertiesOverride = box;
+            }
             part.mLinearDamping = body.mMaterial.mLinearDamping;
             part.mAngularDamping = body.mMaterial.mAngularDamping;
             part.mMaxLinearVelocity = UnitModel::fromMeters(500.0f);

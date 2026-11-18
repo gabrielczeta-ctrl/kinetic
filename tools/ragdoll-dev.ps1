@@ -379,7 +379,7 @@ function Invoke-Build {
     }
     else {
         @('--target', 'openmw', 'components-tests', 'ragdollcore-tests', 'openmw-tests', 'openmw-navmeshtool',
-            'openmw-physicsobjecttool', 'openmw-iniimporter', 'ragdollcore-walksearch')
+            'openmw-physicsobjecttool', 'openmw-iniimporter')
     }
     # Incremental .ilk caches exhausted this workspace during repeated live links.
     $arguments = @('--build', $buildRoot, '--config', $configuration, '--parallel', $Jobs) + $targets `
@@ -583,8 +583,10 @@ function Invoke-Run {
         # Keep the manual trace cadence comparable with the automated real-data
         # gate and independent of a developer's inherited environment.
         $env:OPENMW_PHYSICS_FPS = '60'
-        # I.RagdollDev.recordWalk / recordPath persist their capture here so a
-        # fall seen in play can be replayed offline (walksearch --replay-capture).
+        # The hub's scripts power the player themselves; the engine's own
+        # player powering (a play default, for the package) stays off here.
+        if (-not $env:OPENMW_RAGDOLL_POWER_PLAYER) { $env:OPENMW_RAGDOLL_POWER_PLAYER = '0' }
+        # I.RagdollDev.recordWalk / recordPath persist their capture here.
         $manualReplays = Join-Path $runtimeRoot 'manual-replays'
         New-Item -ItemType Directory -Force -Path $manualReplays | Out-Null
         $env:OPENMW_RAGDOLL_REPLAY_OUTPUT_DIR = $manualReplays

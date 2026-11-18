@@ -39,7 +39,13 @@ namespace RagdollCore
         std::array<float, 4> mReference{ 0.55f, 1.0f, 0.0f, 0.0f };
         // _CUSHION = pelvis dip (units), duration (s), knee softness (0-0.9).
         std::array<float, 3> mCushion{ 0.0f, 0.2f, 0.0f };
-        // _TURN = gain, cap (units).
+        // _TURN = gain, cap (units). 0.25, 30 in play since 11-03 (MOVE-01
+        // W6: a strafing circle round a foe at a run, the game's warhammer
+        // "bump opponent run circle" x2: the legs carry 0.65-0.67 of the
+        // weight against 0.41, the root 0.35-0.36 up against 0.60, slip
+        // 9.7-11.2 u/s against 11-66; offline the matched StrideSim's
+        // running circle 112 -> 55 u/s. The straight course and the turn,
+        // stop, reversal and stairs cases unchanged).
         std::array<float, 2> mTurn{ 1.0f, 30.0f };
         // Anchor settle (standing): offset from the drive pelvis that starts
         // a step, and how far toward it the step lands (units; 0 = off). The
@@ -96,12 +102,11 @@ namespace RagdollCore
         std::array<float, 2> mExtendIntegral{ 2.0f, 10.0f };
         // _LEAN = walk, run lean (degrees).
         std::array<float, 2> mLean{ 3.0f, 10.0f };
-        float mLateralTime = 0.6f;       // _LATERAL_TIME
+        float mLateralTime = 0.6f;       // the swing time moving sideways
         // Backward travel: swing time scale when moving straight back (user
         // 2026-09-30 "running back makes the legs start dragging"; in play
         // both feet stood 31% of the time running back armed, 6% forward).
         float mBackTime = 1.0f;          // _BACK_TIME (1 = off)
-        float mClipSync = 1.0f;          // _CLIP_SYNC
         float mMoveWidth = 6.0f;         // _MOVE_WIDTH
         bool mClipWidthMoving = true;    // _CLIP_WIDTH
         bool mLeadScale = true;          // _LEAD_SCALE
@@ -118,6 +123,18 @@ namespace RagdollCore
         float mPathMatch = 12.0f;        // _PATH_MATCH
         float mRunPathMatch = 30.0f;     // _RUN_PATH_MATCH
         float mOverrunRun = 2.0f;        // _OVERRUN_RUN
+        // _DRAG_LIFT (MOVE-01 W4, the feet dragging behind): walking, a
+        // planted foot whose contacts slip faster than `speed` u/s for
+        // `seconds` lifts once the other foot is down - the trailing foot
+        // dragged before it lifted (offline 50 u/s in its last frames).
+        // Needs FootfallInput::mFootSlip; speed 0 = off.
+        std::array<float, 2> mDragLift{ 0.0f, 0.05f };
+        // _AIR_HOLD (MOVE-01 W4, the rhythm): past its phase end, a swing still
+        // more than 4 units over its target keeps swinging up to this long (s).
+        // A landing that ran on delayed the other foot's lift; the body passed
+        // the trailing foot and a third to a half of the walking lifts were
+        // emergency overruns. Without _CONTACT_LAND.
+        float mAirHold = 0.2f;
         float mFirstStep = 0.7f;         // _FIRST_STEP
         // Landing taper: the reference run lift curves hold the foot ~0.03 leg
         // lengths up from 60% to 85% of the swing (the Mixamo foot reaching
@@ -205,9 +222,72 @@ namespace RagdollCore
         // past `earliest` of its phase whose foot touches supporting ground and
         // no longer closes on its target lands there; without contact a swing
         // may run up to `extra` seconds past its phase end (was a fixed 0.2 s
-        // while the foot was 4 u up). _CONTACT_LAND = "earliest, extra s"
-        // (earliest 0 = off: land by time). Needs FootfallInput::mFootContact.
-        std::array<float, 2> mContactLand{ 0.0f, 0.2f };
+        // while the foot was 4 u up). _CONTACT_LAND = "earliest, extra s,
+        // travel share" (earliest 0 = off: land by time). Travel share
+        // (MOVE-01 S3): contact lands the swing only once the foot has covered
+        // that share of its pin-to-target distance (0 = by phase alone; with
+        // phase alone a walking foot that grazed the floor from half way landed
+        // early, and the walk took 35 steps of ~29 u where it took 14 of ~72).
+        // Needs FootfallInput::mFootContact.
+        std::array<float, 3> mContactLand{ 0.0f, 0.2f, 0.0f };
+        // Stride's turn (KINETIC-2 phase 2, MOVE-01 4.7, OPENMW_RAGDOLL_K2_STRIDE_TURN
+        // = "units, seconds"): a swing whose landing the no-cross guard holds
+        // back by more than `units` (the body now travels across the other
+        // foot: a walk turned into a strafe) lands within `seconds`, so the
+        // foot on the side of travel steps next; 0 = off.
+        std::array<float, 2> mTurnCut{ 0.0f, 0.12f };
+        // The turn step (OPENMW_RAGDOLL_K2_TURN_STEP = "lift units, window s,
+        // least swing s"): a direction change is the command over 30 u/s
+        // pointing more than 30 deg off where it pointed a moment ago (a 0.1 s
+        // lag), or leaving rest. For `window` seconds after one, under 300
+        // u/s, a gait swing that starts lifts at least a `lift`-high arc and
+        // lasts at least `least`; a swing in its first half takes the arc
+        // too (it rises over 0.08 s); and Stride's turn may not cut a swing
+        // shorter than `least` in all. Lift 0 = off.
+        std::array<float, 3> mTurnStep{ 0.0f, 0.3f, 0.3f };
+        // Stride's lead foot (MOVE-01 4.7, OPENMW_RAGDOLL_K2_STRIDE_LEAD_FIRST =
+        // "sideways share, spread units"): travelling mostly sideways (the
+        // share of the command across the facing over `share`) with both feet
+        // down, a lift due to the trailing foot goes to the foot on the side
+        // of travel instead, unless that foot already stands `spread` units
+        // further along the travel (the game's walking strafe: the trailing
+        // foot stepped first, held beside the other by the no-cross guard, and
+        // the lead foot's late 89 u step dragged while the body fell); 0 = off.
+        std::array<float, 2> mLeadFirst{ 0.0f, 25.0f };
+        // A sideways step's climb (OPENMW_RAGDOLL_K2_STRIDE_SIDE_RISE = "rise
+        // units, sideways share, lock"): travelling more sideways than `share`, a
+        // landing more than `rise` above or below the other foot's ground comes
+        // back toward that foot, a tread at a time, until it is not (the whole
+        // foot on its tread) and is within two rises of its own take-off,
+        // never closer than the feet's gap (11-07 trace,
+        // strafing up stairs: the lead foot aimed 33-48 u up, two or three
+        // treads, its swing goal at the hip's height; the toe caught the riser
+        // and it landed 25-52 u short, the body fell over it); 0 = off.
+        // From `lock` of its phase, a sideways swing keeps its tread: a re-aim
+        // onto another is refused (11-07: the last re-aim at phase 0.74 moved
+        // the landing a tread on, 33 u and a riser, with the foot where it was;
+        // it landed 32 u short). Lock 0 = off.
+        std::array<float, 3> mSideRise{ 0.0f, 0.5f, 0.0f };
+        // K2_DESCENT = "most u, share, slack u": going down, the pelvis comes
+        // down by `share` of how far the ground under the foot ahead (planted,
+        // or its landing) lies below the capsule's ground, past `slack`, at
+        // most `most` (11-14, an NPC charging down the Balmora hillside: the
+        // pelvis rode at the capsule's height with the next foothold 40-50 u
+        // lower, 108 u under the pelvis for a 72 u leg - no foot loaded on
+        // 85-95% of steps, "planted" feet 40+ u over their floor, the feet
+        // trailing the pelvis 15-50 u). Most 0 = off.
+        std::array<float, 3> mDescent{ 0.0f, 0.8f, 4.0f };
+        // Side-stepping stairs (OPENMW_RAGDOLL_K2_SIDE_STAIRS = "on, swing s,
+        // pause s"): travelling more sideways than forward with a riser
+        // within 48 u along the travel of the leading foot (or the feet on two
+        // treads), the gait clock stands aside and the feet take turns - the
+        // leading foot onto the next tread, deep enough for the trailing foot
+        // to land beside it on the same tread, then the trailing foot there,
+        // each lifting only once the other is down (`pause` after its landing)
+        // and swinging `swing` seconds, its landing held (11-07: with the
+        // clock, every step fix - the cap, the leash, the lock, a slower
+        // strafe - left strafing up the test stairs at ~1 fall in 4); 0 = off.
+        std::array<float, 3> mSideStairs{ 0.0f, 0.3f, 0.05f };
         // Item 7, the motor lead: the joint
         // motors take time to reach a pose, while the hip and the swing goal
         // move on, so the leg is solved for where both will be `lead` seconds
@@ -246,6 +326,11 @@ namespace RagdollCore
         // landing also keeps this many foot widths across the physical hip
         // line from the other foot (0 = off). _HIP_GAP.
         float mHipGap = 0.0f;
+        // _HIP_GAP_TURN (MOVE-01 W6): the gap only as far as the hips have turned
+        // from the facing - none aligned, whole from this many degrees (0 =
+        // always). At 6 always on, the straight course's walking slip doubled;
+        // the armed running circle crossed 15% -> 4-5% of its frames.
+        float mHipGapTurn = 0.0f;
         // Once a stop is asked (FootfallInput::mStopping) a step lands beside
         // where the pelvis comes to rest, the pelvis plus its velocity x this
         // many seconds (user 10-31: after a run stop the body "needs to take a
@@ -313,7 +398,15 @@ namespace RagdollCore
         double mActorZ = 0.0;
         float mYaw = 0.0f;                               // radians; forward = (sin, cos)
         JPH::Vec3 mCommandVelocity = JPH::Vec3::sZero(); // the root's actual velocity, world
-        bool mArmed = false;                             // weapon drawn
+        // A shift of the body an attack drives with the feet planted (the
+        // thrust's lunge, K2_THRUST_PLANT; world, horizontal) and its rate
+        // (u/s). The standing rules (the still clock, the capture point, the
+        // spot step) and the standing catch measure the body without it, so
+        // the shift alone steps no foot; whatever else moves the body (a
+        // shove, a sag, the keys) still does. Zero = none.
+        JPH::Vec3 mPlantedShift = JPH::Vec3::sZero();
+        JPH::Vec3 mPlantedShiftVelocity = JPH::Vec3::sZero();
+        bool mArmed = false;                            // weapon drawn
         bool mSneaking = false;                          // sneak stance
         const FootfallGaitTable* mGaitTable = nullptr;
         // A recovery episode is running: the mLoad* settings apply.
@@ -321,6 +414,9 @@ namespace RagdollCore
         // Each foot touches supporting ground this step (the contact estimate),
         // for _CONTACT_LAND; unset = unknown (land by time).
         std::optional<std::array<bool, 2>> mFootContact;
+        // Each foot's contact slip (u/s, the fastest supporting contact's
+        // horizontal speed), for _DRAG_LIFT; unset = unknown.
+        std::optional<std::array<float, 2>> mFootSlip;
         // A stop is asked for (the keys released, the capsule braking):
         // landings aim where the pelvis comes to rest (_STOP_LEAD).
         bool mStopping = false;
@@ -348,6 +444,8 @@ namespace RagdollCore
         // both back to the profile's, scale 1).
         std::array<bool, 2> mSpringsChanged{ false, false };
         std::array<bool, 2> mSwingStarted{ false, false }; // a swing began this step
+        // Walking: the gait's cycle (s), its clock (0..1) and the stance share.
+        float mGaitCycle = 0.0f, mGaitClock = 0.0f, mGaitDuty = 0.0f;
         // With mObserveMotorFootGoal: the world point the leg motors drive the
         // foot to (planted or swinging), and its velocity while swinging.
         std::array<std::optional<JPH::RVec3>, 2> mMotorFootGoal;
@@ -429,6 +527,10 @@ namespace RagdollCore
             float mPhase = 0.0f;
             float mDuration = 0.3f;
             float mLift = 10.0f;
+            // mTurnStep: the swing lifts at least an arc this high (0 = none),
+            // and the height that arc is rising to.
+            float mLiftFloor = 0.0f;
+            float mLiftFloorGoal = 0.0f;
             std::optional<std::array<float, 21>> mLiftCurve;
             std::optional<std::array<float, 21>> mProgressCurve;
             std::optional<std::array<std::array<float, 21>, 3>> mPathCurve;
@@ -492,20 +594,22 @@ namespace RagdollCore
         std::array<float, 2> mFootPitch{ 0.0f, 0.0f };
         std::array<float, 2> mKneeGive{ 1.0f, 1.0f };
         std::array<bool, 2> mLiftDue{ false, false };
+        std::array<float, 2> mGuardHeld{ 0.0f, 0.0f }; // how far the no-cross guard moved a landing
+        std::array<float, 2> mDragTime{ 0.0f, 0.0f }; // _DRAG_LIFT: time each planted foot has slipped
         std::array<Foot, 2> mFeet;
         bool mReady = false;
         float mDoubleSupport = 0.0f;
         float mClock = 0.0f;
-        float mClipStrideTime = 0.0f, mClipStrideCorrection = 0.0f, mClipStridePhaseError = 0.0f;
-        float mClipStrideExtremum = 0.0f;
-        std::optional<float> mClipStrideHalf, mClipStrideLast, mClipStridePrevious;
-        std::optional<bool> mClipStrideRising;
         bool mWalking = false;
         float mPelvisDrop = 0.0f;
         float mSneakCrouch = 0.0f;
         float mCrouchLength = -1.0f; // mCrouchLegs: the planted legs' cap (model units; < 0 = none)
         float mCushionDrop = 0.0f;
         std::size_t mLastLanded = 1;
+        // K2_SIDE_STAIRS: which foot steps next (2 = the leading one), and how
+        // long the stairs are still held to be there.
+        std::size_t mSideStairNext = 2;
+        float mSideStairsHold = 0.0f;
         std::optional<JPH::RVec3> mPreviousPelvis;
         JPH::Vec3 mSurplus = JPH::Vec3::sZero(); // mCapture: pelvis velocity beyond the command, filtered
         unsigned mCaptureSteps = 0, mCaptureSwaps = 0;
@@ -514,6 +618,9 @@ namespace RagdollCore
         // _MOTOR_LEAD: the swing goals last step (world).
         std::array<std::optional<JPH::RVec3>, 2> mPreviousGoal;
         std::optional<JPH::Vec3> mPreviousCommand;
+        // mTurnStep: the command 0.1 s behind, and the seconds of the window left.
+        std::optional<JPH::Vec3> mLaggedCommand;
+        float mTurnStepLeft = 0.0f;
         JPH::Vec3 mTurnAcceleration = JPH::Vec3::sZero();
         std::array<bool, 2> mPinned{ false, false };
         std::array<bool, 2> mSwinging{ false, false };
@@ -524,6 +631,8 @@ namespace RagdollCore
         std::optional<JPH::Quat> mPhysToDrive;
         std::array<std::optional<JPH::Vec3>, 2> mHip;
         std::array<std::optional<JPH::RVec3>, 2> mPreviousMotorFootGoal;
+        // The goal each leg was solved for this step (world), for the trace.
+        std::array<JPH::RVec3, 2> mTraceGoal{ JPH::RVec3::sZero(), JPH::RVec3::sZero() };
     };
 
     // The reference foot's pitch (degrees, + toes down) over the swing or

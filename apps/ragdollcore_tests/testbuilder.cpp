@@ -492,4 +492,40 @@ namespace
         EXPECT_TRUE(joint->mPosition2.IsNearZero());
     }
 
+
+    TEST(RagdollCoreBuilderTest, aHullWithBoundsInertiaTurnsLikeItsBox)
+    {
+        // A tilted thin blade: its own inertia has a cross term, its box none.
+        auto profile = RagdollCoreTest::makeProfile();
+        auto& shape = profile.mBodies[0].mShape;
+        shape.mType = RagdollCore::ShapeType::ConvexHull;
+        for (float z : { -50.f, 50.f })
+            for (float x : { -1.f, 1.f })
+                for (float y : { -0.5f, 0.5f })
+                    shape.mPoints.push_back(JPH::Vec3(x + z * 0.2f, y, z));
+        const auto own = RagdollCore::buildRagdollSettings(RagdollCoreTest::makeSkeleton(), profile, {});
+        shape.mBoundsInertia = true;
+        const auto boxed = RagdollCore::buildRagdollSettings(RagdollCoreTest::makeSkeleton(), profile, {});
+        ASSERT_TRUE(own.isValid());
+        ASSERT_TRUE(boxed.isValid());
+        const auto ownMass = own.mSettings->mParts[0].GetMassProperties();
+        const auto boxMass = boxed.mSettings->mParts[0].GetMassProperties();
+        EXPECT_FLOAT_EQ(boxMass.mMass, ownMass.mMass);
+        EXPECT_GT(std::abs(ownMass.mInertia(0, 2)), 1e-3f);
+        EXPECT_NEAR(boxMass.mInertia(0, 2), 0.0f, 1e-6f);
+        // The box spans the hull's bounds: more inertia across than the hull.
+        EXPECT_GT(boxMass.mInertia(1, 1), ownMass.mInertia(1, 1));
+        // The collision shape is the same hull.
+        EXPECT_TRUE(boxed.mSettings->mParts[0].GetShape()->GetLocalBounds().mMin.IsClose(
+            own.mSettings->mParts[0].GetShape()->GetLocalBounds().mMin));
+        // A roll floor lifts the inertia about the long side (z) only.
+        shape.mRollInertiaFloor = 0.5f;
+        const auto floored = RagdollCore::buildRagdollSettings(RagdollCoreTest::makeSkeleton(), profile, {});
+        ASSERT_TRUE(floored.isValid());
+        const auto flooredMass = floored.mSettings->mParts[0].GetMassProperties();
+        const float cross = 0.5f * (boxMass.mInertia(0, 0) + boxMass.mInertia(1, 1));
+        EXPECT_LT(boxMass.mInertia(2, 2), 0.5f * cross);
+        EXPECT_NEAR(flooredMass.mInertia(2, 2), 0.5f * cross, 1e-3f * cross);
+        EXPECT_FLOAT_EQ(flooredMass.mInertia(0, 0), boxMass.mInertia(0, 0));
+    }
 }

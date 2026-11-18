@@ -2,8 +2,7 @@
 
 #include <ragdollcore/reactionpipeline.hpp>
 #include <ragdollcore/scenario.hpp>
-#include "../ragdollcore_walksearch/recoverypose.hpp"
-#include "../ragdollcore_walksearch/hybridcatch.hpp"
+#include "recoverypose.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -416,64 +415,6 @@ TEST(RagdollCoreKinematicRecoveryTest, RequiresValidPoseAndDoesNotOwnStanding)
     script.mKeyframes[0].mKinematicRecoveryTerminalPose->mBodyTransforms[0].mTranslation
         = JPH::Vec3(std::numeric_limits<float>::quiet_NaN(), 0, 0);
     EXPECT_FALSE(runRagdollScenario(skeleton, profile, {}, script).completed());
-}
-
-// Disabled 10-30 (test review): tests the retired reference-gait controller, not
-// Footfall (the game's gait); failing since 10-08 (PLAN.md hygiene).
-TEST(RagdollCoreHybridCatchTest, DISABLED_AnimationDoesNotSpendPhysicalSupportGrace)
-{
-    auto profile = makeScenarioHumanoidProfile().mActiveController;
-    profile.mLocomotionRoute = LocomotionRoute::Reference;
-    profile.mLocomotionSupportGraceDuration = 0.3f;
-    ActiveRagdollController controller;
-    ActiveControllerInput input;
-    ActiveControllerOutput output;
-    input.mPelvisHeight = 70;
-    input.mTargetHorizontalVelocity = JPH::Vec3(0,30,0);
-    input.mCenterOfMassVelocity = input.mTargetHorizontalVelocity;
-    input.mRootExternallyOwned = true;
-    for (int i = 0; i < 120; ++i) ASSERT_TRUE(controller.step(input, 1.0f/60, profile, output));
-    EXPECT_EQ(output.mMode, ActiveControllerMode::Standing);
-    input.mRootExternallyOwned = false;
-    for (int i = 0; i < 12; ++i) ASSERT_TRUE(controller.step(input, 1.0f/60, profile, output));
-    EXPECT_EQ(output.mMode, ActiveControllerMode::Bracing);
-    EXPECT_TRUE(output.mDriveJointMotors);
-    for (int i = 0; i < 30; ++i) ASSERT_TRUE(controller.step(input, 1.0f/60, profile, output));
-    EXPECT_EQ(output.mMode, ActiveControllerMode::Falling);
-    EXPECT_FALSE(output.mDriveJointMotors); // The ordinary grace remains bounded.
-}
-
-TEST(RagdollCoreHybridCatchTest, ReturnNeedsSustainedMeasuredSupportAndPhysicalGait)
-{
-    WalkSearch::HybridCatch state;
-    ScenarioFrame frame;
-    frame.mPelvisUpDot = frame.mControllerInput.mTorsoUpDot = 1;
-    frame.mSupport.mLeftFootSupported = frame.mSupport.mRightFootSupported = true;
-    state.step(&frame, true, true, 1.0f / 60);
-    EXPECT_EQ(state.mStage, 2);
-    for (int i = 0; i < 120; ++i) state.step(&frame, false, true, 1.0f / 60);
-    EXPECT_EQ(state.mStage, 2); // Supported time without PGC is not a catch.
-    frame.mReferenceGait.emplace();
-    frame.mSupport.mRightFootSupported = false;
-    for (int i = 0; i < 120; ++i) state.step(&frame, false, true, 1.0f / 60);
-    EXPECT_EQ(state.mStage, 2); // Acquisition waits for two feet.
-    frame.mSupport.mRightFootSupported = true;
-    frame.mCenterOfMassVelocity = JPH::Vec3(40,0,0);
-    state.step(&frame, false, true, 1.0f / 60);
-    EXPECT_EQ(state.mStableTime, 0);
-    frame.mCenterOfMassVelocity = JPH::Vec3::sZero();
-    for (int i = 0; i < 14; ++i) state.step(&frame, false, true, 1.0f / 60);
-    EXPECT_EQ(state.mStage, 2);
-    for (int i = 0; i < 3; ++i) state.step(&frame, false, true, 1.0f / 60);
-    EXPECT_EQ(state.mStage, 3);
-    state.step(&frame, true, true, 1.0f / 60);
-    EXPECT_EQ(state.mStage, 2); // Another hit interrupts the return.
-    frame.mController.mMode = ActiveControllerMode::Fallen;
-    for (int i = 0; i < 180; ++i) state.step(&frame, false, true, 1.0f / 60);
-    EXPECT_EQ(state.mStage, 2);
-    frame.mController.mMode = ActiveControllerMode::Standing;
-    for (int i = 0; i < 180; ++i) state.step(&frame, false, false, 1.0f / 60);
-    EXPECT_EQ(state.mStage, 2); // Motors-off control cannot acquire a root.
 }
 
 TEST(RagdollCoreHybridCatchTest, KinematicWalkReleasesBeforeEachImpulseRouteWithoutResettingVelocity)

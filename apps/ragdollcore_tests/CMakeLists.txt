@@ -15,8 +15,29 @@ openmw_add_executable(ragdollcore-tests
     testposecomposer.cpp
     testsituation.cpp
     teststaggerplan.cpp
+    testnpcpopulation.cpp
+    testpathcount.cpp
+    testpipeline.cpp
+    testkinetic2phase34.cpp
+    testkinetic2phase34b.cpp
+    testkinetic2stride.cpp
+    testplaydefaults.cpp
     teststeparbiter.cpp
+    teststepplanner.cpp
+    testswitchregistry.cpp
+    teststridesim.cpp
+    testwheelaim.cpp
+    testwheeloutput.cpp
+    testwheelplanner.cpp
     testcontactoutcome.cpp
+    testlodge.cpp
+    testcutwheel.cpp
+    testhaftfit.cpp
+    testfistcontrol.cpp
+    testfiststeer.cpp
+    testpalmparry.cpp
+    testnpcshove.cpp
+    testhanddrive.cpp
     testreactioncontroller.cpp
     testbuilder.cpp
     testcombatstate.cpp
@@ -31,8 +52,10 @@ openmw_add_executable(ragdollcore-tests
     testpassiveragdoll.cpp
     testphysicaldefense.cpp
     testdueltactics.cpp
+    testarmstrain.cpp
     testduelread.cpp
     testrecoverycontrol.cpp
+    teststrideswing.cpp
     testfallprotect.cpp
     testprofile.cpp
     testreactionloop.cpp
@@ -55,6 +78,7 @@ openmw_add_executable(ragdollcore-tests
     testweaponcontact.cpp
     testweaponalignment.cpp
     testwound.cpp
+    testwoundheal.cpp
     testweaponswing.cpp
     feedbackpilot.cpp
 )
@@ -83,3 +107,9 @@ add_test(NAME ragdollcore-tests COMMAND ragdollcore-tests --gtest_brief=1)
 if (WIN32)
     target_sources(ragdollcore-tests PRIVATE ${CMAKE_SOURCE_DIR}/files/windows/other-apps.manifest)
 endif()
+
+# The MOVE-01 training pilot (offline only): StrideSim's walking course and
+# the get-up trainer (trainer.cpp).
+openmw_add_executable(ragdollcore-trainer trainer.cpp)
+# The course loads the game's authored profile (components/ragdollprofile).
+target_link_libraries(ragdollcore-trainer ragdollcore components)

@@ -1,7 +1,11 @@
 #ifndef GAME_MWMECHANICS_CHARACTER_HPP
 #define GAME_MWMECHANICS_CHARACTER_HPP
 
+#include <array>
 #include <deque>
+#include <optional>
+
+#include <osg/Vec2f>
 
 #include "ragdollattackstate.hpp"
 
@@ -155,6 +159,9 @@ namespace MWMechanics
         std::string mCurrentMovement;
         float mMovementAnimSpeed{ 0.f };
         bool mAdjustMovementAnimSpeed{ false };
+        float mNpcStartSpeed{ 0.f }; // K2_NPC_START: the ramp from a stop
+        std::string mLoopClip; // K2_ARM_STEP: the clip mLoopLength was read from
+        float mLoopLength{ 0.f };
         bool mMovementAnimationHasMovement{ false };
 
         CharacterState mDeathState{ CharState_None };

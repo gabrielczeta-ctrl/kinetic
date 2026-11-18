@@ -80,4 +80,13 @@ namespace RagdollCore
             return WeaponShapeProfile{ JPH::Vec3::sAxisZ(), JPH::Vec3::sAxisX(), 0.62f };
         return std::nullopt;
     }
+
+    float weaponTipSign(float centreAlong, float halfLength, float centredShare)
+    {
+        if (!std::isfinite(centreAlong))
+            return 1.0f;
+        const bool centred = centredShare > 0.0f && std::isfinite(halfLength)
+            && std::abs(centreAlong) < centredShare * std::abs(halfLength);
+        return centred || centreAlong >= 0.0f ? 1.0f : -1.0f;
+    }
 }

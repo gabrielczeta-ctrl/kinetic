@@ -32,6 +32,7 @@ namespace RagdollCore
         float mSinceBounce = 1.0e9f; // seconds since its weapon bounced or clashed
         bool mOffBalance = false; // stumbling
         bool mDown = false; // falling, fallen, getting up
+        bool mGettingBearings = false; // the bearings window after a blow is running
         bool mArmed = false;
         float mWeaponReach = 0.0f; // its weapon's tip distance from the hand (0 unarmed)
         bool mWheel = false; // on the attack wheel (hand control)
@@ -96,7 +97,40 @@ namespace RagdollCore
         // chamber, cut); the item 2 cut off leads a charger by it.
         float mStrikeLead = 0.45f;
         float mSinceParryWon = 1.0e9f; // AI-02 item 5: seconds since it won a parry
+        float mOwnClosing = 0.0f; // its own speed toward the opponent, u/s (K2_AI_ARRIVE)
+        bool mStaggered = false; // a blow's stagger has its weapon arm (K2_AI_STAGGER_CUT)
     };
+
+    // Duel aggression (user 11-07, the level-matched Skaal duel: 23 attacks in
+    // 105 s, 5 landed, one cut an attack - "enemies should attack more ...
+    // make them chain attacks, step out less and also if the player is
+    // charging at them make them be able to attack while walking back, or try
+    // to attack when staggered"). Four registry switches, each 0 = off (the
+    // tactics as before); duelPressSettings() reads them.
+    struct DuelPressSettings
+    {
+        // K2_AI_PRESS = "chance A0, chance A100, attacks": its attack over and
+        // the foe still in reach, it attacks again at mix(A0, A100, attack
+        // skill) instead of stepping out, up to `attacks` in a row (fatigue
+        // 0.4 and up).
+        float mChance0 = 0.0f, mChance100 = 0.0f;
+        int mAttacks = 1;
+        // K2_AI_STEP_OUT = seconds backing off after its last strike (0 = the
+        // tactics' own DuelTacticsSettings::mStepOut, 0.6).
+        float mStepOut = 0.0f;
+        // K2_AI_BACK_CUT = "chance A0, chance A100": backing away from a charge
+        // (the backpedal response, or its own step-out with the foe closing
+        // faster than the charge speed) it strikes as the foe comes into reach,
+        // leading it, and keeps walking back through its attack; decided once
+        // per charge or step-out.
+        float mBackCut0 = 0.0f, mBackCut100 = 0.0f;
+        // K2_AI_STAGGER_CUT = "chance A0, chance A100, delay s": staggered with
+        // the foe in reach, it swings back after `delay` through the stagger
+        // (DuelTacticsOutput::mFightThrough: the physics lets the reaction's
+        // hold on its weapon arm go); decided once per stagger.
+        float mStaggerCut0 = 0.0f, mStaggerCut100 = 0.0f, mStaggerDelay = 0.15f;
+    };
+    DuelPressSettings duelPressSettings(); // from the registry (tuningList)
 
     // AI-02 (docs/ragdoll/designs/AI-02-smart-duel-ai.md): the game's stats as
     // four fighter terms, 0..1. Attack A = (weapon skill + Agility/5 +
@@ -254,6 +288,19 @@ namespace RagdollCore
         float mRiposteChance0 = 0.3f;
         float mRiposteChance100 = 0.9f;
         float mRiposteWindShare = 0.5f;
+        // K2_AI_ARRIVE (user bookmark 11-05: "at very high levels ... the enemy
+        // torpedos into the player as a charge, and also they are missing many
+        // hits, if I dont move they dont hit me"; the 21:30 duel: the level-50
+        // guard ran in at up to ~680 u/s to a gap of 15 u, and with the player
+        // still it walked into him during its own cut - gap 0-2 - so the
+        // claymore passed behind). Running or walking in, it brakes at this
+        // deceleration (u/s^2) to stop at its mark instead of through it; in
+        // its own attack it holds the gap at `strike hold` x its strike reach
+        // (backing off when nearer) instead of pressing chest to chest; and it
+        // never presses in inside half its reach. 0 = off.
+        float mArriveDecel = 0.0f;
+        float mStrikeHold = 0.0f; // 0: its own attack presses in as before
+        DuelPressSettings mPress; // K2_AI_PRESS, _STEP_OUT, _BACK_CUT, _STAGGER_CUT (off)
     };
 
     struct DuelTacticsState
@@ -290,6 +337,16 @@ namespace RagdollCore
         float mLastSinceParryWon = 1.0e9f;
         bool mRiposteRead = false;
         bool mRiposting = false;
+        // DuelPressSettings: attacks in this step-in's press (0 = the first),
+        // the read charge's back cut (decided at the read), this step-in
+        // walking back through its attack, the step-out's back cut read, and
+        // the current stagger's read.
+        int mPressCount = 0;
+        bool mBackCut = false;
+        bool mBackCutting = false;
+        bool mBackCutRead = false, mBackCutOut = false;
+        bool mStaggerRead = false, mStaggerCutting = false;
+        float mStaggerSeen = 0.0f;
         std::uint32_t mSeed = 1;
     };
 
@@ -314,10 +371,21 @@ namespace RagdollCore
         bool mDodgeBurst = false;
         float mDodgeSideways = 0.0f;
         float mDodgeBack = 0.0f;
+        // DuelPressSettings: this attack follows at once (a press, a back cut
+        // or a stagger cut: no vanilla attack delay), and a stagger cut's arm
+        // is let go by the reaction.
+        bool mAttackNow = false;
+        bool mFightThrough = false;
+        std::string_view mStaggerRead; // a stagger read: "yes" or "no" (AI trace)
     };
 
     DuelTacticsOutput stepDuelTactics(DuelTacticsState& state, const DuelSelfView& self,
         const DuelOpponentView& opponent, float duration, const DuelTacticsSettings& settings = {});
+
+    // K2_AI_BEARINGS: a fighter getting its bearings after a blow neither runs
+    // nor bursts into a dodge, and uses at most `pace` of its movement (0 = off).
+    float duelBearingsPace(); // from the registry
+    void limitToBearings(DuelTacticsOutput& out, bool gettingBearings, float pace);
 }
 
 #endif

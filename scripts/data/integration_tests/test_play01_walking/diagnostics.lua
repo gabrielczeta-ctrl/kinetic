@@ -53,8 +53,7 @@ function M.write(row)
     end
 end
 
--- Every body (the behaviour viewer, tools/viewer, draws the whole
--- skeleton): thighs, calves and hands also give hip and knee target vs
+-- Every body (to draw the whole skeleton): thighs, calves and hands also give hip and knee target vs
 -- actual at the end of swing and the carried hand heights (walk carry).
 local bodyNames = { pelvis = true, spine = true, spine1 = true, spine2 = true, neck = true,
     left_foot = true, right_foot = true, left_thigh = true, right_thigh = true,
@@ -138,7 +137,11 @@ function M.state(state)
     local selected = { powered = state.powered, centerOfMass = state.centerOfMass,
         support = state.support, experimentalWalking = state.experimentalWalking, softRoot = state.softRoot,
         contacts = state.contacts, stepQuality = state.stepQuality, bodies = {}, controller = {},
-        body_names = {}, weapon = state.weapon }
+        body_names = {}, weapon = state.weapon,
+        -- HUD-01 balance and the HUD-02 weight arrow's feed
+        hud = { balanceRight = state.balanceRight, balanceForward = state.balanceForward,
+            balanceTip = state.balanceTip, weightRight = state.weightRight, weightForward = state.weightForward,
+            weightEdge = state.weightEdge } }
     for index, body in ipairs(state.bodies) do
         selected.body_names[index] = body.name
         if bodyNames[body.name] then selected.bodies[body.name] = body end

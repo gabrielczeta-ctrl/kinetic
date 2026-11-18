@@ -4,16 +4,13 @@ over Morrowind's Data Files.
 
   openmw.exe + DLLs + osgPlugins + resources   from the engine build and the
                                                pinned vcpkg bundle
-  ragdoll\                                     profile, settings, gaits (play defaults
-                                               appended to ragdoll.cfg)
+  ragdoll\                                     profile, settings, gaits
   data\                                        kinetic.omwscripts (Options > Scripts > KINETIC)
   KINETIC.cmd, README.txt
 
-usage: powershell -File tools/package-kinetic.ps1 [-Engine path\to\openmw.exe] [-Out dir] [-Zip]
-         [-PlayLauncher Run-Game-MotionBricks.cmd] [-Record]
--PlayLauncher: the play defaults are that development launcher's switches
-(its "set OPENMW_RAGDOLL_..." lines without file paths or traces), so the
-package plays like the builds the user tests (10-30: a normal playthrough).
+usage: powershell -File tools/package-kinetic.ps1 [-Engine path\to\openmw.exe] [-Out dir] [-Zip] [-Record]
+The package plays like the builds the user tests because the engine carries
+the game's switch values (components/ragdollcore/src/playdefaults.cpp).
 Rebuilding over an existing package keeps its saves and settings (config\,
 userdata\, morrowind-data.txt, kinetic-switches.cfg).
 #>
@@ -22,7 +19,6 @@ param(
     [string]$Out = '',
     [switch]$Zip,
     [switch]$Release,
-    [string]$PlayLauncher = '',
     # Record every session and bookmark with B (development packages only).
     [switch]$Record,
     # Where the source of this build is published (SOURCE.txt). Default: the
@@ -33,7 +29,7 @@ param(
     # HEAD while the shipped files are the same. Default: HEAD.
     [string]$SourceCommit = 'HEAD'
 )
-$version = 'TECH-DEMO RELEASE 0.1'
+$version = 'TECH-DEMO RELEASE 0.2'
 $ErrorActionPreference = 'Stop'
 $source = Split-Path -Parent $PSScriptRoot
 $root = Split-Path -Parent $source
@@ -44,7 +40,7 @@ if (!$Engine) {
 if ($Record -and $Release) { throw '-Record needs a development engine; the release build has no recorder.' }
 $binary = Split-Path -Parent $Engine
 $commit = (& git -C $source rev-parse --short=10 $SourceCommit).Trim()
-if (!$Out) { $Out = Join-Path $root ("dist\KINETIC-tech-demo-0.1-" + $commit + $(if ($Release) { '' } else { '-dev' })) }
+if (!$Out) { $Out = Join-Path $root ("dist\KINETIC-tech-demo-" + ($version -split ' ')[-1] + "-" + $commit + $(if ($Release) { '' } else { '-dev' })) }
 $manifest = Get-Content -Raw (Join-Path $source 'docs\ragdoll\version-manifest.json') | ConvertFrom-Json
 $deps = Join-Path $root $manifest.dependencies.windows_bundle.relative_path
 $depsBin = Join-Path $deps 'installed\x64-windows\bin'
@@ -52,7 +48,8 @@ if (!(Test-Path $Engine)) { throw "Engine not found: $Engine" }
 if (!(Test-Path $depsBin)) { throw "Dependency bundle not found: $depsBin" }
 
 # A rebuild keeps the player's saves and settings.
-$kept = @('config', 'userdata', 'morrowind-data.txt', 'kinetic-switches.cfg', 'mods.cfg')
+# kinetic-tuning.cfg holds the options page's sliders (11-17: it was missing here).
+$kept = @('config', 'userdata', 'morrowind-data.txt', 'kinetic-switches.cfg', 'kinetic-tuning.cfg', 'mods.cfg')
 $stash = "$Out.keep"
 # A stash left by an interrupted rebuild holds the saves: it is restored,
 # never deleted (10-30: the folder was locked, the rebuild stopped with the
@@ -92,39 +89,14 @@ Get-ChildItem -LiteralPath (Join-Path $depsBin 'Release') -Filter *.dll -ErrorAc
 $plugins = Get-ChildItem -LiteralPath $depsBin -Directory -Filter 'osgPlugins-*' | Select-Object -First 1
 if ($plugins) { Copy-Item -Recurse -LiteralPath $plugins.FullName -Destination $Out }
 
-# Ragdoll profile and settings; the play defaults (what the development
-# launcher sets) go into the settings file, so the in-game options can change
-# them (an environment variable would win over the options).
+# Ragdoll profile and settings. The game's switch values are built into the
+# engine (components/ragdollcore/src/playdefaults.cpp); ragdoll.cfg only
+# overrides them, and the in-game options win over both.
 $ragdoll = Join-Path $Out 'ragdoll'
 Copy-Item -Recurse -LiteralPath (Join-Path $source 'files\data\ragdoll') -Destination $ragdoll
 # The debug ghost's reference loops are Mixamo-derived (release audit 10-06):
 # never shipped. The game runs without them.
 Remove-Item -LiteralPath (Join-Path $ragdoll 'reference-loops.txt') -ErrorAction SilentlyContinue
-$defaults = @'
-
-# --- KINETIC play defaults (package-kinetic.ps1) ------------------------------
-OPENMW_RAGDOLL_POWER_PLAYER = 1
-OPENMW_RAGDOLL_POWER_NPCS = 1
-OPENMW_RAGDOLL_FOOTFALL = 1
-OPENMW_RAGDOLL_CATCH_ON_HIT = 1
-OPENMW_RAGDOLL_PGC = 1,1,1,1
-OPENMW_RAGDOLL_PGC_BRACE = 1
-'@
-if ($PlayLauncher) {
-    $lines = @('', "# --- play defaults from $(Split-Path -Leaf $PlayLauncher) (package-kinetic.ps1) ---")
-    foreach ($line in Get-Content -LiteralPath $PlayLauncher) {
-        if ($line.Trim() -match '^set "?(OPENMW_RAGDOLL_[A-Z0-9_]+)=([^"]*)"?\s*$' -and $Matches[2] -notmatch '%~dp0' `
-            -and $Matches[1] -notmatch '_TRACE$') {
-            $lines += "$($Matches[1]) = $($Matches[2])"
-        }
-    }
-    # The first value of a key wins (loadRagdollSettingsFile), so these go
-    # before the file's own entries, as the launcher's environment did.
-    $cfg = Join-Path $ragdoll 'ragdoll.cfg'
-    $text = ($lines -join "`n") + "`n`n" + (Get-Content -Raw -LiteralPath $cfg)
-    [IO.File]::WriteAllText($cfg, $text, [Text.UTF8Encoding]::new($false))
-}
-Add-Content -LiteralPath (Join-Path $ragdoll 'ragdoll.cfg') -Value $defaults -Encoding UTF8
 
 # The options page.
 $data = Join-Path $Out 'data'
@@ -136,16 +108,19 @@ Copy-Item -LiteralPath (Join-Path $manual 'kinetic_settings_menu.lua') -Destinat
 Copy-Item -LiteralPath (Join-Path $manual 'kinetic_stranded.lua') -Destination $data
 # Other combat mods (COMPAT-01): Mercy's melee fights go to KINETIC's duel AI.
 Copy-Item -LiteralPath (Join-Path $manual 'kinetic_compat_actor.lua') -Destination $data
+# A drawn bow or crossbow takes its ammunition from the pack (user 11-14).
+Copy-Item -LiteralPath (Join-Path $manual 'kinetic_ammo.lua') -Destination $data
 # The brass reticle (user 10-30: the crosshair in a normal playthrough): its
 # feed, its player script, the reticle itself and its textures.
 Copy-Item -LiteralPath (Join-Path $manual 'kinetic_hud_global.lua') -Destination $data
 Copy-Item -LiteralPath (Join-Path $manual 'kinetic_hud_player.lua') -Destination $data
 Copy-Item -LiteralPath (Join-Path $source 'scripts\data\ragdoll_hub\kinetic_reticle.lua') -Destination $data
+Copy-Item -LiteralPath (Join-Path $source 'scripts\data\ragdoll_hub\kinetic_sigil.lua') -Destination $data
 New-Item -ItemType Directory -Force -Path (Join-Path $data 'textures') | Out-Null
 Get-ChildItem -LiteralPath (Join-Path $manual 'textures') -Filter 'kinetic_brass_*.png' |
     Copy-Item -Destination (Join-Path $data 'textures')
 Copy-Item -Recurse -LiteralPath (Join-Path $manual 'l10n') -Destination $data
-$scripts = "MENU: kinetic_settings_menu.lua`nPLAYER: kinetic_settings.lua`nGLOBAL: kinetic_stranded.lua`nGLOBAL: kinetic_hud_global.lua`nPLAYER: kinetic_hud_player.lua`nNPC: kinetic_compat_actor.lua`n"
+$scripts = "MENU: kinetic_settings_menu.lua`nPLAYER: kinetic_settings.lua`nGLOBAL: kinetic_stranded.lua`nGLOBAL: kinetic_hud_global.lua`nPLAYER: kinetic_hud_player.lua`nNPC: kinetic_compat_actor.lua`nPLAYER: kinetic_ammo.lua`n"
 # -Record (user 10-31: bookmarks in the playthrough): every session is recorded
 # into <workspace>\runtime-GAME-manual-playthrough-*, like the hub's, and B
 # bookmarks a moment with a note. Needs a development engine (the recorder's Lua

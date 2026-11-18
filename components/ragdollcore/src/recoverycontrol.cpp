@@ -86,11 +86,26 @@ namespace RagdollCore
         if (!moving)
             accel = add(accel, scale(sub(centre, input.mCenterOfMass), s.mStiffness));
         accel = capLength(accel, s.mFrictionShare * input.mGravity, out.mCapped);
+        // By load, inside the grip: a lightly loaded planted foot was pushed
+        // back by half the force and slid.
+        float load = 0.0f;
+        if (s.mGripMargin > 0.0f && input.mFriction > 0.0f)
+            for (std::size_t side = 0; side < 2; ++side)
+                if (input.mPlantedFeet[side] && input.mFootLoad[side] > 0.0f)
+                    load += input.mFootLoad[side];
+        if (load > 0.0f)
+        {
+            bool capped = false;
+            accel = capLength(accel, s.mGripMargin * input.mFriction * load / input.mTotalMass, capped);
+            out.mCapped = out.mCapped || capped;
+        }
         out.mActive = true;
         out.mBodyForce = scale(accel, input.mTotalMass);
         for (std::size_t side = 0; side < 2; ++side)
             if (input.mPlantedFeet[side])
-                out.mFootForce[side] = scale(out.mBodyForce, -1.0f / static_cast<float>(planted));
+                out.mFootForce[side] = load > 0.0f
+                    ? scale(out.mBodyForce, -std::max(0.0f, input.mFootLoad[side]) / load)
+                    : scale(out.mBodyForce, -1.0f / static_cast<float>(planted));
         return out;
     }
 

@@ -4,14 +4,13 @@ ordinary package (package-kinetic.ps1) plus the duel scripts, the flat test
 floor and KINETIC-Duel.cmd.
 
 usage: powershell -File tools/package-kinetic-duel.ps1 [-Engine path\to\openmw.exe] [-Out dir] [-Zip]
-         [-Release] [-PlayLauncher Run-Game-MotionBricks.cmd]
+         [-Release]
 #>
 param(
     [string]$Engine = '',
     [string]$Out = '',
     [switch]$Zip,
-    [switch]$Release,
-    [string]$PlayLauncher = ''
+    [switch]$Release
 )
 $ErrorActionPreference = 'Stop'
 $source = Split-Path -Parent $PSScriptRoot
@@ -21,7 +20,6 @@ if (!$Out) { $Out = Join-Path $root ("dist\KINETIC-duel-" + $commit) }
 $arguments = @{ Out = $Out }
 if ($Engine) { $arguments.Engine = $Engine }
 if ($Release) { $arguments.Release = $true }
-if ($PlayLauncher) { $arguments.PlayLauncher = $PlayLauncher }
 & (Join-Path $PSScriptRoot 'package-kinetic.ps1') @arguments
 
 $data = Join-Path $Out 'data'

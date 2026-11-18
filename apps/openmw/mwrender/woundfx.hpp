@@ -173,6 +173,14 @@ namespace MWRender
         /// second. No-op below level 4.
         void update();
 
+        /// The seed of the blood that wells from under a hard blow's armour
+        /// mark, from that mark's seed (they are one wound).
+        static float bleedSeed(float seed);
+        /// Forget one wound: every record made with `seed` (and its armour
+        /// bleed), on every drawable it spilled over. Blood on a weapon is
+        /// not a wound. False when none was found.
+        bool remove(float seed);
+
         /// Forget every record and give the drawables their own state back
         /// (the hub reset). The shared bind array stays; it is inert.
         void clear();

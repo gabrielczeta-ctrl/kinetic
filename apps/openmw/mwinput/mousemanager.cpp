@@ -1,8 +1,13 @@
 #include "mousemanager.hpp"
 #include <ragdollcore/tuning.hpp>
+#include <ragdollcore/palmparry.hpp>
 #include "../manualdiagnostics.hpp"
 
 #include "actions.hpp"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <components/debug/debuglog.hpp>
 
@@ -35,6 +40,112 @@ namespace MWInput
 {
     namespace
     {
+        // KICK-01: the middle button kicks while the player's body is
+        // powered (it was Physical thrust's default; user 11-03: "kick
+        // replaces it"). OPENMW_RAGDOLL_KICK's first value (0 = off).
+        bool kickEnabled()
+        {
+            static const auto on_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_KICK");
+                return text && std::atof(text) > 0.0;
+            });
+            static const auto& on = on_tuned.get();
+            return on;
+        }
+
+        // K2_HOLD_AIM (registry): an undecided attack press keeps the mouse
+        // off the view, and RagdollTapDrag::sDragCounts of travel make it a
+        // drag at once, its wind-up from the way the mouse went (0 = the view
+        // turns for the press's first 0.16 s, as before).
+        bool holdAimEnabled()
+        {
+            static const auto on_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_HOLD_AIM");
+                return text && std::atof(text) > 0.0;
+            });
+            return on_tuned.get();
+        }
+
+        // K2_MIDDLE_PARRY (registry): what the middle button does. 0 = nothing
+        // here (it is kept for the left-hand spell; the kick is its own
+        // action, A_PhysicalKick); 1 = it guards and parries as the right one
+        // does, without the shove; 2 = it kicks.
+        int middleButtonMode()
+        {
+            static const auto mode_tuned = RagdollCore::tuned<int>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_MIDDLE_PARRY");
+                return text ? std::clamp(std::atoi(text), 0, 2) : 0;
+            });
+            return mode_tuned.get();
+        }
+        bool middleParryEnabled()
+        {
+            return middleButtonMode() == 1;
+        }
+
+        // K2_TAP_PARRY_AIM (registry): a tapped parry's zone takes the mouse
+        // until its window ends, not only while the button is down (a tap is
+        // under 0.2 s: the flick that aims it mostly comes after the release).
+        // Its second value, flick counts: for a press's first 0.35 s (the
+        // tap's window) this much mouse travel picks a zone, where the guard
+        // asks 150 (PassiveRagdollEntry::sGuardZoneDeadCounts) - of the
+        // user's 33 single parry taps on 11-11/12, 21 stayed under 150 in
+        // the window and 12 under 60. 0 or 150 = the guard's 150.
+        const std::array<float, 2>& tapParryAimSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                std::array<float, 2> value{ 0.0f, 0.0f };
+                if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_TAP_PARRY_AIM"))
+                    std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                value[0] = std::isfinite(value[0]) && value[0] != 0.0f ? 1.0f : 0.0f;
+                value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 0.0f, 150.0f) : 0.0f;
+                return value;
+            });
+            return value_tuned.get();
+        }
+        bool tapParryAimEnabled()
+        {
+            return tapParryAimSettings()[0] > 0.0f;
+        }
+        // The mouse's gain on the guard's zone `sincePress` s into a press.
+        float guardZoneGain(float sincePress)
+        {
+            const float flick = tapParryAimSettings()[1];
+            return tapParryAimEnabled() && flick >= 10.0f && sincePress < 0.35f ? 150.0f / flick : 1.0f;
+        }
+
+        // K2_FIST_STEER (registry): FIST-06's steered fists - with bare fists
+        // the right button is the left fist, both buttons the guard.
+        // Its mode: 1 = the steered fists (a held button gives the mouse to
+        // the fist), 2 = FIST-07 (the movement keys pick the punch; the mouse
+        // stays the view's).
+        int fistSteerMode()
+        {
+            static const auto mode_tuned = RagdollCore::tuned<int>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_FIST_STEER");
+                const double value = text ? std::atof(text) : 0.0;
+                // 4 (FIST-12): a held button gives the mouse to the fist, as 1.
+                return value >= 4.0 ? 1 : value >= 2.0 ? 2 : value > 0.0 ? 1 : 0;
+            });
+            return mode_tuned.get();
+        }
+        bool fistSteerEnabled()
+        {
+            return fistSteerMode() > 0;
+        }
+
+        // K2_PALM_TAP (registry): with bare fists a tap of both buttons is a
+        // timed palm parry (the guard stays up for its window, counted from
+        // the press) and the shove is the second press of both. Window 0 = a
+        // tap of both shoves, as FIST-06 had it.
+        const RagdollCore::PalmTapSettings& palmTapSettings()
+        {
+            static const auto value_tuned = RagdollCore::tuned<RagdollCore::PalmTapSettings>([] {
+                return RagdollCore::parsePalmTapSettings(RagdollCore::tuningText("OPENMW_RAGDOLL_K2_PALM_TAP"));
+            });
+            return value_tuned.get();
+        }
+
         bool rmbGuardEnabled()
         {
             static const auto on_tuned = RagdollCore::tuned<bool>([] {
@@ -73,6 +184,17 @@ namespace MWInput
             auto& inventory = player.getClass().getInventoryStore(player);
             const auto equipped = inventory.getSlot(MWWorld::InventoryStore::Slot_CarriedRight);
             return equipped == inventory.end() ? MWWorld::Ptr{} : *equipped;
+        }
+
+        // FIST-06: the player's powered body has its bare fists up.
+        bool steeredFists(MWBase::World& world)
+        {
+            if (!fistSteerEnabled())
+                return false;
+            const MWWorld::Ptr player = world.getPlayerPtr();
+            return !player.isEmpty() && world.isActorPoweredRagdoll(player)
+                && player.getClass().getCreatureStats(player).getDrawState() == MWMechanics::DrawState::Weapon
+                && playerWeapon(world).isEmpty();
         }
     }
 
@@ -161,14 +283,45 @@ namespace MWInput
                 * Settings::input().mCameraYMultiplier / 256.f;
 
             // The right-click guard's zone takes the mouse while it is held.
-            if (mRmbGuardHeld && !mGuardYielded && world->driveActorRagdollGuardZone(x, -y, false))
+            if ((mRmbGuardHeld || (mRmbGuardTapLeft > 0.0f && tapParryAimEnabled())) && !mGuardYielded)
+            {
+                const float gain
+                    = guardZoneGain(mRmbGuardHeld ? mRmbGuardHeldTime : mGuardTapWindow - mRmbGuardTapLeft);
+                if (world->driveActorRagdollGuardZone(x * gain, -y * gain, false))
+                    return;
+            }
+
+            // FIST-07: with the fists the mouse is the view's, whatever is held.
+            const bool viewFists = fistSteerMode() == 2 && !mRagdollThrustClaimed && steeredFists(*world);
+
+            // FIST-06: the right button holds the left fist - the mouse moves it.
+            if (mFistLeftHeld && !viewFists && world->driveActorRagdollLeftFist(x, -y, true, false))
                 return;
+
+            // K2_HOLD_AIM: the undecided press - no view turn; far enough, a drag.
+            if (holdAimEnabled() && mRagdollTapDrag.pending() && !viewFists)
+            {
+                if (mRagdollTapDrag.move(static_cast<float>(arg.xrel), static_cast<float>(arg.yrel), x, y)
+                    == RagdollTapDragAction::BeginDrag)
+                {
+                    world->cancelPlayerRagdollAttackInput();
+                    if (world->driveActorRagdollSwing(0.0f, 0.0f, true))
+                    {
+                        mRagdollUseClaimed = true;
+                        mRagdollSwingHeld = true;
+                        world->driveActorRagdollSwing(mRagdollTapDrag.pendingX(), -mRagdollTapDrag.pendingY(), true);
+                    }
+                    else
+                        mRagdollTapDrag.cancel();
+                }
+                return;
+            }
 
             // While the attack is held the mouse belongs to the weapon, not
             // the view. This consumes the motion only when the player's body
             // is a powered ragdoll; otherwise nothing changes and the camera
             // turns exactly as it always did.
-            if ((!mRagdollAnimationUseClaimed || mRagdollThrustClaimed)
+            if (!viewFists && (!mRagdollAnimationUseClaimed || mRagdollThrustClaimed)
                 && (mRagdollThrustClaimed || mBindingsManager->actionIsActive(A_PhysicalThrust) || mRagdollUseClaimed
                     || mPendingRagdollMouseUse.value_or(mBindingsManager->actionIsActive(A_Use)))
                 && world->driveActorRagdollSwing(x, -y, true,
@@ -198,13 +351,56 @@ namespace MWInput
     void MouseManager::mouseReleased(const SDL_MouseButtonEvent& arg, Uint8 id)
     {
         ManualDiagnostics::recorder().mouse(0, 0, id, false, mMouseLookEnabled, mGuiCursorEnabled);
-        if (id == SDL_BUTTON_RIGHT && mRmbGuardHeld)
+        // FIST-06: the guard of both buttons ends with either. A tap of both
+        // is a timed palm parry (K2_PALM_TAP: the guard stays up for the rest
+        // of its window, as a weapon's tapped guard does; 11-17, the player's
+        // presses of both were down a median 0.127 s and the guard was down
+        // for 22 of the 24 blows that landed), or with the window 0 the shove
+        // as before. The other button, still down, does nothing more.
+        if (mFistGuard && (id == SDL_BUTTON_LEFT || id == SDL_BUTTON_RIGHT))
+        {
+            mFistGuard = false;
+            // (pressed again while the other is still down, it is both again)
+            mFistGuardLinger = id == SDL_BUTTON_LEFT ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
+            if (mRmbGuardHeld)
+            {
+                mRmbGuardHeld = false;
+                if (mRmbGuardHeldTime < RagdollCore::sPalmTapHeld && !mGuardYielded)
+                {
+                    if (palmTapSettings().mWindow > 0.0f)
+                    {
+                        mGuardTapWindow = palmTapSettings().mWindow;
+                        mRmbGuardTapLeft = RagdollCore::palmTapLeft(palmTapSettings(), mRmbGuardHeldTime);
+                        mFistTapParry = true;
+                    }
+                    else
+                        MWBase::Environment::get().getWorld()->shoveActorRagdoll();
+                }
+            }
+            MWBase::Environment::get().getLuaManager()->inputEvent(
+                { MWBase::LuaManager::InputEvent::MouseButtonReleased, arg.button });
+            return;
+        }
+        if (id == mFistGuardLinger)
+            mFistGuardLinger = 0;
+        if (mFistLeftHeld && id == SDL_BUTTON_RIGHT)
+        {
+            mFistLeftHeld = false;
+            MWBase::Environment::get().getWorld()->driveActorRagdollLeftFist(0.0f, 0.0f, false, false);
+            MWBase::Environment::get().getLuaManager()->inputEvent(
+                { MWBase::LuaManager::InputEvent::MouseButtonReleased, arg.button });
+            return;
+        }
+        if (mRmbGuardHeld && id == mGuardButton)
         {
             mRmbGuardHeld = false;
             // A tap holds the guard up long enough to meet the blow: the parry
             // window counts from the raise (not after an attack took over).
             if (mRmbGuardHeldTime < 0.2f && !mGuardYielded)
+            {
+                mGuardTapWindow = 0.35f;
                 mRmbGuardTapLeft = 0.35f - mRmbGuardHeldTime;
+            }
             return;
         }
         cancelInvalidRagdollTapDrag();
@@ -324,11 +520,79 @@ namespace MWInput
 
         mBindingsManager->setPlayerControlsEnabled(!guiMode);
 
+        // FIST-06 (K2_FIST_STEER): with bare fists the right button is the
+        // left fist (a tap its straight; held, the mouse moves it; let go, it
+        // is thrown), and both buttons together are the guard.
+        if ((id == SDL_BUTTON_LEFT || id == SDL_BUTTON_RIGHT) && !guiMode && !mBindingsManager->isDetectingBindingState()
+            && !MWBase::Environment::get().getWindowManager()->isSettingsWindowVisible() && !input->controlsDisabled()
+            && mMouseLookEnabled && !mFistGuard && steeredFists(*MWBase::Environment::get().getWorld()))
+        {
+            MWBase::World* world = MWBase::Environment::get().getWorld();
+            const bool rightFistDown = mRagdollUseClaimed || mRagdollTapDrag.pending() || mRagdollTapDrag.dragging();
+            // K2_PALM_TAP (11-17, the first session with the tap: of the
+            // guard's two buttons one came up and went down again with the
+            // other still held, 0.1-0.2 s apart; that press was the left
+            // fist's, ended the tapped guard and threw a cross): the button
+            // of an ended guard pressed again while the other is still down
+            // is both.
+            const bool again = palmTapSettings().mWindow > 0.0f && mFistGuardLinger != 0 && id != mFistGuardLinger;
+            const bool both = again
+                || (id == SDL_BUTTON_RIGHT ? rightFistDown
+                        : mFistLeftHeld && mBindingsManager->isMouseButtonBound(A_Use, id));
+            if (both)
+            {
+                // The guard goes up first, then the holds end: a hold let go
+                // under the guard throws nothing (ended first, a physics step
+                // in between threw the right fist: FIST-06 11-16).
+                mRagdollGuardHeld = world->setActorRagdollGuard(true);
+                cancelRagdollUse();
+                world->driveActorRagdollLeftFist(0.0f, 0.0f, false, true);
+                mFistLeftHeld = false;
+                mFistGuard = true;
+                mGuardButton = id;
+                // K2_PALM_TAP: both pressed again this soon after the last
+                // press is the shove (the weapons' double click), thrown from
+                // the raised guard as the tap's shove was; the guard is not
+                // held under it. A shove that does not start (its cooldown)
+                // leaves the press the guard.
+                // With a carry set, never while a blow is read: the player's
+                // parries came every 0.1-0.2 s (11-17: 5 blows landed on a
+                // shove the second tap threw).
+                const bool shoved = RagdollCore::palmTapShoves(palmTapSettings(), mFistGuardSincePress)
+                    && !(palmTapSettings().mCarry > 0.0f && world->isPlayerRagdollPalmBusy())
+                    && world->shoveActorRagdoll();
+                mFistGuardLinger = 0;
+                mFistTapParry = false;
+                mFistGuardSincePress = shoved ? 10.0f : 0.0f;
+                mRmbGuardHeld = !shoved;
+                mGuardYielded = false;
+                mRmbGuardHeldTime = 0.0f;
+                mRmbGuardTapLeft = 0.0f;
+                world->driveActorRagdollGuardZone(0.0f, 0.0f, true);
+                MWBase::Environment::get().getLuaManager()->inputEvent(
+                    { MWBase::LuaManager::InputEvent::MouseButtonPressed, arg.button });
+                return;
+            }
+            if (id == SDL_BUTTON_RIGHT && world->driveActorRagdollLeftFist(0.0f, 0.0f, true, false))
+            {
+                mFistLeftHeld = true;
+                // (a fist's press in a tapped guard's window ends it, as the
+                // right fist's does through GUARD-03)
+                if (palmTapSettings().mWindow > 0.0f)
+                    mRmbGuardTapLeft = 0.0f;
+                MWBase::Environment::get().getLuaManager()->inputEvent(
+                    { MWBase::LuaManager::InputEvent::MouseButtonPressed, arg.button });
+                return;
+            }
+        }
+
         // Right-click guard (user 10-07): with a weapon drawn in the game the
         // right button is the guard - held, the mouse picks its zone; a tap is
         // a timed parry. Sheathed, it stays the inventory (also on I).
         // OPENMW_RAGDOLL_RMB_GUARD=1.
-        if (id == SDL_BUTTON_RIGHT && rmbGuardEnabled() && !guiMode && !mBindingsManager->isDetectingBindingState()
+        const bool rightGuard = id == SDL_BUTTON_RIGHT && rmbGuardEnabled();
+        const bool middleGuard = id == SDL_BUTTON_MIDDLE && middleParryEnabled();
+        if ((rightGuard || middleGuard) && !guiMode && !mBindingsManager->isDetectingBindingState()
             && !MWBase::Environment::get().getWindowManager()->isSettingsWindowVisible() && !input->controlsDisabled())
         {
             MWBase::World* world = MWBase::Environment::get().getWorld();
@@ -338,7 +602,7 @@ namespace MWInput
             {
                 // A double click shoves (SHOVE-01, user 10-29); the first
                 // click was a tap of the guard. Clicking on rapidly adds power.
-                if (mRmbShoveBurst > 0.0f || mRmbSincePress < 0.3f)
+                if (rightGuard && (mRmbShoveBurst > 0.0f || mRmbSincePress < 0.3f))
                 {
                     mRmbSincePress = 10.0f;
                     if (world->shoveActorRagdoll())
@@ -349,11 +613,28 @@ namespace MWInput
                         return;
                     }
                 }
-                mRmbSincePress = 0.0f;
+                // The other guard button while one holds the guard: nothing new.
+                if (mRmbGuardHeld && id != mGuardButton)
+                    return;
+                if (rightGuard)
+                    mRmbSincePress = 0.0f;
+                mGuardButton = id;
                 mRmbGuardHeld = true;
                 mGuardYielded = false;
                 mRmbGuardHeldTime = 0.0f;
                 world->driveActorRagdollGuardZone(0.0f, 0.0f, true);
+                return;
+            }
+        }
+
+        if (id == SDL_BUTTON_MIDDLE && kickEnabled() && middleButtonMode() == 2 && !guiMode
+            && !mBindingsManager->isDetectingBindingState()
+            && !MWBase::Environment::get().getWindowManager()->isSettingsWindowVisible() && !input->controlsDisabled())
+        {
+            MWBase::World* world = MWBase::Environment::get().getWorld();
+            if (world->isActorPoweredRagdoll(world->getPlayerPtr()))
+            {
+                world->kickActorRagdoll();
                 return;
             }
         }
@@ -495,7 +776,14 @@ namespace MWInput
         MWBase::InputManager* input = MWBase::Environment::get().getInputManager();
         const bool windowHasFocus = (SDL_GetWindowFlags(mWindow) & SDL_WINDOW_INPUT_FOCUS) != 0;
         if (mWindowHadFocus && !windowHasFocus)
+        {
             cancelRagdollUse();
+            if (mFistLeftHeld)
+            {
+                mFistLeftHeld = false;
+                MWBase::Environment::get().getWorld()->driveActorRagdollLeftFist(0.0f, 0.0f, false, true);
+            }
+        }
         mWindowHadFocus = windowHasFocus;
         if (!mMouseLookEnabled || input->controlsDisabled()
             || MWBase::Environment::get().getWindowManager()->isGuiMode())
@@ -531,12 +819,40 @@ namespace MWInput
         // Raised once per press, so holding it turns a parry into a block.
         if (mRmbGuardHeld)
             mRmbGuardHeldTime += dt;
+        // K2_PALM_TAP's carry: a tapped fist guard whose window is ending
+        // stays up while it reads a blow or its palm is out (a window an
+        // attack's press or a new press ended is at 0 and stays there).
+        if (mFistTapParry)
+        {
+            if (mRmbGuardTapLeft <= 0.0f)
+                mFistTapParry = false;
+            else if (mRmbGuardTapLeft <= dt && RagdollCore::palmTapCarries(palmTapSettings(), mFistGuardSincePress)
+                && MWBase::Environment::get().getWorld()->isPlayerRagdollPalmBusy())
+                mRmbGuardTapLeft = dt + 0.001f;
+        }
         mRmbGuardTapLeft = std::max(0.0f, mRmbGuardTapLeft - dt);
         mRmbSincePress += dt;
+        mFistGuardSincePress += dt;
         mRmbShoveBurst = std::max(0.0f, mRmbShoveBurst - dt);
         if (!mMouseLookEnabled || input->controlsDisabled()
             || MWBase::Environment::get().getWindowManager()->isGuiMode())
+        {
             mRmbGuardHeld = false;
+            mFistGuard = false;
+            mFistGuardLinger = 0;
+        }
+        // FIST-06: the left fist's hold ends unthrown with the game's input
+        // (a menu; lost focus, above) or the fists themselves (a weapon drawn).
+        if (mFistLeftHeld
+            && (!mMouseLookEnabled || input->controlsDisabled()
+                || MWBase::Environment::get().getWindowManager()->isGuiMode()
+                || !steeredFists(*MWBase::Environment::get().getWorld())))
+        {
+            mFistLeftHeld = false;
+            MWBase::Environment::get().getWorld()->driveActorRagdollLeftFist(0.0f, 0.0f, false, true);
+        }
+        else if (mFistLeftHeld)
+            MWBase::Environment::get().getWorld()->driveActorRagdollLeftFist(0.0f, 0.0f, true, false);
         const bool guardInput
             = mBindingsManager->actionIsActive(A_PhysicalGuard) || mRmbGuardHeld || mRmbGuardTapLeft > 0.0f;
         // GUARD-03: a guard an attack lowered comes back with a new press.

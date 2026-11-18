@@ -51,9 +51,9 @@ local protocols = {
     -- The staircase sits off the corridor at (875, 875) with its ascent along
     -- +X. Diagonal right reaches its foot, then the strafe walks up and back.
     { name = 'stairs up and back', segments = {
-        segment('idle', 2), segment('diagonal', 9.5, 1, 1),
+        segment('idle', 2), segment('diagonal', 12, 1, 1),
         segment('climb', 5, 0, 1), segment('descend', 5, 0, -1),
-        segment('return', 9.5, -1, -1), segment('stop', 2),
+        segment('return', 12, -1, -1), segment('stop', 2),
     } },
     -- Play test 2026-09-24 M6: drawing or sheathing while walking broke the
     -- leg animation. Walk, draw while walking, walk, sheathe while walking.
@@ -88,7 +88,7 @@ local protocols = {
     -- drop). The landing speed is above the registered threshold, so the root
     -- must hand over to the passive ragdoll and recovery.
     { name = 'stairs drop off', segments = {
-        segment('idle', 2), segment('diagonal', 9.5, 1, 1),
+        segment('idle', 2), segment('diagonal', 12, 1, 1),
         segment('climb', 3, 0, 1), segment('step off', 2.5, 1, 0), segment('stop', 10),
     } },
     -- STAIRS-01 (user bookmark 9, 2026-09-30: "running up stairs too
@@ -168,17 +168,17 @@ local protocols = {
     -- 128-unit top), then jump off its side moving forward; land and stand.
     -- A body that lands on its feet should not fall.
     { name = 'JUMP-01 ledge jump low', segments = {
-        segment('idle', 2), segment('diagonal', 9.5, 1, 1),
+        segment('idle', 2), segment('diagonal', 12, 1, 1),
         segment('climb', 1.5, 0, 1), segment('jump off', 0.2, 1, 0, 0, true),
         segment('flight', 1.3, 1, 0), segment('stop', 6),
     } },
     { name = 'JUMP-01 ledge jump high', segments = {
-        segment('idle', 2), segment('diagonal', 9.5, 1, 1),
+        segment('idle', 2), segment('diagonal', 12, 1, 1),
         segment('climb', 3, 0, 1), segment('jump off', 0.2, 1, 0, 0, true),
         segment('flight', 1.3, 1, 0), segment('stop', 6),
     } },
     { name = 'JUMP-01 ledge jump high running', segments = {
-        segment('idle', 2), segment('diagonal', 9.5, 1, 1),
+        segment('idle', 2), segment('diagonal', 12, 1, 1),
         segment('climb', 3, 0, 1),
         { segment = 'run off', duration = 0.4, movement = 1, sideMovement = 0, yawRate = 0, jump = false, run = true },
         { segment = 'jump off', duration = 0.2, movement = 1, sideMovement = 0, yawRate = 0, jump = true, run = true },
@@ -546,6 +546,14 @@ do
     protocols[#protocols + 1] = { name = 'rebuild mid-run', segments = {
         segment('idle', 1), run('run in', 1, 1), mid, segment('stand', 5),
     } }
+    -- The 11-08 stuck sprint: rebuilt mid-run with the ground rising under it
+    -- (that session's floor rose 50 u in 2 s under feet that never touched).
+    local hillMid = run('run', 6, 1)
+    hillMid.repowerAt = 0.9
+    protocols[#protocols + 1] = { name = 'rebuild mid-run hill', allowFall = true,
+        exterior = util.vector3(-17000, -11100, 700), initialYaw = 1.026 - math.pi / 2, segments = {
+        segment('idle', 1), run('run in', 1, 1), hillMid, segment('stand', 3),
+    } }
     -- the same without the rebuild (the baseline)
     protocols[#protocols + 1] = { name = 'run then stand', segments = {
         segment('idle', 1), run('run in', 1, 1), run('run', 2.5, 1), segment('stand', 5),
@@ -580,6 +588,26 @@ protocols[#protocols + 1] = { name = 'run zigzag', segments = {
     run('back left', 0.7, -1, -1), run('zig again', 0.7, 1, -1), run('right', 0.7, 0, 1),
     run('zag again', 0.7, 1, 1), segment('stop', 3),
 } }
+-- A duel's footwork (user bookmark 11-16 21:11: "the ragdoll legs drag ...
+-- they just slide to catch up to the chest"; that session's keys changed
+-- every 0.1-0.3 s): eight ways in turn, a new one every 0.15-0.35 s, walked
+-- for 6 s and run for 6 s (K2_TURN_STEP; read with FOOTFALL_TRACE).
+do
+    local ways = { { 1, 0 }, { 0, -1 }, { -1, 0 }, { 0, 1 }, { 1, 1 }, { -1, -1 }, { 0, 1 }, { 1, -1 },
+        { -1, 0 }, { 0, -1 }, { 1, 0 }, { -1, 1 } }
+    local times = { 0.25, 0.2, 0.3, 0.15, 0.35 }
+    local segments = { segment('idle', 1) }
+    for _, pace in ipairs({ 'walk', 'run' }) do
+        for i = 1, 24 do
+            local way = ways[(i - 1) % #ways + 1]
+            local value = segment(pace .. ' keys ' .. i, times[(i - 1) % #times + 1], way[1], way[2])
+            value.run = pace == 'run'
+            segments[#segments + 1] = value
+        end
+    end
+    segments[#segments + 1] = segment('stop', 3)
+    protocols[#protocols + 1] = { name = 'duel footwork', segments = segments }
+end
 -- Running diagonally, both ways (play test 2026-09-28: "legs are stuck",
 -- fell while running diagonally).
 protocols[#protocols + 1] = { name = 'run diagonal', segments = {
@@ -762,6 +790,39 @@ do
         part('run', 9.0, 1, 0, true),
         part('walk again', 3.0, 1, 0),
         part('run again', 5.0, 1, 0, true),
+        part('stop', 2.0, 0, 0),
+    } }
+    -- Stride's sprint (11-06): Speed and Athletics 100, ~690 u/s running,
+    -- for StrideSim's sprint clip (OPENMW_RAGDOLL_CLIP_DUMP); 4 s of run
+    -- keep it on the floor.
+    protocols[#protocols + 1] = { name = 'course sprint', sprint = 100, segments = {
+        part('stand', 2.0, 0, 0),
+        part('walk', 2.0, 1, 0),
+        part('run', 4.0, 1, 0, true),
+        part('walk again', 2.0, 1, 0),
+        part('stop', 2.0, 0, 0),
+    } }
+    -- User 11-09 ("left arm still stiff with weapon sheathed"): in play the
+    -- rig is rebuilt from the ready stance once the weapon has been drawn
+    -- (RAGDOLL_READY_REBUILD); 'course sprint' never draws it.
+    do
+        local draw, sheathe = part('draw', 2.5, 0, 0), part('sheathe', 2.0, 0, 0)
+        draw.stance, sheathe.stance = 'weapon', 'nothing'
+        protocols[#protocols + 1] = { name = 'course sprint drawn', sprint = 100, segments = {
+            part('stand', 1.0, 0, 0), draw, sheathe,
+            part('walk', 2.0, 1, 0),
+            part('run', 4.0, 1, 0, true),
+            part('walk again', 2.0, 1, 0),
+            part('stop', 2.0, 0, 0),
+        } }
+    end
+    -- Stride's turn (11-06): a walk turned into a strafe, the moment
+    -- StrideSim's walking strafes sagged (K2_STRIDE_TURN).
+    protocols[#protocols + 1] = { name = 'course strafe', segments = {
+        part('stand', 2.0, 0, 0),
+        part('walk', 3.0, 1, 0),
+        part('strafe left', 3.0, 0, -1),
+        part('strafe right', 3.0, 0, 1),
         part('stop', 2.0, 0, 0),
     } }
     -- Terrain (2026-09-28): a steady Balmora hillside from the user's play
@@ -1028,5 +1089,136 @@ do
     protocols[#protocols + 1] = { name = 'RAMP-01 ship guard up vanilla', interior = { ship, util.vector3(61, -135, -104) },
         escort = { 'chargen boat guard 2', util.vector3(88, -66, -104), util.vector3(-110, 1360, 110), 'vanilla' }, allowFall = true,
         segments = { move('wait', 60) } }
+end
+-- MOVE-01 "paths that matter" (11-03): a cell NPC walks the legs its own game
+-- script gives it (the same AiTravel points), as a powered copy; every leg
+-- must be reached on its own legs, the stuck fallback taking it is a failure.
+-- 'vanilla': the same unpowered, the time to beat.
+-- PATH-01: Fargoth's night walk to his hiding place (lookoutScript, the
+-- MS_Lookout quest, Seyda Neen): tree, wall, shore, tree, muck - grass, a
+-- slope down to the water's edge and into the shallows. The script sneaks
+-- him; this case walks (sneaking powered NPCs is CROUCH-01's).
+-- PATH-02: the chargen guard's walk (CharGenWalkNPC, the first scene of every
+-- game): from the deck down the ramp to the player in the hold, then up to
+-- the deck past the ramp's top, and turning there. The script escorts the
+-- player on the middle leg; this case travels it.
+do
+    local fargoth = { util.vector3(-11468.595, -71511.531, 173.728), util.vector3(-11410.590, -72057.188, 133.644),
+        util.vector3(-11809.143, -72958.930, 36.435), util.vector3(-11869.832, -71553.195, 141.121),
+        util.vector3(-12592.300, -71155.977, -43.445) }
+    local guard = { util.vector3(90, -90, -88), util.vector3(195, 100, 170), util.vector3(185, 174, 170) }
+    -- PATH-03 (S1): the two runtime copies of the ship cases - the player's
+    -- record and the guard's - walking the flat test floor, out and back:
+    -- tells the ship's hold floor from the walker.
+    local floor = { util.vector3(150, 900, 0), util.vector3(150, -150, 0) }
+    -- PATH-04 / PATH-05 (MOVE-01 W2, thin floors): the player's record walks
+    -- out and back along Seyda Neen's dock (ex_de_docks_end to _center, the
+    -- deck at about z 126) and across Balmora's low bridge over the Odai
+    -- (ex_hlaalu_bridge_04 / _01 along x at y -14896, the deck at about z 219).
+    local dock = { util.vector3(-9400, -72790, 126), util.vector3(-9730, -72570, 126) }
+    local bridge = { util.vector3(-19040, -14896, 220), util.vector3(-19650, -14896, 220) }
+    -- PATH-06 (bookmark 15, an NPC "stuck falling" on Eight Plates' stairs):
+    -- down the inn's stairs (in_hlaalu_hall_stairs, along x) to the rented
+    -- rooms' hall and back up.
+    local inn = { util.vector3(1030, 1152, -384), util.vector3(550, 1152, -245) }
+    -- PATH-07 (bookmark 15, where it happened): the Fighters Guild's
+    -- Eydis Fire-Eye, from the foot of its stairs (in_hlaalu_hall_stairsl,
+    -- along x), runs up them to fight the player standing at the top.
+    -- PATH-08 (bookmark 20, "enemies got stuck at the little bench
+    -- thingies"): Balmora's Temple, the ash-pit room's prayer stools
+    -- (furn_velothi_prayer_stool_01, knee-high); Llarara Omayn from west of
+    -- them runs in to fight the player at the bookmark's spot.
+    protocols[#protocols + 1] = { name = 'PATH-03 floor walker player copy', allowFall = true,
+        path = { 'player', util.vector3(150, -150, 0), floor, 30 }, segments = { move('wait', 1) } }
+    protocols[#protocols + 1] = { name = 'PATH-03 floor walker guard copy', allowFall = true,
+        path = { 'chargen boat guard 2', util.vector3(150, -150, 0), floor, 30 }, segments = { move('wait', 1) } }
+    for _, vanilla in ipairs({ false, true }) do
+        local suffix = vanilla and ' vanilla' or ''
+        protocols[#protocols + 1] = { name = 'PATH-01 fargoth lookout' .. suffix,
+            exterior = util.vector3(-10650, -71150, 200), allowFall = true,
+            path = { 'fargoth', util.vector3(-10510.8, -71218.2, 196.3), fargoth, 45, vanilla = vanilla },
+            segments = { move('wait', 1) } }
+        protocols[#protocols + 1] = { name = 'PATH-04 seyda neen dock walker' .. suffix,
+            exterior = util.vector3(-10650, -71150, 200), allowFall = true,
+            path = { 'player', util.vector3(-9730, -72570, 300), dock, 25, vanilla = vanilla },
+            segments = { move('wait', 1) } }
+        protocols[#protocols + 1] = { name = 'PATH-05 balmora bridge walker' .. suffix,
+            exterior = util.vector3(-18650, -14700, 400), allowFall = true,
+            path = { 'player', util.vector3(-19650, -14896, 400), bridge, 30, vanilla = vanilla },
+            segments = { move('wait', 1) } }
+        protocols[#protocols + 1] = { name = 'PATH-06 eight plates stairs walker' .. suffix,
+            interior = { 'Balmora, Eight Plates', util.vector3(250, 800, -235) }, allowFall = true,
+            path = { 'player', util.vector3(550, 1152, -200), inn, 25, vanilla = vanilla },
+            segments = { move('wait', 1) } }
+        protocols[#protocols + 1] = { name = 'PATH-07 fighters guild stairs run' .. suffix,
+            interior = { 'Balmora, Guild of Fighters', util.vector3(187, 36, 140) }, initialYaw = math.pi / 2,
+            allowFall = true,
+            path = { 'eydis fire-eye', util.vector3(800, 0, 0), { 'player' }, 15, vanilla = vanilla },
+            segments = { move('wait', 1) } }
+        protocols[#protocols + 1] = { name = 'PATH-08 temple prayer stools run' .. suffix,
+            interior = { 'Balmora, Temple', util.vector3(4845, 3926, 14760) }, initialYaw = -math.pi / 2,
+            allowFall = true,
+            path = { 'llarara omayn', util.vector3(4380, 3880, 14760), { 'player' }, 15, vanilla = vanilla },
+            segments = { move('wait', 1) } }
+        protocols[#protocols + 1] = { name = 'PATH-02 chargen guard walk' .. suffix,
+            interior = { 'Imperial Prison Ship', util.vector3(61, -135, -104) }, allowFall = true,
+            path = { 'chargen boat guard 2', util.vector3(34.3, 806.4, 134.4), guard, 45, vanilla = vanilla },
+            segments = { move('wait', 1) } }
+        -- PATH-09 / PATH-10 (user 11-14: "their chest go ahead but the legs
+        -- lag ... especially in slopes ... npcs running down slopes and
+        -- sometimes when charging at the player"): a fighter runs down the
+        -- Balmora hillside (the terrain course's, top to bottom) at the
+        -- player standing at its foot, and charges across the flat floor;
+        -- 'walker': the same hill at a walk (AI travel). Trace the walker's
+        -- legs with OPENMW_RAGDOLL_FOOTFALL_TRACE=npc (tools/body/slope_report.py).
+        protocols[#protocols + 1] = { name = 'PATH-09 balmora hill charge down' .. suffix,
+            exterior = util.vector3(-17258, -11291, 600), initialYaw = 1.026, allowFall = true,
+            path = { 'eydis fire-eye', util.vector3(-15743, -10374, 1400), { 'player' }, 25, vanilla = vanilla },
+            segments = { move('wait', 1) } }
+        protocols[#protocols + 1] = { name = 'PATH-09 balmora hill walker down' .. suffix,
+            exterior = util.vector3(-17400, -11500, 600), initialYaw = 1.026, allowFall = true,
+            path = { 'player', util.vector3(-15743, -10374, 1400), { util.vector3(-17258, -11291, 300) }, 40,
+                vanilla = vanilla },
+            segments = { move('wait', 1) } }
+        protocols[#protocols + 1] = { name = 'PATH-10 floor charge' .. suffix, allowFall = true,
+            path = { 'eydis fire-eye', util.vector3(150, 1500, 0), { 'player' }, 15, vanilla = vanilla },
+            segments = { move('wait', 1) } }
+    end
+    -- CALM-01 (K2_CALM, user 11-14: calm NPCs "kinetic body with like 90%
+    -- strength ... blended"). 'hill walk then charge': the fighter walks half
+    -- way down the Balmora hillside held to the animation, then turns on the
+    -- player at its foot - let go mid-walk on a slope into a run.
+    -- 'cave slope stander': Zainsipilu's Bahdrashi where the game stands
+    -- her, on a 42 degree slope (11-13: 15 get-ups in 14 minutes), watched
+    -- for 40 s.
+    protocols[#protocols + 1] = { name = 'CALM-01 hill walk then charge',
+        exterior = util.vector3(-17258, -11291, 600), initialYaw = 1.026, allowFall = true,
+        path = { 'eydis fire-eye', util.vector3(-15743, -10374, 1400), { util.vector3(-16500, -10832, 800), 'player' }, 30 },
+        segments = { move('wait', 1) } }
+    -- 'hill walker look': the walker down the same hill toward the camera,
+    -- a still a second (the shard's screenshots/): how a held body is drawn
+    -- (K2_CALM_DRAW; compare with =0 and with K2_CALM=0).
+    protocols[#protocols + 1] = { name = 'CALM-01 hill walker look',
+        exterior = util.vector3(-17400, -11500, 600), initialYaw = 1.026, allowFall = true,
+        path = { 'player', util.vector3(-16300, -10750, 1000), { util.vector3(-17258, -11291, 300) }, 40, shots = 1 },
+        segments = { move('wait', 1) } }
+    protocols[#protocols + 1] = { name = 'CALM-01 cave slope stander',
+        interior = { 'Zainsipilu', util.vector3(290, 1567, 127) }, allowFall = true,
+        watch = { 'bahdrashi', 40 }, segments = { move('wait', 1) } }
+end
+-- ROUGH-01 (user 11-13: "falling A LOT on slopes and uneven terrain ... stuck
+-- going up a hill"): the bank west of Seyda Neen where the 11-13 session's
+-- first fall happened (a 34 degree rise of rock and grass: the capsule went
+-- up 75 units in 0.7 s, the body stayed below), walked and run up from the
+-- east and walked back down. tools/body/slope_report.py reads the legs' load
+-- and the pelvis under its target from the traces.
+do
+    local west, east = -math.pi / 2, math.pi / 2
+    protocols[#protocols + 1] = { name = 'ROUGH-01 seyda bank walk up', exterior = util.vector3(-11380, -70400, 330),
+        initialYaw = west, allowFall = true, segments = { move('idle', 1), move('up', 6, 1), move('stop', 2) } }
+    protocols[#protocols + 1] = { name = 'ROUGH-01 seyda bank run up', exterior = util.vector3(-11380, -70400, 330),
+        initialYaw = west, allowFall = true, segments = { move('idle', 1), move('up', 3.5, 1, 0, true), move('stop', 2) } }
+    protocols[#protocols + 1] = { name = 'ROUGH-01 seyda bank walk down', exterior = util.vector3(-12000, -70390, 520),
+        initialYaw = east, allowFall = true, segments = { move('idle', 1), move('down', 6, 1), move('stop', 2) } }
 end
 return protocols

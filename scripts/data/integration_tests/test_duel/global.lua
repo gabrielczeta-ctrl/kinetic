@@ -372,6 +372,84 @@ testing.registerGlobalTest('DUEL-A02 npc duel to the death', function()
     if not ok then error(message) end
 end)
 
+-- SLING-01 (user 11-09: "upon hitting a enemy with a lot of force they sort
+-- of sling away from the capsule then they go back and sling back"): the
+-- player's claymore blow as logged in that session (pelvis, 1435 u/s, 23.4 kg
+-- carried: dv 441) on a fighting duelist, three times. RAGDOLL_BLOW_TRACK
+-- (OPENMW_RAGDOLL_K2_BLOW_TRACE) reads what the capsule and the body did.
+testing.registerGlobalTest('SLING-01 heavy blows on a fighting duelist', function()
+    local multiplier = ragdoll.testStepMultiplier()
+    if multiplier > 0 then ragdoll.setTestStepActive(true, 906101) end
+    local duelists = {}
+    local ok, message = pcall(function()
+        ragdoll.setAutomaticRecovery(true)
+        local player = world.players[1]
+        player:teleport(testArea.cell, testArea.player + util.vector3(0, -800, 0), { onGround = true })
+        waitFor('sling spectator relocation', function()
+            local current = player.position
+            local horizontal = util.vector3(
+                current.x - testArea.player.x, current.y - testArea.player.y, 0)
+            return player.cell.name == testArea.cell and horizontal:length() >= 700
+        end)
+        local function makeDuelist(name, offset)
+            local record = world.createRecord(types.NPC.createRecordDraft({
+                template = types.NPC.record(player),
+                name = name,
+                isEssential = false,
+                isPersistent = false,
+                isRespawning = false,
+            }))
+            local actor = world.createObject(record.id)
+            addItem(actor, 'steel claymore')
+            actor:teleport(testArea.cell, testArea.player + offset, { onGround = true })
+            actor:addScript('duelist.lua')
+            return actor
+        end
+        local a = makeDuelist('SLING-01 struck', util.vector3(0, -60, 0))
+        local b = makeDuelist('SLING-01 foe', util.vector3(0, 60, 0))
+        duelists = { a, b }
+        coroutine.yield()
+        a:sendEvent('duelDuelistConfigure', { weapon = 'steel claymore' })
+        b:sendEvent('duelDuelistConfigure', { weapon = 'steel claymore' })
+        ragdoll.setCombatTarget(a, b)
+        ragdoll.setCombatTarget(b, a)
+        local function ready(actor) return types.Actor.getStance(actor) == types.Actor.STANCE.Weapon end
+        waitFor('struck stance', function() return ready(a) end)
+        waitFor('foe stance', function() return ready(b) end)
+        ragdoll.setPowered(a, true)
+        ragdoll.setPowered(b, true)
+        waitForMode(a, 'struck standing', { standing = true }, 10, {})
+        waitForMode(b, 'foe standing', { standing = true }, 10, {})
+        local function wait(seconds)
+            local untilTime = core.getSimulationTime() + seconds
+            waitFor('sling wait', function()
+                ragdoll.setCombatTarget(a, b)
+                ragdoll.setCombatTarget(b, a)
+                return core.getSimulationTime() >= untilTime
+            end, seconds + 5)
+        end
+        wait(2)
+        for _ = 1, 3 do
+            -- Their own blows can end the fight first.
+            if types.Actor.isDead(a) or types.Actor.isDead(b) then break end
+            local away = a.position - b.position
+            away = util.vector3(away.x, away.y, 0):normalize()
+            print(string.format('SLING-01 blow at %.2f distance %.0f', core.getSimulationTime(), (a.position - b.position):length()))
+            ragdoll.applyBlow(a, 'pelvis', away, 1435, 23.4, 44)
+            wait(4)
+        end
+    end)
+    for _, actor in ipairs(duelists) do
+        if actor and actor:isValid() then
+            actor:sendEvent('duelDuelistStop')
+            ragdoll.setPowered(actor, false)
+            actor:remove()
+        end
+    end
+    if multiplier > 0 then ragdoll.setTestStepActive(false, 0) end
+    if not ok then error(message) end
+end)
+
 -- DMG-04 damage course: a stock Hlaalu guard (steel longsword, bonemold,
 -- Strength 100, Long Blade 68) against a player-template fighter with an
 -- iron claymore, both with their real health. Every landed blow is logged
@@ -849,7 +927,9 @@ end)
 -- Each weapon tip's speed is sampled every frame and split by whether its
 -- owner is in an attack. Reports p50/p90/p99 speed and the share of the
 -- non-attacking time the tip moved over 600 units/s (flailing).
-testing.registerGlobalTest('DUEL-W01 npc weapon control spear and longsword', function()
+local function weaponDuel(tag, weaponA, weaponB, options)
+    options = options or {}
+    return function()
     local multiplier = ragdoll.testStepMultiplier()
     if multiplier > 0 then ragdoll.setTestStepActive(true, 906011) end
     local duelists = {}
@@ -877,13 +957,13 @@ testing.registerGlobalTest('DUEL-W01 npc weapon control spear and longsword', fu
             actor:addScript('duelist.lua')
             return actor
         end
-        local spear = makeFighter('DUEL-W01 spear', util.vector3(0, -60, 0), 'iron spear')
-        local sword = makeFighter('DUEL-W01 longsword', util.vector3(0, 60, 0), 'iron longsword')
+        local spear = makeFighter(tag .. ' ' .. weaponA, util.vector3(0, -60, 0), weaponA)
+        local sword = makeFighter(tag .. ' ' .. weaponB, util.vector3(0, 60, 0), weaponB)
         duelists = { spear, sword }
-        local weapons = { [spear.id] = 'iron spear', [sword.id] = 'iron longsword' }
+        local weapons = { [spear.id] = weaponA, [sword.id] = weaponB }
         coroutine.yield()
-        spear:sendEvent('duelDuelistConfigure', { weapon = 'iron spear', keepHealth = true })
-        sword:sendEvent('duelDuelistConfigure', { weapon = 'iron longsword', keepHealth = true })
+        spear:sendEvent('duelDuelistConfigure', { weapon = weaponA, keepHealth = true, health = options.health })
+        sword:sendEvent('duelDuelistConfigure', { weapon = weaponB, keepHealth = true, health = options.health })
         ragdoll.setCombatTarget(spear, sword)
         ragdoll.setCombatTarget(sword, spear)
         for _, actor in ipairs(duelists) do
@@ -896,11 +976,43 @@ testing.registerGlobalTest('DUEL-W01 npc weapon control spear and longsword', fu
             waitForMode(actor, 'weapon duel initial standing', { standing = true }, 10, {})
         end
         local samples, last = {}, {}
-        for _, actor in ipairs(duelists) do samples[actor.id] = { idle = {}, attack = {} } end
+        for _, actor in ipairs(duelists) do
+            samples[actor.id] = { idle = {}, attack = {}, hands = { idle = { n = 0, behind = 0, across = 0, off = {} },
+                attack = { n = 0, behind = 0, across = 0, off = {} } } }
+        end
         local startTime = core.getSimulationTime()
         local lastTargetRefresh = 0
-        waitSeconds(40, function()
+        local armx = {}
+        for _, actor in ipairs(duelists) do
+            armx[actor.id] = { n = 0, off = 0, hands = 0, elbows = 0, idle = 0, idleHands = 0, longest = 0, episodes = 0 }
+        end
+        local function closeEpisode(actor, x, how)
+            local e = x.ep
+            x.ep = nil
+            local seconds = e.t1 - e.t0
+            x.longest = math.max(x.longest, seconds)
+            if seconds < 1 then return end
+            x.episodes = x.episodes + 1
+            print(string.format('%s_OFFLINE %s at=%.1f seconds=%.1f end=%s weapon_off=%.0f command_off=%.0f chest_off=%.0f attack=%.2f hands_crossed=%.2f elbows_crossed=%.2f grip=%.2f stage=%s->%s mode=%s since_attack=%.2f',
+                tag, weapons[actor.id], e.t0 - startTime, seconds, how, e.wb / e.n, e.cbn > 0 and e.cb / e.cbn or -999,
+                e.chest / e.n, e.attack / e.n, e.hands / e.n, e.elbows / e.n, e.grip / e.n, e.stage, tostring(e.stageEnd),
+                e.mode, e.sinceAttack))
+        end
+        local blowParts = { 'right_thigh', 'left_thigh', 'pelvis', 'right_thigh', 'right_thigh', 'left_upper_arm' }
+        local nextBlow, blowCount = startTime + 3, 0
+        waitSeconds(options.seconds or 40, function()
             local now = core.getSimulationTime()
+            -- ARMX-02: the play's blows on the first spear (11-16: seven
+            -- spear thrusts in ten seconds, thighs, pelvis, upper arm, each
+            -- a stagger), one every 1.3 s from the foe's side.
+            if options.blows and now >= nextBlow then
+                nextBlow = now + 1.3
+                blowCount = blowCount + 1
+                local push = util.vector3(spear.position.x - sword.position.x, spear.position.y - sword.position.y, 0)
+                if push:length() > 1 then
+                    ragdoll.applyBlow(spear, blowParts[(blowCount - 1) % #blowParts + 1], push:normalize(), 2500, 1.4, 5)
+                end
+            end
             if now - lastTargetRefresh >= 2 then
                 lastTargetRefresh = now
                 ragdoll.setCombatTarget(spear, sword)
@@ -922,8 +1034,100 @@ testing.registerGlobalTest('DUEL-W01 npc weapon control spear and longsword', fu
                         local attacking = (state.attackPhase and state.attackPhase ~= 'idle')
                             or ragdoll.getSwingSpeed(actor) ~= nil
                         table.insert(samples[actor.id][attacking and 'attack' or 'idle'], speed)
+                        -- DUEL-W02: a two-hander's support hand in the chest's own
+                        -- frame (behind its plane, on the weapon side of its
+                        -- middle) and the weapon off its command (degrees).
+                        local l, r, hand
+                        for _, item in ipairs(state.bodies) do
+                            if item.name == 'left_upper_arm' then l = item.position end
+                            if item.name == 'right_upper_arm' then r = item.position end
+                            if item.name == 'left_hand' then hand = item.position end
+                        end
+                        local grip = state.weapon.supportGrip
+                        if l and r and hand and state.weapon.twoHanded and grip and grip.attached then
+                            local across = util.vector3(r.x - l.x, r.y - l.y, 0):normalize()
+                            local ahead = util.vector3(-across.y, across.x, 0)
+                            local from = hand - (l + r) * 0.5
+                            local h = samples[actor.id].hands[attacking and 'attack' or 'idle']
+                            h.n = h.n + 1
+                            if from:dot(ahead) < -4 then h.behind = h.behind + 1 end
+                            if from:dot(across) > 4 then h.across = h.across + 1 end
+                            local blade = state.hsc and state.hsc.blade
+                            if blade and blade:length() > 0.5 then
+                                local axis = (b.rotation * util.vector3(0, 0, 1)):normalize()
+                                h.off[#h.off + 1] = math.deg(math.acos(math.max(-1, math.min(1, axis:dot(blade:normalize())))))
+                            end
+                        end
                     end
                     last[actor.id] = { rel = rel, t = now }
+                    -- ARMX (user bookmark 11-16: "my enemy has his arms all
+                    -- crossed up ... he swinged and it got fixed"; the spear
+                    -- lay across the duelist 55-90 deg off the line to its
+                    -- foe from the end of one strike to the next): the
+                    -- weapon's level bearing off the line to the foe, the
+                    -- command's, and whether hands or elbows are crossed
+                    -- (left one right of the right one in the chest's frame).
+                    -- A stretch over 45 deg off for 1 s or more is printed
+                    -- (_OFFLINE), the totals at the end (_ARMX).
+                    do
+                        local x = armx[actor.id]
+                        local part = {}
+                        for _, item in ipairs(state.bodies) do part[item.name] = item.position end
+                        local l, r = part.left_upper_arm, part.right_upper_arm
+                        local lh, rh = part.left_hand, part.right_hand
+                        local le, re = part.left_forearm, part.right_forearm
+                        local foe = actor == spear and sword or spear
+                        local toFoe = util.vector3(foe.position.x - actor.position.x, foe.position.y - actor.position.y, 0)
+                        local axis3 = b.rotation * util.vector3(0, 0, 1)
+                        local axis = util.vector3(axis3.x, axis3.y, 0)
+                        if l and r and lh and rh and toFoe:length() > 1 and axis:length() > 0.5 then
+                            local f = toFoe:normalize()
+                            local right = util.vector3(f.y, -f.x, 0)
+                            local function off(v) return math.deg(math.atan2(v:dot(right), v:dot(f))) end
+                            local across = util.vector3(r.x - l.x, r.y - l.y, 0):normalize()
+                            local wb = off(axis)
+                            local blade = state.hsc and state.hsc.blade
+                            local cb = blade and blade:length() > 0.5 and util.vector3(blade.x, blade.y, 0):length() > 0.3
+                                and off(util.vector3(blade.x, blade.y, 0)) or nil
+                            local chestOff = off(util.vector3(-across.y, across.x, 0))
+                            local attackingNow = (state.attackPhase and state.attackPhase ~= 'idle')
+                                or ragdoll.getSwingSpeed(actor) ~= nil
+                            local hands = (lh - rh):dot(across) > 4
+                            local elbows = le and re and (le - re):dot(across) > 0
+                            local grip = state.weapon.supportGrip
+                            x.n = x.n + 1
+                            if hands then x.hands = x.hands + 1 end
+                            if elbows then x.elbows = x.elbows + 1 end
+                            if not attackingNow then
+                                x.idle = x.idle + 1
+                                if hands then x.idleHands = x.idleHands + 1 end
+                            end
+                            if attackingNow then x.lastAttack = now end
+                            local isOff = math.abs(wb) > 45
+                            if isOff then
+                                x.off = x.off + 1
+                                if not x.ep then
+                                    x.ep = { t0 = now, n = 0, wb = 0, cb = 0, cbn = 0, chest = 0, attack = 0, hands = 0, elbows = 0,
+                                        grip = 0, stage = tostring(state.hsc and state.hsc.stage), mode = tostring(state.mode),
+                                        sinceAttack = x.lastAttack and (now - x.lastAttack) or -1 }
+                                end
+                                local e = x.ep
+                                e.t1 = now
+                                e.n = e.n + 1
+                                e.wb = e.wb + wb
+                                e.chest = e.chest + chestOff
+                                if cb then e.cb = e.cb + cb e.cbn = e.cbn + 1 end
+                                if attackingNow then e.attack = e.attack + 1 end
+                                if hands then e.hands = e.hands + 1 end
+                                if elbows then e.elbows = e.elbows + 1 end
+                                if grip and grip.attached then e.grip = e.grip + 1 end
+                                e.stageEnd = tostring(state.hsc and state.hsc.stage)
+                            end
+                            if x.ep and (not isOff) and now - x.ep.t1 > 0.25 then
+                                closeEpisode(actor, x, 'back')
+                            end
+                        end
+                    end
                 end
             end
         end, function()
@@ -939,10 +1143,24 @@ testing.registerGlobalTest('DUEL-W01 npc weapon control spear and longsword', fu
             local s = samples[actor.id]
             local wild = 0
             for _, v in ipairs(s.idle) do if v > 600 then wild = wild + 1 end end
-            print(string.format('DUEL-W01 %s idle n=%d p50=%.0f p90=%.0f p99=%.0f over600=%.2f | attack n=%d p50=%.0f p90=%.0f p99=%.0f | after=%.1f s',
+            print(string.format(tag .. ' %s idle n=%d p50=%.0f p90=%.0f p99=%.0f over600=%.2f | attack n=%d p50=%.0f p90=%.0f p99=%.0f | after=%.1f s',
                 weapons[actor.id], #s.idle, pct(s.idle, 0.5), pct(s.idle, 0.9), pct(s.idle, 0.99),
                 #s.idle > 0 and wild / #s.idle or -1, #s.attack, pct(s.attack, 0.5), pct(s.attack, 0.9),
                 pct(s.attack, 0.99), core.getSimulationTime() - startTime))
+            local x = armx[actor.id]
+            if x.ep then closeEpisode(actor, x, 'open') end
+            print(string.format('%s_ARMX %s n=%d off45=%.3f longest=%.1f episodes=%d hands_crossed=%.3f idle_hands_crossed=%.3f elbows_crossed=%.3f',
+                tag, weapons[actor.id], x.n, x.n > 0 and x.off / x.n or -1, x.longest, x.episodes,
+                x.n > 0 and x.hands / x.n or -1, x.idle > 0 and x.idleHands / x.idle or -1, x.n > 0 and x.elbows / x.n or -1))
+            local health = types.Actor.stats.dynamic.health(actor)
+            print(string.format('%s_HEALTH %s lost=%.0f of %.0f', tag, weapons[actor.id], health.base - health.current, health.base))
+            for _, phase in ipairs({ 'idle', 'attack' }) do
+                local h = s.hands[phase]
+                if h.n > 0 then
+                    print(string.format('%s_HANDS %s %s n=%d support_behind=%.2f support_across=%.2f weapon_off p50=%.0f p90=%.0f',
+                        tag, weapons[actor.id], phase, h.n, h.behind / h.n, h.across / h.n, pct(h.off, 0.5), pct(h.off, 0.9)))
+                end
+            end
         end
     end)
     for _, actor in ipairs(duelists) do
@@ -954,7 +1172,26 @@ testing.registerGlobalTest('DUEL-W01 npc weapon control spear and longsword', fu
     end
     if multiplier > 0 then ragdoll.setTestStepActive(false, 0) end
     if not ok then error(message) end
-end)
+    end
+end
+testing.registerGlobalTest('DUEL-W01 npc weapon control spear and longsword', weaponDuel('DUEL-W01', 'iron spear', 'iron longsword'))
+-- DUEL-W02 (user 11-12: "we need to be careful with the enemy hands not mixing
+-- up after a swing then returning in a weird position"): two-handed NPCs duel;
+-- DUEL-W02_HANDS rows say how often the support hand is behind the chest or
+-- on the weapon side of it and how far the weapon is off its command, in and
+-- out of attacks.
+testing.registerGlobalTest('DUEL-W02 npc hands spear and staff', weaponDuel('DUEL-W02', 'iron spear', 'wooden staff'))
+testing.registerGlobalTest('DUEL-W02 npc hands claymore and battle axe', weaponDuel('DUEL-W02', 'iron claymore', 'iron battle axe'))
+testing.registerGlobalTest('DUEL-W02 npc hands steel spear and warhammer', weaponDuel('DUEL-W02', 'steel spear', 'iron warhammer'))
+-- ARMX-01 (user bookmark 11-16, a spear duelist: "my enemy has his arms all
+-- crossed up", then "he swinged and it got fixed"): two steel spears duel
+-- for 60 s with health to last; ARMX-01_OFFLINE rows are stretches of 1 s or
+-- more with a spear over 45 deg off the line to its foe, ARMX-01_ARMX the
+-- totals.
+testing.registerGlobalTest('ARMX-01 npc spear returns to its guard',
+    weaponDuel('ARMX-01', 'steel spear', 'steel spear', { health = 5000, seconds = 60 }))
+testing.registerGlobalTest('ARMX-02 npc spear struck through its strikes',
+    weaponDuel('ARMX-02', 'steel spear', 'steel spear', { health = 5000, seconds = 60, blows = true }))
 
 -- DUEL-C01 (alpha 0.4 item 4, user 2026-09-30: "an opponent who retreats is
 -- sprinted down and lunged at in reach"): a longsword duelist faces a foe

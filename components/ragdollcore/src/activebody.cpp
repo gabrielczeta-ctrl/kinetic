@@ -52,8 +52,9 @@ namespace RagdollCore
             return out;
         const JPH::Vec3 up = -in.mGravity / g;
 
-        float totalMass = 0.0f, upperMass = 0.0f, torsoMass = 0.0f;
+        float totalMass = 0.0f, upperMass = 0.0f, torsoMass = 0.0f, fieldMass = 0.0f;
         JPH::Vec3 upperMomentum = JPH::Vec3::sZero();
+        JPH::Vec3 fieldMomentum = JPH::Vec3::sZero();
         JPH::Vec3 torsoSpin = JPH::Vec3::sZero();
         std::size_t grounded = 0;
         for (const ActiveBodyPart& part : in.mParts)
@@ -71,12 +72,19 @@ namespace RagdollCore
             }
             if (part.mFoot && part.mGrounded)
                 ++grounded;
+            else
+            {
+                fieldMass += part.mMass;
+                fieldMomentum += part.mVelocity * part.mMass;
+            }
         }
         if (!(totalMass > 0.0f) || !(upperMass > 0.0f) || !(torsoMass > 0.0f))
             return out;
         // Damping reads the mass-weighted motion of the parts that receive the
         // wrench, never one light body (the pelvis is ~14% of the mass).
-        const JPH::Vec3 velocity = upperMomentum / upperMass;
+        const float fieldShare = fieldMass > 0.0f ? std::clamp(in.mFieldShare, 0.0f, 1.0f) : 0.0f;
+        const JPH::Vec3 velocity = upperMomentum / upperMass * (1.0f - fieldShare)
+            + (fieldShare > 0.0f ? fieldMomentum / fieldMass * fieldShare : JPH::Vec3::sZero());
         const JPH::Vec3 angularVelocity = torsoSpin / torsoMass;
         const float strength = std::clamp(in.mStrength, 0.0f, 1.0f);
         const float support = std::clamp(in.mSupport, 0.0f, 1.0f);
@@ -102,7 +110,11 @@ namespace RagdollCore
         }
         // The upper parts carry the whole-body correction (scaled total/upper,
         // so the legs follow through the hips) plus their own weight.
-        const JPH::Vec3 correction = (horizontal + up * vertical) * (totalMass / upperMass);
+        // The field's share of the horizontal correction goes to every part
+        // but a grounded foot instead (scaled total/field the same way).
+        const JPH::Vec3 correction = (horizontal * (1.0f - fieldShare) + up * vertical) * (totalMass / upperMass);
+        const JPH::Vec3 field
+            = fieldShare > 0.0f ? horizontal * (fieldShare * totalMass / fieldMass) : JPH::Vec3::sZero();
         const JPH::Vec3 weight = up * (g * s.mWeightSupport * support * strength);
 
         // Ground routing: this fraction of the upper-body force is taken back
@@ -119,9 +131,12 @@ namespace RagdollCore
         for (std::size_t i = 0; i < count; ++i)
         {
             const ActiveBodyPart& part = in.mParts[i];
-            if (!part.mUpper)
+            const bool inField = fieldShare > 0.0f && !(part.mFoot && part.mGrounded);
+            if (!part.mUpper && !inField)
                 continue;
-            JPH::Vec3 force = (correction + weight) * part.mMass;
+            JPH::Vec3 force = part.mUpper ? (correction + weight) * part.mMass : JPH::Vec3::sZero();
+            if (inField)
+                force += field * part.mMass;
             if (grounded == 0)
             {
                 // In the air the routed share has nothing to push against.
@@ -222,13 +237,15 @@ namespace RagdollCore
 
     std::vector<std::string> ActiveBodySettings::load(const std::string& path)
     {
-        std::vector<std::string> problems;
         std::ifstream file(path);
         if (!file)
-        {
-            problems.push_back("cannot open " + path);
-            return problems;
-        }
+            return { "cannot open " + path };
+        return load(file, path);
+    }
+
+    std::vector<std::string> ActiveBodySettings::load(std::istream& file, const std::string& path)
+    {
+        std::vector<std::string> problems;
         std::string line;
         int number = 0;
         while (std::getline(file, line))

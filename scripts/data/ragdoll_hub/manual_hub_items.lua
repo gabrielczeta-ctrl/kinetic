@@ -89,7 +89,17 @@ function items.slot(id)
     end
     local okWeapon, weapon = pcall(types.Weapon.record, id)
     if okWeapon and weapon then return S.CarriedRight end
+    local okClothing, clothing = pcall(types.Clothing.record, id)
+    if okClothing and clothing then
+        local T = types.Clothing.TYPE
+        return ({ [T.Shirt] = S.Shirt, [T.Pants] = S.Pants, [T.Shoes] = S.Boots })[clothing.type]
+    end
     return nil
+end
+
+-- What someone with no armor wears (Morrowind's common shirt, pants and shoes).
+function items.clothes()
+    return { 'common_shirt_01', 'common_pants_01', 'common_shoes_01' }
 end
 
 return items

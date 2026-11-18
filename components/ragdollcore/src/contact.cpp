@@ -79,4 +79,25 @@ namespace RagdollCore
         }
         return result;
     }
+
+    bool rejectsFloorUnderside(const JPH::Body& body1, const JPH::Body& body2, JPH::RVec3Arg baseOffset,
+        const JPH::CollideShapeResult& result)
+    {
+        const bool movingSecond = body1.IsStatic() && !body2.IsStatic();
+        if (!movingSecond && !(body2.IsStatic() && !body1.IsStatic()))
+            return false;
+        const JPH::Vec3 axis = result.mPenetrationAxis;
+        if (axis.IsNearZero())
+            return false;
+        // The penetration axis moves body 2 out of body 1 (a floor under a
+        // moving body 2 gives +z).
+        const JPH::Vec3 normal = axis.Normalized();
+        const float up = movingSecond ? normal.GetZ() : -normal.GetZ();
+        if (up > -0.5f)
+            return false;
+        const JPH::Body& moving = movingSecond ? body2 : body1;
+        const JPH::Vec3 point = movingSecond ? result.mContactPointOn2 : result.mContactPointOn1;
+        const double pointZ = baseOffset.GetZ() + point.GetZ();
+        return pointZ < moving.GetCenterOfMassPosition().GetZ();
+    }
 }

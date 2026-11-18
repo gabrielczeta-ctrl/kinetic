@@ -29,6 +29,8 @@ $private = @('PLAN.md', 'PLAYTEST.md', 'AGENTS.md', 'tools/workspace', 'docs/rew
 if ($Author -notmatch '^(.+?) <(.+)>$') { throw "Author must be 'Name <address>': $Author" }
 $env:GIT_AUTHOR_NAME = $env:GIT_COMMITTER_NAME = $Matches[1]
 $env:GIT_AUTHOR_EMAIL = $env:GIT_COMMITTER_EMAIL = $Matches[2]
+# UTC: a local date would publish the machine's time zone.
+$env:GIT_AUTHOR_DATE = $env:GIT_COMMITTER_DATE = "$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) +0000"
 # git.exe: a function named Git would call itself (names ignore case).
 function Git { $out = & git.exe -C $source @args; if ($LASTEXITCODE) { throw "git $args failed" }; $out }
 

@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -25,6 +26,7 @@
 #include <ragdollcore/balancemetrics.hpp>
 #include <ragdollcore/balanceepisodes.hpp>
 #include <ragdollcore/combatstate.hpp>
+#include <ragdollcore/controller.hpp>
 #include <ragdollcore/dueltactics.hpp>
 #include <ragdollcore/physicaldefense.hpp>
 
@@ -612,11 +614,19 @@ namespace MWPhysics
         int mHscStage = 0;
         float mHscStanceX = 0, mHscStanceY = 0, mHscAngle = 0, mHscDrivePhase = 1, mHscPlaneMiss = 0;
         bool mHscSnap = false, mHscChain = false, mHscAuto = false;
+        std::optional<osg::Vec3f> mFistAimOrigin;
+        osg::Vec3f mFistAimDirection;
+        std::array<float, 2> mFistAimBlend{ 0.0f, 0.0f };
+        bool mFistHudActive = false;
+        bool mFistHudDrag = false; // FIST-12: the fists wind up by the mouse (the weapons' reticle)
+        std::array<float, 2> mFistHudCharge{ -1.0f, -1.0f };
+        std::array<int, 2> mFistHudKind{ 0, 0 };
         bool mHscRiposte = false; // HSC_RIPOSTE: the running click answers a parry won
         float mHscFlow = 0; // HSC_CHAIN_FLOW: the running chain's flow (0-1)
         float mHscSinceParryWon = 1.0e9f; // s since this body's last parry won
         int mHscGripMode = 0; // GRIP-05: 0 normal, 1 half-sword, 2 murder-stroke
         std::uint64_t mHscJabs = 0; // FIST-02: left jabs thrown
+        std::uint64_t mHscPalmParries = 0; // FIST-08: blows a palm deflected
         float mHscJab = 0; // ... how far the jab is out (0-1)
         float mHscRoute = 0; // the route position shown (mFlowU: 0..1 wind-up, 1..2 cut)
         float mHscReseat = 0; // the re-seat, 1 open .. 0
@@ -624,9 +634,17 @@ namespace MWPhysics
         // TRAJ-01: the committed attack's cut, the commanded tip (world);
         // empty out of one.
         std::vector<osg::Vec3f> mHscTrajectory;
+        // ... where it meets the foe (K2_AIM_PREVIEW): the blade's first touch
+        // (hit) or its closest pass; none without a foe or the switch.
+        std::optional<osg::Vec3f> mHscMark;
+        bool mHscMarkHit = false;
+        float mHscMarkGap = 0.0f; // depth into the body (negative) or the pass's gap
         std::string mArmOwnerLeft, mArmOwnerRight; // who holds each arm (consolidation)
         std::string mOwnerLegs, mOwnerTrunk, mOwnerHead; // the body arbiter's other channels
         std::uint64_t mBlockStaggers = 0;
+        // Blade contacts handled as clashes and as slides (CLASH-SLIDE); kicks
+        // thrown and landed (KICK-01).
+        std::uint64_t mClashes = 0, mClashSlides = 0, mKicks = 0, mKickHits = 0;
         // Head-blow daze left (s) and how deep the knees gave (units).
         float mDazeTime = 0, mDazeDrop = 0;
         std::uint64_t mDazeCount = 0;
@@ -678,6 +696,15 @@ namespace MWPhysics
         // HUD-01: the way the weight tips (x right, y forward) and how near
         // the edge, 0..1 (PassiveRagdollEntry::hudBalance).
         float mBalanceRight = 0.0f, mBalanceForward = 0.0f, mBalanceTip = 0.0f;
+        float mBalanceRisk = 0.0f; // K2_BALANCE_RISK: 0 steady .. 1 going over
+        // HUD-02 weight cue: the capture point off the feet (u, x right, y
+        // forward) and the tipping edge (u; 0 = off the ground).
+        float mWeightRight = 0.0f, mWeightForward = 0.0f, mWeightEdge = 0.0f;
+        // K2_BALANCE_SIGIL: the stance for the balance sigil (unknown with
+        // the switch off, in the air, or before the body's first pose) and
+        // how dazed the body is, 0..1 (PassiveRagdollEntry::hudDaze).
+        RagdollCore::BalanceSigil mBalanceSigil;
+        float mBalanceDaze = 0.0f;
         float mAttackReady = 1.0f; // HUD-01: 0 just after a cut, 1 ready (attackReadiness)
         std::uint64_t mGuardStartPhysicsStep = 0;
         std::uint64_t mCombatReactionCount = 0;
@@ -820,6 +847,8 @@ namespace MWPhysics
         // Physical deaths that have ended this frame: the world makes them limp.
         std::vector<MWWorld::Ptr> takeFinishedDeaths();
         bool addPoweredRagdoll(const MWWorld::Ptr& ptr, SceneUtil::Skeleton& skeleton);
+        // Marks a powered NPC as a script's (see mPinnedBodies).
+        void pinPoweredRagdoll(const MWWorld::Ptr& ptr);
         // Selects the actor's currently equipped right-hand weapon for the
         // next powered-ragdoll construction. The first qualified live route
         // uses the one-kilogram training-bar proxy from the offline fixture.
@@ -847,8 +876,12 @@ namespace MWPhysics
         float applyGuardBlow(PassiveRagdollEntry& side, const PassiveRagdollEntry& other, JPH::RVec3Arg point,
             JPH::Vec3Arg direction, float momentum, bool shield, bool beaten, bool blunt, std::uint64_t physicsStep);
 #ifdef OPENMW_RAGDOLL_DEV_API
+        // attacker (optional): the receipt names its powered body, the contact
+        // weaponAlong of the way from its hand to its weapon's tip
+        // (BLADE-BLOOD-01: the blood on the weapon).
         std::uint64_t stageWoundReceipt(const MWWorld::Ptr& ptr, std::string_view body, int kind,
-            const osg::Vec3f& point, const osg::Vec3f& normal);
+            const osg::Vec3f& point, const osg::Vec3f& normal, const MWWorld::Ptr& attacker = MWWorld::Ptr(),
+            float weaponAlong = 0.9f);
 #endif
         void recordKillingBlow(const MWWorld::Ptr& ptr, const osg::Vec3f& worldPoint,
             const osg::Vec3f& direction, float healthDamage);
@@ -859,10 +892,12 @@ namespace MWPhysics
         void updatePassiveRagdolls();
 
         /// Powers humanoid NPCs near the player and releases them again when
-        /// they leave the neighbourhood. The first cut powers every NPC that
-        /// comes close (OPENMW_RAGDOLL_POWER_NPCS, dev builds); the population
-        /// budget and hysteresis keep the cost bounded.
+        /// they leave the neighbourhood (OPENMW_RAGDOLL_POWER_NPCS); how many
+        /// and how near is ragdollcore npcpopulation (OPENMW_RAGDOLL_NPC_BODIES).
         void updatePoweredRagdollPopulation();
+        // Bodies a script powered (the dev API: tests, duels): the population
+        // never trades them away for its count, only when dead or far.
+        std::set<const MWWorld::LiveCellRefBase*> mPinnedBodies;
         // BOAT_START: character creation and the player still on the prison
         // ship (its hold, deck or plank); no body is powered until off it.
         bool playerOnChargenShip();
@@ -880,7 +915,7 @@ namespace MWPhysics
             osg::Vec3f mAnchor;
             double mSince = 0.0;
             osg::Vec3f mLast{}; // suspended: where it last moved 5 units from
-            bool mSteep = false; // suspended by NPC_STEEP: powered again only standing still
+            bool mWalkOnOnly = false; // K2_NPC_REFALL: powered again only after walking on
         };
         std::map<const MWWorld::LiveCellRefBase*, StuckWatch> mStuckWatch;
         std::map<const MWWorld::LiveCellRefBase*, StuckWatch> mStuckSuspended;
@@ -903,6 +938,11 @@ namespace MWPhysics
         /// blow instead of the animation hit path.
         void updatePoweredAiStrikes();
         void stepDeathDrag(float dt);
+        // K2_DEATH_LIMITS: the corpses' opened joints close (ragdollcore lifecycle).
+        void stepDeathLimits(float dt);
+        // K2_LODGE: the weapons held in bodies (ragdollcore lodge).
+        void stepLodges(float dt);
+        void endLodge(PassiveRagdollEntry& entry, const char* reason);
         void updateGuardThreats();
         void updateHscFoes();
         void strikeCapsuleActors(PassiveRagdollEntry& entry);
@@ -916,6 +956,7 @@ namespace MWPhysics
             const MWWorld::ConstPtr& ptr) const;
         std::optional<osg::Vec3f> getPassiveRagdollCameraPosition(const MWWorld::ConstPtr& ptr) const;
         bool isPoweredRagdoll(const MWWorld::ConstPtr& ptr) const;
+        float poweredMoveScale(const MWWorld::ConstPtr& ptr) const;
         // True only while the actor owns an attached live physical weapon.
         // Input uses this to claim the attack button before the ordinary
         // animation-driven melee path can see it.
@@ -927,6 +968,7 @@ namespace MWPhysics
         // AI-02 item 2: the AI holds this body's guard up for `seconds` (renewed while wanted).
         void requestRagdollAiGuard(const MWWorld::ConstPtr& ptr, float seconds);
         void requestRagdollAiRiposte(const MWWorld::ConstPtr& ptr);
+        void requestRagdollAiFightThrough(const MWWorld::ConstPtr& ptr); // K2_AI_STAGGER_CUT
         // Tests (RIPOSTE-02): as if this body's parry had just won a clash.
         void markRagdollParryWon(const MWWorld::ConstPtr& ptr);
         PassiveRagdollDebugCounters getPassiveRagdollDebugCounters() const;
@@ -934,6 +976,10 @@ namespace MWPhysics
         // hands go to that chest and the push lands through the blow reaction
         // when they get there. False: nobody in reach, on cooldown, or off.
         bool shovePassiveRagdoll(const MWWorld::ConstPtr& ptr);
+        void updateNpcShoves();
+        // KICK-01: a kick from the actor's leg at the body in front of it;
+        // false when it cannot kick now (not standing, kicking, cooling down).
+        bool kickPassiveRagdoll(const MWWorld::ConstPtr& ptr);
         // GRIP-05: the actor's long blade to its next grip; false when none.
         bool cycleRagdollGrip(const MWWorld::ConstPtr& ptr);
         // The dodge (OPENMW_RAGDOLL_DODGE): a committed step or, running, a
@@ -1001,6 +1047,11 @@ namespace MWPhysics
         // The guard's zone (RMB_GUARD): mouse counts accumulated while the
         // guard is held (right, up); reset = the middle.
         bool drivePassiveRagdollGuardZone(const MWWorld::ConstPtr& ptr, float countsRight, float countsUp, bool reset);
+        // FIST-06 (K2_FIST_STEER): the right button as the left fist - held,
+        // the mouse counts since the last call; cancel = the press ended
+        // without a release (nothing is thrown).
+        bool drivePassiveRagdollLeftFist(
+            const MWWorld::ConstPtr& ptr, float countsRight, float countsUp, bool held, bool cancel);
         bool setPassiveRagdollGuard(const MWWorld::ConstPtr& ptr, bool active,
             const std::optional<osg::Vec3f>& worldFacing = std::nullopt);
         // Distance between the last requested point and the point the arm
@@ -1009,6 +1060,7 @@ namespace MWPhysics
         // Whether hand control (the cut wheel) holds the actor's weapon
         // arm: a tap is then its own click attack, not Morrowind's clip.
         bool isPassiveRagdollHandControlActive(const MWWorld::ConstPtr& ptr) const;
+        bool isPassiveRagdollPalmBusy(const MWWorld::ConstPtr& ptr) const;
         // Physical attack (plan item 2.3d): while held, aim motion
         // drives a point the weapon hand chases, and the swing is whatever
         // the arm motors produce on the way there. The impact is then an
@@ -1048,6 +1100,15 @@ namespace MWPhysics
         // Speed of the last commanded swing point, for callers deciding how
         // hard a blow landed. Unset when nothing is swinging.
         std::optional<float> getRagdollWeaponSwingSpeed(const MWWorld::ConstPtr& ptr) const;
+        // K2_LODGE, for tests: the actor's weapon in another body.
+        struct RagdollLodgeView
+        {
+            std::string mKind, mLastKind, mLastRelease; // mKind "none" when free
+            bool mClearing = false;
+            float mDepth = 0.0f, mDeepest = 0.0f, mAge = 0.0f, mLastDeepest = 0.0f, mLastHeld = 0.0f;
+            std::uint64_t mCount = 0;
+        };
+        std::optional<RagdollLodgeView> getRagdollLodge(const MWWorld::ConstPtr& ptr) const;
         // How much stronger the arm is while swinging than the profile
         // authored it. One means the authored motors, which are sized to hold
         // a pose and visibly cannot drive a weapon.
@@ -1273,7 +1334,16 @@ namespace MWPhysics
         void updatePtrHolders();
 
         void prepareSimulation(bool willSimulate, std::vector<Simulation>& simulations);
-        bool addRagdoll(const MWWorld::Ptr& ptr, SceneUtil::Skeleton& skeleton, bool powered);
+        // A dying powered body's build, for its corpse (K2_DEATH_JOINTS): the
+        // skeleton it was built from and its standing frames' key.
+        struct LivingBuild
+        {
+            RagdollCore::SkeletonDescriptor mSkeleton;
+            std::string mFrameKey;
+            bool mFramesFromStanding = false;
+        };
+        bool addRagdoll(const MWWorld::Ptr& ptr, SceneUtil::Skeleton& skeleton, bool powered,
+            const LivingBuild* living = nullptr);
         const RagdollCore::RagdollProfile* getPassiveRagdollProfile();
         bool releaseWeapon(PassiveRagdollEntry& entry, PassiveRagdollWeaponReleaseReason reason);
         // The world point the player's physical swing should be aimed at this
@@ -1331,6 +1401,7 @@ namespace MWPhysics
         };
         std::vector<PendingShove> mPendingShoves;
         void stepPendingShoves(float dt);
+        void stepKicks(float dt);
         using PassiveRagdollMotionMap
             = std::unordered_map<const MWWorld::LiveCellRefBase*, std::unique_ptr<PassiveRagdollMotionHistory>>;
         PassiveRagdollMotionMap mPassiveRagdollMotionHistory;

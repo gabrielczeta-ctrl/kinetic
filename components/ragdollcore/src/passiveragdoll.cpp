@@ -468,6 +468,7 @@ namespace RagdollCore
         input.mGravity = mPhysicsSystem->GetGravity();
         input.mStrength = mSoftRootStrength;
         input.mHorizontalScale = mSoftRootHorizontalScale;
+        input.mFieldShare = mSoftRootFieldShare;
         input.mSupport = mSoftRootSupport;
         JPH::RVec3 current;
         JPH::Quat currentRotation;
@@ -569,7 +570,8 @@ namespace RagdollCore
             totalTorque += torque;
         }
         mSoftRootTelemetry
-            = { output.mNetForce, totalTorque, output.mPositionError, output.mAngleError, output.mSaturated };
+            = { output.mNetForce, totalTorque, output.mPositionError, output.mAngleError, output.mSaturated,
+                  input.mTargetPosition.GetZ() - input.mRootPosition.GetZ() };
         return true;
     }
 
@@ -1377,6 +1379,54 @@ namespace RagdollCore
             return std::nullopt;
         const auto* hinge = static_cast<const JPH::HingeConstraint*>(constraint);
         return std::pair<float, float>{ hinge->GetLimitsMin(), hinge->GetLimitsMax() };
+    }
+
+    std::optional<std::pair<JointRange, JointAt>> PassiveRagdoll::getJointRange(std::size_t bodyIndex) const
+    {
+        if (!mAdded || bodyIndex >= getBodyCount())
+            return std::nullopt;
+        const int constraintIndex
+            = mRagdoll->GetRagdollSettings()->GetConstraintIndexForBodyIndex(static_cast<int>(bodyIndex));
+        if (constraintIndex < 0)
+            return std::nullopt;
+        const JPH::TwoBodyConstraint* constraint = mRagdoll->GetConstraint(constraintIndex);
+        JointRange range;
+        JointAt at;
+        if (constraint->GetSubType() == JPH::EConstraintSubType::Hinge)
+        {
+            const auto* hinge = static_cast<const JPH::HingeConstraint*>(constraint);
+            range.mHinge = true;
+            range.mHingeMin = hinge->GetLimitsMin();
+            range.mHingeMax = hinge->GetLimitsMax();
+            at.mHinge = hinge->GetCurrentAngle();
+            return std::pair{ range, at };
+        }
+        if (constraint->GetSubType() != JPH::EConstraintSubType::SwingTwist)
+            return std::nullopt;
+        const auto* swingTwist = static_cast<const JPH::SwingTwistConstraint*>(constraint);
+        range.mNormalHalfCone = swingTwist->GetNormalHalfConeAngle();
+        range.mPlaneHalfCone = swingTwist->GetPlaneHalfConeAngle();
+        range.mTwistMin = swingTwist->GetTwistMinAngle();
+        range.mTwistMax = swingTwist->GetTwistMaxAngle();
+        // As Jolt's own limit reads it: swing and twist, each with w >= 0.
+        JPH::Quat swing, twist;
+        swingTwist->GetRotationInConstraintSpace().GetSwingTwist(swing, twist);
+        if (swing.GetW() < 0.0f)
+            swing = -swing;
+        if (twist.GetW() < 0.0f)
+            twist = -twist;
+        at.mSwingY = swing.GetY();
+        at.mSwingZ = swing.GetZ();
+        at.mTwist = 2.0f * std::atan2(twist.GetX(), twist.GetW());
+        return std::pair{ range, at };
+    }
+
+    bool PassiveRagdoll::setJointRange(std::size_t bodyIndex, const JointRange& range)
+    {
+        return range.mHinge
+            ? setHingeJointLimits(bodyIndex, range.mHingeMin, range.mHingeMax)
+            : setSwingTwistJointLimits(
+                  bodyIndex, range.mNormalHalfCone, range.mPlaneHalfCone, range.mTwistMin, range.mTwistMax);
     }
 
     std::optional<PassiveRagdoll::MotorDebug> PassiveRagdoll::getMotorDebug(std::size_t bodyIndex) const

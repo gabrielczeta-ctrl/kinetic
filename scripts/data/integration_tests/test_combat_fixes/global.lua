@@ -404,7 +404,10 @@ for shoveIndex, case in ipairs({
 registerTest('SHOVE-01 a shove ' .. case.label, 918400 + shoveIndex, function()
     placePlayer()
     ragdoll.setAutomaticRecovery(true)
-    local shover = spawnDummy('SHOVE-01 shover', util.vector3(60, 60, 0), false)
+    -- OPENMW_RAGDOLL_TEST_SHOVE_WEAPON: the shover's weapon (K2_SHOVE_ARMS:
+    -- the weapon hand thrusts too); unset = bare hands.
+    local shoveWeapon = ragdoll.tuningText('OPENMW_RAGDOLL_TEST_SHOVE_WEAPON')
+    local shover = spawnDummy('SHOVE-01 shover', util.vector3(60, 60, 0), shoveWeapon or false)
     local target = spawnDummy('SHOVE-01 target', util.vector3(60, 60 + case.gap, 0), false)
     local ok, message = pcall(function()
         powerAndStand(shover, 'SHOVE-01 shover')
@@ -422,6 +425,7 @@ registerTest('SHOVE-01 a shove ' .. case.label, 918400 + shoveIndex, function()
         local line = flat(body(t0, 'pelvis').centerOfMass) - shoverFrom
         line = line / math.max(line:length(), 1)
         local handOut = 0
+        local handOutBy = { left_hand = 0, right_hand = 0 }
         local handFrom = {}
         for _, hand in ipairs({ 'left_hand', 'right_hand' }) do handFrom[hand] = flat(body(s0, hand).centerOfMass) end
         local ground = math.min(body(t0, 'left_foot').centerOfMass.z, body(t0, 'right_foot').centerOfMass.z)
@@ -447,7 +451,9 @@ registerTest('SHOVE-01 a shove ' .. case.label, 918400 + shoveIndex, function()
                 local chest = body(ts, 'spine2').centerOfMass
                 for _, hand in ipairs({ 'left_hand', 'right_hand' }) do
                     handNear = math.min(handNear, (body(ss, hand).centerOfMass - chest):length())
-                    handOut = math.max(handOut, (flat(body(ss, hand).centerOfMass) - handFrom[hand]):dot(line))
+                    local out = (flat(body(ss, hand).centerOfMass) - handFrom[hand]):dot(line)
+                    handOut = math.max(handOut, out)
+                    handOutBy[hand] = math.max(handOutBy[hand], out)
                 end
             end)
         end
@@ -464,6 +470,8 @@ registerTest('SHOVE-01 a shove ' .. case.label, 918400 + shoveIndex, function()
         local seen = {}
         for mode in pairs(modes) do seen[#seen + 1] = mode end
         table.sort(seen)
+        print(string.format('SHOVE-01 hands case=%s weapon=%s left_out=%.0f right_out=%.0f', case.label,
+            tostring(shoveWeapon or 'none'), handOutBy.left_hand, handOutBy.right_hand))
         print(string.format('SHOVE-01 case=%s gap=%d shoves=%d target_travel=%.0f pelvis_low=%.0f hand_near=%.0f hand_out=%.0f lunge=%.0f fatigue=%.1f clicks=%d modes=%s balance_tip=%.2f balance_way=%s',
             case.label, case.gap, shoves, far, pelvisLow, handNear, handOut, recoil, spent, clicks, table.concat(seen, ','), balanceTip, balanceWay))
         if case.pushed then
@@ -474,6 +482,156 @@ registerTest('SHOVE-01 a shove ' .. case.label, 918400 + shoveIndex, function()
         end
     end)
     if shover:isValid() then shover:remove() end
+    if target:isValid() then target:remove() end
+    if not ok then error(message, 0) end
+end)
+end
+
+-- SHOVE-03 (K2_SHOVE_ARMS, user 11-12: "make it so shoving throws the arms
+-- forward"): the player, a weapon drawn, shoves a dummy in reach and then
+-- nobody. SHOVE03 lines: how far each hand went forward of the chest (the
+-- player's frame) from where it was, and the target's travel.
+-- OPENMW_RAGDOLL_TEST_SHOVE_WEAPON picks the weapon (default iron longsword).
+registerTest('SHOVE-03 the player shoves with a weapon drawn', 918403, function()
+    local weapon = ragdoll.tuningText('OPENMW_RAGDOLL_TEST_SHOVE_WEAPON') or 'iron longsword'
+    local player = placePlayer()
+    local target
+    local ok, message = pcall(function()
+        if not types.Actor.inventory(player):find(weapon) then
+            world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+            coroutine.yield()
+        end
+        player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 495, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 495 end)
+        waitSeconds(1)
+        powerAndStand(player, 'SHOVE-03 player')
+        cameraReadyMode = nil
+        player:sendEvent('fixPlayerCamera', true)
+        waitFor('SHOVE-03 first-person camera', function() return cameraReadyMode == true end)
+        local function hands()
+            local st = ragdoll.getState(player)
+            local chest = body(st, 'spine2').position
+            local yaw = player.rotation:getYaw()
+            local forward = util.vector3(math.sin(yaw), math.cos(yaw), 0)
+            return (body(st, 'left_hand').position - chest):dot(forward),
+                (body(st, 'right_hand').position - chest):dot(forward)
+        end
+        for _, case in ipairs({ 'in reach', 'nobody' }) do
+            if case == 'in reach' then
+                target = spawnDummy('SHOVE-03 target', util.vector3(0, 50, 0), false)
+                powerAndStand(target, 'SHOVE-03 target')
+                waitFor('SHOVE-03 target state', function() return ragdoll.getState(target) ~= nil end, 5)
+                waitSeconds(0.5)
+            end
+            waitFor('SHOVE-03 player state', function() return ragdoll.getState(player) ~= nil end, 5)
+            local from = target and target:isValid() and body(ragdoll.getState(target), 'pelvis').centerOfMass or nil
+            local left0, right0 = hands()
+            local leftOut, rightOut, far = 0, 0, 0
+            local accepted = ragdoll.shove(player)
+            waitSeconds(1.0, function()
+                if not ragdoll.getState(player) then return end
+                local l, r = hands()
+                leftOut, rightOut = math.max(leftOut, l - left0), math.max(rightOut, r - right0)
+                if from and target:isValid() then
+                    local ts = ragdoll.getState(target)
+                    if ts then
+                        local d = body(ts, 'pelvis').centerOfMass - from
+                        far = math.max(far, util.vector3(d.x, d.y, 0):length())
+                    end
+                end
+            end)
+            print(string.format('SHOVE03 case=%s weapon=%s accepted=%s left_rest=%.0f right_rest=%.0f left_out=%.0f right_out=%.0f target_travel=%.0f',
+                case, weapon, tostring(accepted), left0, right0, leftOut, rightOut, far))
+            if target and target:isValid() then target:remove() target = nil end
+            waitSeconds(1.5)
+        end
+    end)
+    ragdoll.setPowered(player, false)
+    if target and target:isValid() then target:remove() end
+    if not ok then error(message, 0) end
+end)
+
+-- KICK-01 (user 11-03 bookmark 13: "lets make mouse button click to be a kick
+-- :) with good pushback"): a dummy (armed, as in a fight) kicks another in
+-- front of it (ragdoll.kick, as the middle button). In reach the foot lands
+-- and the target is pushed off its spot; out of reach the leg kicks the air.
+-- Either way the kicker stays on its feet. KICK01 lines: hits, target travel,
+-- the target's fatigue lost (Morrowind's hand-to-hand damage), the kicker's
+-- fatigue spent, how far the kicking foot went out, both bodies' modes.
+for kickIndex, case in ipairs({
+    { label = 'in reach', gap = 62, hit = true },
+    { label = 'out of reach', gap = 200, hit = false },
+}) do
+registerTest('KICK-01 a kick ' .. case.label, 918420 + kickIndex, function()
+    placePlayer()
+    ragdoll.setAutomaticRecovery(true)
+    local kicker = spawnDummy('KICK-01 kicker', util.vector3(60, 60, 0), 'iron longsword')
+    local target = spawnDummy('KICK-01 target', util.vector3(60, 60 + case.gap, 0), 'iron longsword')
+    local ok, message = pcall(function()
+        powerAndStand(kicker, 'KICK-01 kicker')
+        powerAndStand(target, 'KICK-01 target')
+        -- Past the weapon-ready rebuild (~0.8 s after the draw), which builds
+        -- a fresh body (and would drop a kick under way).
+        waitSeconds(2.0)
+        local flat = function(v) return util.vector3(v.x, v.y, 0) end
+        local t0, k0 = ragdoll.getState(target), ragdoll.getState(kicker)
+        local from = flat(body(t0, 'pelvis').centerOfMass)
+        local kickerFrom = flat(body(k0, 'pelvis').centerOfMass)
+        local line = from - kickerFrom
+        line = line / math.max(line:length(), 1)
+        local footFrom = {}
+        for _, foot in ipairs({ 'left_foot', 'right_foot' }) do footFrom[foot] = flat(body(k0, foot).centerOfMass) end
+        local ground = math.min(body(k0, 'left_foot').centerOfMass.z, body(k0, 'right_foot').centerOfMass.z)
+        local far, footOut, footUp, kickerDrift = 0, 0, 0, 0
+        local targetModes, kickerModes = {}, {}
+        local fatigueT0 = types.Actor.stats.dynamic.fatigue(target).current
+        local fatigueK0 = types.Actor.stats.dynamic.fatigue(kicker).current
+        local kicks0, hits0 = k0.kicks or 0, k0.kickHits or 0
+        ragdoll.kick(kicker)
+        local kickerSpent
+        waitSeconds(2.5, function()
+            -- The kick's cost, read before fatigue comes back (~3.5 a second).
+            if not kickerSpent and core.getSimulationTime() then
+                local now = types.Actor.stats.dynamic.fatigue(kicker).current
+                if now < fatigueK0 - 0.5 then kickerSpent = fatigueK0 - now end
+            end
+            local ts, ks = ragdoll.getState(target), ragdoll.getState(kicker)
+            if not ts or not ks then return end
+            far = math.max(far, (flat(body(ts, 'pelvis').centerOfMass) - from):length())
+            kickerDrift = math.max(kickerDrift, (flat(body(ks, 'pelvis').centerOfMass) - kickerFrom):length())
+            for _, foot in ipairs({ 'left_foot', 'right_foot' }) do
+                local at = body(ks, foot).centerOfMass
+                footOut = math.max(footOut, (flat(at) - footFrom[foot]):dot(line))
+                footUp = math.max(footUp, at.z - ground)
+            end
+            if ts.controller then targetModes[ts.controller.mode] = true end
+            if ks.controller then kickerModes[ks.controller.mode] = true end
+        end)
+        local k1 = ragdoll.getState(kicker)
+        local kicks, hits = (k1.kicks or 0) - kicks0, (k1.kickHits or 0) - hits0
+        local function list(set)
+            local out = {}
+            for mode in pairs(set) do out[#out + 1] = mode end
+            table.sort(out)
+            return table.concat(out, ',')
+        end
+        local kickerFell = kickerModes.falling or kickerModes.fallen or kickerModes.down or false
+        print(string.format('KICK01 case=%s gap=%d kicks=%d hits=%d target_travel=%.0f target_fatigue=%.1f kicker_fatigue=%.1f foot_out=%.0f foot_up=%.0f kicker_drift=%.0f target_modes=%s kicker_modes=%s',
+            case.label, case.gap, kicks, hits, far, fatigueT0 - types.Actor.stats.dynamic.fatigue(target).current,
+            kickerSpent or 0, footOut, footUp, kickerDrift,
+            list(targetModes), list(kickerModes)))
+        testing.expect(kicks == 1, 'the kick did not start')
+        testing.expect(footOut >= 20, 'the kicking foot did not go out')
+        testing.expect(not kickerFell, 'the kicker fell')
+        if case.hit then
+            testing.expect(hits == 1, 'the kick did not land')
+            testing.expect(far >= 25, 'the kick did not push the target back')
+        else
+            testing.expect(hits == 0, 'a kick out of reach landed')
+            testing.expect(far < 8, 'a kick out of reach moved the target')
+        end
+    end)
+    if kicker:isValid() then kicker:remove() end
     if target:isValid() then target:remove() end
     if not ok then error(message, 0) end
 end)
@@ -2092,6 +2250,114 @@ registerTest('WOUNDFX-03 stains on clothing, scratches on armour', 918337, funct
     if not ok then error(message, 0) end
 end)
 
+-- HEAL-01 (K2_WOUND_HEAL, user 11-17: Restore Health and rest heal wounds,
+-- "maintaining/repairing the armor fixes them"): a bare dummy at a fifth of
+-- its health takes four cuts on the forearm and 40 limb damage there; half
+-- the missing health back leaves about half of both, full health none. An
+-- armoured dummy's cuirass at half condition takes three marks: its health
+-- coming back leaves them, the cuirass repaired removes them. HEAL01 lines
+-- give the counts at each step.
+registerTest('HEAL-01 wounds heal with health, armour marks with repair', 918376, function()
+    placePlayer()
+    local victims = {}
+    local ok, message = pcall(function()
+        if ragdoll.getWoundFxLevel() < 3 then
+            testing.expect(false, 'HEAL-01 needs OPENMW_RAGDOLL_WOUND_FX>=3')
+            return
+        end
+        local up = util.vector3(0, 0, 1)
+        local bare = spawnDummy('HEAL-01 bare dummy', util.vector3(-45, 120, 0), false)
+        victims[#victims + 1] = bare
+        local armoured = spawnDummy('HEAL-01 armoured dummy', util.vector3(45, 120, 0), false)
+        victims[#victims + 1] = armoured
+        bare:sendEvent('fixWoundMode', { mode = 'normal' }) -- strips the clothes: bare skin
+        world.createObject('iron_cuirass', 1):moveInto(types.Actor.inventory(armoured))
+        coroutine.yield()
+        armoured:sendEvent('fixActorWear', { Cuirass = 'iron_cuirass' })
+        waitSeconds(0.5)
+        local cuirass = types.Actor.getEquipment(armoured, types.Actor.EQUIPMENT_SLOT.Cuirass)
+        testing.expect(cuirass ~= nil and cuirass.recordId == 'iron_cuirass', 'the dummy did not put the cuirass on')
+        local whole = types.Armor.record(cuirass).health
+        powerAndStand(bare, 'HEAL-01 bare dummy')
+        powerAndStand(armoured, 'HEAL-01 armoured dummy')
+        waitSeconds(2) -- settle, and let the parts be culled and skinned
+        -- Hurt first: wounds taken at full health would start to fade.
+        bare:sendEvent('fixActorHealthShare', 0.2)
+        armoured:sendEvent('fixActorHealthShare', 0.2)
+        types.Item.itemData(cuirass).condition = math.floor(whole * 0.5)
+        waitSeconds(0.5)
+        local function counts(tag)
+            local b, a = ragdoll.getWoundCounts(bare), ragdoll.getWoundCounts(armoured)
+            local limb = ragdoll.getLimbDamage(bare).right_forearm or 0
+            print(string.format('HEAL01 %s bare_body=%d bare_limb=%.1f armoured_body=%d armoured_armour=%d', tag,
+                b.body, limb, a.body, a.armour))
+            return b.body, limb, a.armour
+        end
+        -- Four cuts along the outer side of the bare forearm.
+        do
+            local state = ragdoll.getState(bare)
+            local forearm = body(state, 'right_forearm')
+            local side = forearm.centerOfMass - body(state, 'spine2').centerOfMass
+            local normal = util.vector3(side.x, side.y, 0):normalize()
+            local axis = (body(state, 'right_hand').position - forearm.position):normalize()
+            local direction = (axis * 0.2 + normal:cross(axis):normalize() * 0.98):normalize()
+            for index = 0, 3 do
+                ragdoll.addWoundFx(bare, 'right_forearm', forearm.centerOfMass + axis * (index * 3 - 3) + normal * 5,
+                    normal, direction, 3, 0.4, 0.6)
+                waitSeconds(0.2)
+            end
+            ragdoll.addLimbDamage(bare, 'right_forearm', 40)
+        end
+        -- WOUNDFX-03's slash, blunt blow and stab on the breastplate.
+        do
+            local state = ragdoll.getState(armoured)
+            local chest = body(state, 'spine2')
+            local shoulders = body(state, 'right_upper_arm').position - body(state, 'left_upper_arm').position
+            local lateral = util.vector3(shoulders.x, shoulders.y, 0):normalize()
+            local forward = up:cross(lateral):normalize()
+            for _, mark in ipairs({
+                { 'slash', lateral * 3 + up * 2, (lateral * 0.8 - up * 0.6):normalize(), 7, 0.55 },
+                { 'blunt', -lateral * 4 + up * 1, up, 1.0, 1.8 },
+                { 'stab', lateral * 1 - up * 4, (up * 0.8 + lateral * 0.6):normalize(), 2.4, 0.35 } }) do
+                ragdoll.addWoundFx(armoured, 'chest', chest.centerOfMass + mark[2] + forward * 11, forward, mark[3],
+                    mark[4], mark[5], 0.7, mark[1])
+                waitSeconds(0.2)
+            end
+        end
+        waitSeconds(0.3)
+        local body0, limb0, armour0 = counts('wounded')
+        testing.expect(body0 == 4, string.format('%d of the 4 forearm cuts are on the bare dummy', body0))
+        testing.expect(armour0 == 3, string.format('%d of the 3 marks are on the cuirass', armour0))
+        testing.expect(math.abs(limb0 - 40) < 0.5, string.format('the forearm ledger reads %.1f, not 40', limb0))
+        -- Half the missing health back (20% -> 60%): half of what is left.
+        bare:sendEvent('fixActorHealthShare', 0.6)
+        waitSeconds(0.5)
+        local body1, limb1 = counts('half healed')
+        testing.expect(body1 == 2, string.format('half the missing health left %d cuts, not 2', body1))
+        testing.expect(math.abs(limb1 - 20) < 1, string.format('half the missing health left %.1f limb damage, not 20', limb1))
+        -- The armoured dummy's own health all back: its armour marks stay.
+        armoured:sendEvent('fixActorHealthShare', 1)
+        waitSeconds(0.5)
+        local _, _, armour1 = counts('armoured healthy')
+        testing.expect(armour1 == armour0, string.format('health took %d armour marks', armour0 - armour1))
+        -- Full health: nothing left on the bare dummy.
+        bare:sendEvent('fixActorHealthShare', 1)
+        waitSeconds(0.5)
+        local body2, limb2 = counts('healed')
+        testing.expect(body2 == 0, string.format('%d cuts left at full health', body2))
+        testing.expect(limb2 == 0, string.format('%.1f limb damage left at full health', limb2))
+        -- The cuirass repaired: its marks go.
+        types.Item.itemData(cuirass).condition = whole
+        waitSeconds(0.5)
+        local _, _, armour2 = counts('repaired')
+        testing.expect(armour2 == 0, string.format('%d marks left on the repaired cuirass', armour2))
+    end)
+    for _, victim in ipairs(victims) do
+        if victim:isValid() then victim:remove() end
+    end
+    if not ok then error(message, 0) end
+end)
+
 -- WOUNDFX-06 (user 10-31, the release test: "I dont see the wounds" - the
 -- foe was a Hlaalu guard, bonemold from helm to boots, and the log said
 -- "WOUNDFX01 no shader recipe for Tri A_Bonemold_Bracer_W 0"): a stock
@@ -2671,6 +2937,131 @@ for index, weapon in ipairs({ 'iron claymore', 'iron longsword' }) do
     end)
 end
 
+-- CLASH-02 (user 11-03 bookmark 5: blades slide past each other unless
+-- someone parries or holds block): CLASH-01's chops with an iron longsword
+-- into a dummy holding an iron longsword, three with its guard raised as the
+-- cut starts and three with no guard. CLASH02 lines per chop: blade contacts
+-- handled as clashes and as slides (both bodies' counters), the damage the
+-- chop dealt, whether the dummy raised a guard of its own (an NPC hit hard
+-- in the head covers up). With OPENMW_RAGDOLL_CLASH_SLIDE on, a chop with no
+-- guard up the whole time never clashes and a guarded one never slides; off,
+-- every contact clashes.
+registerTest('CLASH-02 chops into a longsword, guarded and open', 918365, function()
+    local player = placePlayer()
+    local victim
+    local savedReaction = ragdoll.reactionScale()
+    local weapon = 'iron longsword'
+    local tally = { guard = { clashes = 0, slides = 0, damage = 0 }, open = { clashes = 0, slides = 0, damage = 0 },
+        covered = { clashes = 0, slides = 0, damage = 0 } }
+    local ok, message = pcall(function()
+        ragdoll.setPlayerAlwaysHits(true)
+        if not types.Actor.inventory(player):find(weapon) then
+            world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+            coroutine.yield()
+        end
+        player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 465, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 465 end)
+        waitSeconds(1)
+        powerAndStand(player, 'CLASH-02 player')
+        cameraReadyMode = nil
+        player:sendEvent('fixPlayerCamera', true)
+        waitFor('CLASH-02 first-person camera', function() return cameraReadyMode == true end)
+        ragdoll.reactionScale(0)
+        ragdoll.prepareMouseInput()
+        local function damageTotal()
+            local total = 0
+            if victim and victim:isValid() then
+                for _, value in pairs(ragdoll.getLimbDamage(victim)) do total = total + value end
+            end
+            return total
+        end
+        local function counts()
+            local clashes, slides = 0, 0
+            for _, actor in ipairs({ player, victim }) do
+                local state = actor and actor:isValid() and ragdoll.getState(actor)
+                if state then
+                    clashes = clashes + (state.clashes or 0)
+                    slides = slides + (state.clashSlides or 0) -- both count one slide
+                end
+            end
+            return clashes, slides / 2
+        end
+        local raised = false
+        local function watchGuard()
+            local vs = victim and victim:isValid() and ragdoll.getState(victim)
+            if vs and vs.guardActive then raised = true end
+        end
+        local function drag(y, seconds)
+            local started, sent = core.getSimulationTime(), 0
+            waitSeconds(seconds, function()
+                local f = math.min(1, (core.getSimulationTime() - started) / seconds)
+                local v = math.floor(y * f)
+                ragdoll.injectMouseInput(0, v - sent)
+                sent = v
+                watchGuard()
+            end)
+            ragdoll.injectMouseInput(0, y - sent)
+        end
+        for _, mode in ipairs({ 'guard', 'open' }) do
+            for rep = 1, 3 do
+                if victim and victim:isValid() then victim:remove() coroutine.yield() end
+                victim = spawnDummy('CLASH-02 longsword', util.vector3(0, 200, 0), weapon)
+                powerAndStand(victim, 'CLASH-02 longsword')
+                local p = ragdoll.getState(player)
+                local shoulder = body(p, 'right_upper_arm').position
+                local elbow = body(p, 'right_forearm').position
+                local hand = body(p, 'right_hand').position
+                local reach = (elbow - shoulder):length() + (hand - elbow):length()
+                local pivot = (body(p, 'left_upper_arm').position + shoulder) * 0.5
+                placeVictimPoint(victim, function()
+                    local vs = ragdoll.getState(victim)
+                    return vs and body(vs, 'spine2').position or victim.position
+                end, pivot + util.vector3(0, reach + p.weapon.length * 0.55, 0), util.transform.rotateZ(math.pi))
+                waitSeconds(0.6)
+                local before = damageTotal()
+                local clashes0, slides0 = counts()
+                raised = false
+                ragdoll.injectMouseInput(0, 0, true, 1)
+                waitSeconds(0.25, watchGuard)
+                drag(-HSC_WIND, 0.4)
+                if mode == 'guard' then ragdoll.setGuard(victim, true) end
+                drag(HSC_CUT, 0.2)
+                waitSeconds(0.3, watchGuard)
+                ragdoll.injectMouseInput(0, 0, false, 1)
+                waitSeconds(0.6, watchGuard)
+                pcall(waitFor, 'CLASH-02 withdrawal', function() watchGuard() return ragdoll.getSwingSpeed(player) == nil end, 4)
+                local clashes1, slides1 = counts()
+                local dealt = damageTotal() - before
+                -- An open chop the dummy covered up against counts apart.
+                local kind = (mode == 'open' and raised) and 'covered' or mode
+                local t = tally[kind]
+                t.clashes = t.clashes + clashes1 - clashes0
+                t.slides = t.slides + slides1 - slides0
+                t.damage = t.damage + dealt
+                print(string.format('CLASH02 mode=%s rep=%d clashes=%d slides=%d damage=%.2f covered=%s',
+                    mode, rep, clashes1 - clashes0, slides1 - slides0, dealt, tostring(mode == 'open' and raised)))
+                if victim and victim:isValid() then ragdoll.setGuard(victim, false) end
+                waitSeconds(0.4)
+            end
+        end
+        print(string.format('CLASH02 summary guard_clashes=%d guard_slides=%d guard_damage=%.2f open_clashes=%d open_slides=%d open_damage=%.2f covered_clashes=%d covered_slides=%d',
+            tally.guard.clashes, tally.guard.slides, tally.guard.damage, tally.open.clashes, tally.open.slides,
+            tally.open.damage, tally.covered.clashes, tally.covered.slides))
+        local slideOn = (tonumber((ragdoll.tuningText('OPENMW_RAGDOLL_CLASH_SLIDE') or '0'):match('^[%d%.]+') or '0') or 0) > 0
+        testing.expect(tally.guard.clashes + tally.guard.slides >= 1, 'no chop met the raised blade')
+        if slideOn then
+            testing.expect(tally.guard.slides == 0, 'a blade contact against a raised guard slid')
+            testing.expect(tally.open.clashes == 0, 'a blade contact with no guard held clashed')
+        end
+    end)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.reactionScale(savedReaction)
+    ragdoll.setPlayerAlwaysHits(false)
+    ragdoll.setPowered(player, false)
+    if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+end)
+
 -- REACT-02 (RXN-02: the reaction baseline before the controller rewrite): a
 -- matrix of blows on a fresh dummy per cell - six parts (head, chest,
 -- shoulder, upper arm, thigh, calf) x three strengths (light, solid, heavy) x
@@ -3028,6 +3419,184 @@ for index, weapon in ipairs({ 'iron longsword', 'iron claymore' }) do
     end)
 end
 
+-- LODGE-01 / LODGE-02 (K2_LODGE; user 11-16: "is it possible to add a behavior
+-- so the stab weapons physically enter the body? and pin the tip somewhat into
+-- the body? ... what would be an equivalent for slashing?"). The player's
+-- dragged strokes at a standing bare dummy's chest: LODGE-01 four spear thrusts
+-- with the lodge off and four with it on (1,1,1: the "game" rows), LODGE-02 longsword cuts
+-- fast and slow. Rows: the damage, what the weapon did in the body (stab: in
+-- and pinned on its line; chop: lodged; pass: through, the part dragged), how
+-- deep and how long, why it let go, how far the dummy's pelvis moved, whether
+-- the weapon stayed in the hand and the player on its feet. FAIL (the game's
+-- value): a weapon torn from the hand, the player down, the dummy thrown 200 u
+-- or more, a lodge still held 4 s after the stroke; LODGE-01 also when fewer
+-- than two paying thrusts went in 2 u or more.
+local function lodgeTest(tag, weapon, sequence, thrusts)
+    return function()
+        local player = placePlayer()
+        local victim
+        local savedReaction = ragdoll.reactionScale()
+        local ok, message = pcall(function()
+            ragdoll.setPlayerAlwaysHits(true)
+            if not types.Actor.inventory(player):find(weapon) then
+                world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+                coroutine.yield()
+            end
+            player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = sequence, firstPerson = false })
+            waitFor('player loadout', function() return playerReadySequence == sequence end)
+            waitSeconds(1)
+            powerAndStand(player, tag .. ' player')
+            ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_AIM', '0')
+            ragdoll.prepareMouseInput()
+            local yaw = player.rotation:getYaw()
+            local forward = util.vector3(math.sin(yaw), math.cos(yaw), 0)
+            local function pivotOf()
+                local p = ragdoll.getState(player)
+                return (body(p, 'left_upper_arm').position + body(p, 'right_upper_arm').position) * 0.5
+            end
+            local seen
+            local function watch()
+                local p = ragdoll.getState(player)
+                if p and p.weapon then
+                    local b = p.bodies[p.weapon.bodyIndex]
+                    local tip = b.position + (b.rotation * util.vector3(0, 0, 1)):normalize() * (p.weapon.length * 0.5)
+                    seen.most = math.max(seen.most, (tip - pivotOf()):dot(forward))
+                    if not p.weapon.attached then seen.lost = true end
+                else
+                    seen.lost = true
+                end
+                if p and p.controller and (p.controller.mode == 'falling' or p.controller.mode == 'fallen') then
+                    seen.down = true
+                end
+                local lodge = ragdoll.getLodge(player)
+                if lodge and lodge.kind ~= 'none' then
+                    seen.kind = lodge.kind
+                    if not lodge.clearing then seen.pinned = seen.pinned + 1 end
+                end
+                if victim and seen.pelvis then
+                    local vs = ragdoll.getState(victim)
+                    if vs then seen.moved = math.max(seen.moved, (body(vs, 'pelvis').position - seen.pelvis):length()) end
+                end
+            end
+            local function fresh()
+                seen = { most = -1e9, moved = 0, pinned = 0 }
+                if victim then
+                    local vs = ragdoll.getState(victim)
+                    seen.pelvis = vs and body(vs, 'pelvis').position
+                end
+            end
+            local function drag(dx, dy, seconds)
+                local steps = math.max(1, math.floor(seconds * 60))
+                local sx, sy = 0, 0
+                for i = 1, steps do
+                    local t = i / steps
+                    local f = t * t * t * (10 - 15 * t + 6 * t * t)
+                    local x, y = math.floor(dx * f), math.floor(dy * f)
+                    if x ~= sx or y ~= sy then ragdoll.injectMouseInput(x - sx, y - sy) end
+                    sx, sy = x, y
+                    waitSeconds(1 / 60, watch)
+                end
+            end
+            -- THRUST-01's dragged thrust, or BITE-01's forehand cut.
+            local function stroke(seconds)
+                pcall(waitFor, 'guard', function() return ragdoll.getSwingSpeed(player) == nil end, 4)
+                waitSeconds(0.5)
+                local presses = ragdoll.getState(player).playerPressCount
+                ragdoll.injectMouseInput(0, 0, true, 1)
+                pcall(waitFor, 'press', function() return ragdoll.getState(player).playerPressCount > presses end, 3)
+                if thrusts then
+                    drag(0, HSC_WIND, 0.45)
+                    waitSeconds(0.25, watch)
+                    drag(0, -HSC_CUT, seconds)
+                else
+                    drag(HSC_WIND, 0, 0.4)
+                    drag(-HSC_CUT, 0, seconds)
+                end
+                waitSeconds(0.4, watch)
+                ragdoll.injectMouseInput(0, 0, false, 1)
+                waitSeconds(1.0, watch)
+            end
+            fresh()
+            stroke(0.3)
+            local reach = seen.most
+            victim = spawnDummy(tag .. ' target', util.vector3(0, 300, 0), false)
+            victim:sendEvent('fixActorHealth', 4000)
+            powerAndStand(victim, tag .. ' target')
+            local function damageTotal()
+                local total = 0
+                for _, value in pairs(ragdoll.getLimbDamage(victim)) do total = total + value end
+                return total
+            end
+            local failures = {}
+            local went = 0
+            local rows = thrusts and { { '0,0,0', 0.3 }, { '0,0,0', 0.3 }, { '0,0,0', 0.3 }, { '0,0,0', 0.3 },
+                    { 'game', 0.3 }, { 'game', 0.3 }, { 'game', 0.3 }, { 'game', 0.3 } }
+                or { { '0,0,0', 0.2 }, { '0,0,0', 0.6 }, { 'game', 0.2 }, { 'game', 0.2 }, { 'game', 0.6 }, { 'game', 0.6 } }
+            for index, row in ipairs(rows) do
+                local game = row[1] == 'game'
+                ragdoll.setTuning('OPENMW_RAGDOLL_K2_LODGE', not game and row[1] or '1,1,1')
+                local p = ragdoll.getState(player)
+                local at = thrusts and pivotOf() + forward * (reach - 10)
+                    or pivotOf() + forward * ((body(p, 'right_forearm').position - body(p, 'right_upper_arm').position):length()
+                        + (body(p, 'right_hand').position - body(p, 'right_forearm').position):length()
+                        + p.weapon.length * 0.55)
+                placeVictimPoint(victim, function()
+                    local vs = ragdoll.getState(victim)
+                    return vs and body(vs, 'spine2').position or victim.position
+                end, at, util.transform.rotateZ(math.pi + yaw))
+                local vs = waitFor(tag .. ' target body', function() return ragdoll.getState(victim) end, 5)
+                if thrusts then
+                    contactAimReady = false
+                    player:sendEvent('fixAimAt', body(vs, 'spine2').position)
+                    pcall(waitFor, tag .. ' aim', function() return contactAimReady end, 4)
+                end
+                waitSeconds(0.3)
+                local before, count = damageTotal(), ragdoll.getLodge(player).count
+                fresh()
+                stroke(row[2])
+                local held = pcall(waitFor, tag .. ' free', function()
+                    watch()
+                    return ragdoll.getLodge(player).kind == 'none'
+                end, 3)
+                local lodge = ragdoll.getLodge(player)
+                local lodged = lodge.count > count
+                local lost = damageTotal() - before
+                print(string.format('%s row=%d lodge=%s drag_s=%.1f damage=%.2f kind=%s deepest=%.1f held=%.2f release=%s'
+                    .. ' pinned_frames=%d dummy_moved=%.0f weapon_lost=%s player_down=%s freed=%s', tag, index, row[1],
+                    row[2], lost, lodged and lodge.lastKind or 'none', lodged and lodge.lastDeepest or 0,
+                    lodged and lodge.lastHeld or 0, lodged and lodge.lastRelease or '-', seen.pinned, seen.moved,
+                    tostring(seen.lost == true), tostring(seen.down == true), tostring(held)))
+                if game then
+                    if seen.lost then failures[#failures + 1] = 'row ' .. index .. ' weapon lost' end
+                    if seen.down then failures[#failures + 1] = 'row ' .. index .. ' player down' end
+                    if seen.moved >= 200 then failures[#failures + 1] = string.format('row %d dummy thrown %.0f', index, seen.moved) end
+                    if not held then failures[#failures + 1] = 'row ' .. index .. ' still lodged after 4 s' end
+                    if lodged and lodge.lastKind == 'stab' and lodge.lastDeepest >= 2 then went = went + 1 end
+                end
+                -- Back on its feet for the next row.
+                pcall(waitFor, tag .. ' target standing', function()
+                    local s = ragdoll.getState(victim)
+                    return s and s.controller and s.controller.mode == 'standing'
+                end, 8)
+                if not ragdoll.getState(player).powered then powerAndStand(player, tag .. ' player') end
+            end
+            if thrusts and went < 2 then failures[#failures + 1] = went .. ' of 4 thrusts went in 2 u or more' end
+            print(string.format('%s result %s %s', tag, #failures == 0 and 'PASS' or 'FAIL', table.concat(failures, '; ')))
+            testing.expect(#failures == 0, table.concat(failures, '; '))
+        end)
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_LODGE', nil)
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_AIM', nil)
+        ragdoll.reactionScale(savedReaction)
+        ragdoll.injectMouseInput(0, 0, false)
+        ragdoll.setPlayerAlwaysHits(false)
+        ragdoll.setPowered(player, false)
+        if victim and victim:isValid() then victim:remove() end
+        if not ok then error(message, 0) end
+    end
+end
+registerTest('LODGE-01 spear thrusts go in and pin', 919236, lodgeTest('LODGE01', 'iron spear', 496, true))
+registerTest('LODGE-02 longsword cuts lodge or pass', 919237, lodgeTest('LODGE02', 'iron longsword', 497, false))
+
 -- REACT-03 (RXN-02, the robustness sweep after DReCon's cube test): a dummy
 -- walks back and forth for 60 s taking a blow every 1.2-1.8 s - a random
 -- part, strength (light/solid/heavy weights 3/2/1) and direction - through
@@ -3288,6 +3857,9 @@ for index, weapon in ipairs({ 'fists', 'iron dagger' }) do
         local ok, message = pcall(function()
             ragdoll.setPlayerAlwaysHits(true)
             local armed = weapon ~= 'fists'
+            -- The wheel's aimed punch: FIST-05's flicks would throw the left jab.
+            ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIGHT_NIGHT', '0')
+            ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', '0,300')
             if armed and not types.Actor.inventory(player):find(weapon) then
                 world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
                 coroutine.yield()
@@ -3310,6 +3882,9 @@ for index, weapon in ipairs({ 'fists', 'iron dagger' }) do
             local hits, attempts = 0, 0
             for _, placement in ipairs(punchPlacements) do
                 for _ = 1, 2 do
+                    -- Fists take fatigue: a dummy punched out collapses and
+                    -- cannot be placed (11-07: knocked out after 7 punches).
+                    victim:sendEvent('fixActorFatigue', types.Actor.stats.dynamic.fatigue(victim).base)
                     local p = ragdoll.getState(player)
                     local shoulder = body(p, 'right_upper_arm').position
                     local elbow = body(p, 'right_forearm').position
@@ -3376,6 +3951,8 @@ for index, weapon in ipairs({ 'fists', 'iron dagger' }) do
             end
             print(string.format('PUNCH01_TOTAL weapon=%s hits=%d of %d', weapon, hits, attempts))
         end)
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIGHT_NIGHT', nil)
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', nil)
         ragdoll.injectMouseInput(0, 0, false)
         ragdoll.reactionScale(savedReaction)
         ragdoll.setPlayerAlwaysHits(false)
@@ -4388,6 +4965,93 @@ end
 -- the series cost and the blade's strikes; the engine's RAGDOLL_HSC_COMBO
 -- lines give each chained cut's flow (0-1) and its fatigue share. With the
 -- switch on, square should flow and pay less; reverse and clicks not.
+-- REACH-01 (B6, 11-03 play: "I feel for some reason that the axe range is
+-- too small sometimes?"): a standing foe 0, 20 and 35 units past the blade's
+-- sweet reach (the shoulder, the arm's reach and 0.6 of the weapon), three
+-- standing clicks at each; REACH01 lines count the blade's strikes. In the
+-- 11-03 recording the battle axe touched a foe 100-130 away in 26% of its
+-- cuts, a one-handed sword of its length in 52%. Measures, asserts only
+-- that a click at the sweet reach strikes.
+for index, weapon in ipairs({ 'iron battle axe', 'iron longsword', 'iron claymore' }) do
+    registerTest('REACH-01 clicks past the sweet reach with ' .. weapon, 919550 + index, function()
+        local player = placePlayer()
+        local victim
+        local ok, message = pcall(function()
+            if not types.Actor.inventory(player):find(weapon) then
+                world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+                coroutine.yield()
+            end
+            player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 967 + index, firstPerson = false })
+            waitFor('player loadout', function() return playerReadySequence == 967 + index end)
+            waitSeconds(1)
+            powerAndStand(player, 'REACH-01 player')
+            player:sendEvent('fixSetWeaponSkill', 90)
+            waitFor('REACH-01 weapon attached', function()
+                local st = ragdoll.getState(player)
+                return st and st.weapon ~= nil
+            end, 5)
+            ragdoll.prepareMouseInput()
+            local atSweet = 0
+            for _, past in ipairs({ 0, 20, 35 }) do
+                local strikes = 0
+                for rep = 1, 3 do
+                    if not victim or not victim:isValid() or types.Actor.isDead(victim) or not ragdoll.getState(victim) then
+                        if victim and victim:isValid() then victim:remove() coroutine.yield() end
+                        victim = spawnDummy('REACH-01 target', util.vector3(0, 200, 0), false)
+                        powerAndStand(victim, 'REACH-01 target')
+                    end
+                    pcall(waitFor, 'REACH-01 guard', function() return ragdoll.getSwingSpeed(player) == nil end, 4)
+                    local p = ragdoll.getState(player)
+                    local shoulder = body(p, 'right_upper_arm').position
+                    local reach = (body(p, 'right_forearm').position - shoulder):length()
+                        + (body(p, 'right_hand').position - body(p, 'right_forearm').position):length()
+                    local pivot = (body(p, 'left_upper_arm').position + shoulder) * 0.5
+                    placeVictimPoint(victim, function()
+                        local vs = ragdoll.getState(victim)
+                        return vs and body(vs, 'spine2').position or victim.position
+                    end, pivot + util.vector3(0, reach + p.weapon.length * 0.6 + past, 0), util.transform.rotateZ(math.pi))
+                    player:sendEvent('fixSetFatigue', 1.0)
+                    waitSeconds(0.5)
+                    local before = ragdoll.getState(player).weapon.strikeEventCount
+                    -- How far the body went toward the foe (the step-in): the
+                    -- pelvis's most along the foe's way during the click.
+                    local pelvis0 = body(ragdoll.getState(player), 'pelvis').position
+                    local stepIn = 0
+                    -- The aim preview's mark as the cut begins (K2_AIM_PREVIEW):
+                    -- -1 none, 0 short or wide, 1 a hit.
+                    local markAtCut, gapAtCut = nil, 0
+                    local function watchStep()
+                        local ps = ragdoll.getState(player)
+                        if ps then stepIn = math.max(stepIn, body(ps, 'pelvis').position.y - pelvis0.y) end
+                        if ps and ps.hsc and ps.hsc.stage == 2 and markAtCut == nil then
+                            markAtCut = ps.hsc.mark and (ps.hsc.markHit and 1 or 0) or -1
+                            gapAtCut = ps.hsc.markGap or 0
+                        end
+                    end
+                    ragdoll.injectMouseInput(0, 0, true, 1)
+                    waitSeconds(0.08, watchStep)
+                    ragdoll.injectMouseInput(0, 0, false, 1)
+                    waitSeconds(1.5, watchStep)
+                    local st = ragdoll.getState(player)
+                    local got = st and st.weapon and (st.weapon.strikeEventCount - before) or 0
+                    if got > 0 then strikes = strikes + 1 end
+                    local vs = ragdoll.getState(victim)
+                    print(string.format('REACH01_CLICK weapon=%s past=%d rep=%d strikes=%d chest_dist=%.1f step_in=%.1f mark=%d gap=%.1f',
+                        weapon, past, rep, got, vs and (body(vs, 'spine2').position - pivot):length() or -1, stepIn,
+                        markAtCut or -2, gapAtCut))
+                end
+                print(string.format('REACH01 weapon=%s past=%d clicks=3 struck=%d', weapon, past, strikes))
+                if past == 0 then atSweet = strikes end
+            end
+            testing.expect(atSweet >= 1, 'REACH-01: no click struck at the sweet reach')
+        end)
+        ragdoll.injectMouseInput(0, 0, false)
+        ragdoll.setPowered(player, false)
+        if victim and victim:isValid() then victim:remove() end
+        if not ok then error(message, 0) end
+    end)
+end
+
 for index, weapon in ipairs({ 'iron longsword', 'iron claymore' }) do
     registerTest('COMBO-01 chain flow with ' .. weapon, 919500 + index, function()
         local player = placePlayer()
@@ -4619,7 +5283,7 @@ for index, weapon in ipairs({ 'iron longsword', 'iron claymore' }) do
                     lastStage = stage
                     steps = steps + 1
                     if (st.weapon.supportGrip or {}).attached then held = held + 1 end
-                    if st.hsc then gripModes[st.hsc.grip or -1] = true end
+                    if st.hsc then gripModes[st.hsc.gripMode or -1] = true end
                 end
                 for _ = 1, 8 do
                     ragdoll.injectMouseInput(0, 0, true, 1)
@@ -4668,7 +5332,7 @@ for index, weapon in ipairs({ 'iron longsword', 'iron claymore' }) do
             ragdoll.cycleGrip(player)
             waitSeconds(1.0)
             local st = ragdoll.getState(player)
-            if st.hsc and st.hsc.grip == 2 then
+            if st.hsc and st.hsc.gripMode == 2 then
                 d, length = spacing()
                 print(string.format('GRIP05_MURDER weapon=%s attached=%s spacing=%.1f share=%.2f weapon_attached=%s',
                     weapon, tostring(grip().attached), d, d / math.max(1, length), tostring(st.weapon.attached)))
@@ -4681,8 +5345,8 @@ for index, weapon in ipairs({ 'iron longsword', 'iron claymore' }) do
             end
             d, length = spacing()
             print(string.format('GRIP05_BACK weapon=%s grip=%s attached=%s spacing=%.1f weapon_attached=%s', weapon,
-                tostring(st.hsc and st.hsc.grip), tostring(grip().attached), d, tostring(st.weapon.attached)))
-            testing.expect(st.hsc == nil or st.hsc.grip == 0, 'GRIP-05 the grip did not come back to normal')
+                tostring(st.hsc and st.hsc.gripMode), tostring(grip().attached), d, tostring(st.weapon.attached)))
+            testing.expect(st.hsc == nil or st.hsc.gripMode == 0, 'GRIP-05 the grip did not come back to normal')
         end)
         ragdoll.injectMouseInput(0, 0, false)
         ragdoll.setPowered(player, false)
@@ -4703,6 +5367,7 @@ registerTest('FIST-02 jab and cross', 919530, function()
     local victim
     local savedReaction = ragdoll.reactionScale()
     local ok, message = pcall(function()
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', '0,300') -- FIST-05's control, not FIST-06's
         player:sendEvent('fixPlayerConfigure', { sequence = 950, firstPerson = false })
         waitFor('player loadout', function() return playerReadySequence == 950 end)
         waitSeconds(1)
@@ -4754,11 +5419,1355 @@ registerTest('FIST-02 jab and cross', 919530, function()
                 health0 - types.Actor.stats.dynamic.fatigue(victim).current))
         end
     end)
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', nil)
     ragdoll.injectMouseInput(0, 0, false)
     ragdoll.setPlayerAlwaysHits(false)
     ragdoll.reactionScale(savedReaction)
     ragdoll.setPowered(player, false)
     if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+end)
+
+-- FIST-04 (K2_FISTS, user 11-05: "I can only move 1 hand and its impossible to
+-- aim"): with bare fists a held drag to the left throws the left fist and a
+-- drag to the right winds the right up; the left lands. FIST04 lines: the
+-- left punches thrown, the right's wind-ups, the left hand's reach share and
+-- the fatigue the target lost.
+registerTest('FIST-04 a left drag throws the left fist', 919531, function()
+    if (tonumber(ragdoll.tuningText('OPENMW_RAGDOLL_K2_FIGHT_NIGHT') or '0') or 0) > 0 then
+        print('FIST04 skipped: K2_FIGHT_NIGHT replaces the steered drags (FIST-05)')
+        return
+    end
+    local player = placePlayer()
+    local victim
+    local savedReaction = ragdoll.reactionScale()
+    local ok, message = pcall(function()
+        player:sendEvent('fixPlayerConfigure', { sequence = 951, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 951 end)
+        waitSeconds(1)
+        powerAndStand(player, 'FIST-04 player')
+        ragdoll.setPlayerAlwaysHits(true)
+        ragdoll.reactionScale(0)
+        ragdoll.prepareMouseInput()
+        victim = spawnDummy('FIST-04 target', util.vector3(0, 200, 0), false)
+        victim:sendEvent('fixActorHealth', 1000)
+        powerAndStand(victim, 'FIST-04 target')
+        local p = ragdoll.getState(player)
+        local shoulder = body(p, 'right_upper_arm').position
+        local reach = (body(p, 'right_forearm').position - shoulder):length()
+            + (body(p, 'right_hand').position - body(p, 'right_forearm').position):length()
+        local pivot = (body(p, 'left_upper_arm').position + shoulder) * 0.5
+        placeVictimPoint(victim, function()
+            local vs = ragdoll.getState(victim)
+            return vs and body(vs, 'spine2').position or victim.position
+        end, pivot + util.vector3(0, reach + 8, 0), util.transform.rotateZ(math.pi))
+        waitSeconds(1.2)
+        local jabs0 = (ragdoll.getState(player).hsc or {}).jabs or 0
+        local fatigue0 = types.Actor.stats.dynamic.fatigue(victim).current
+        local leftReach, rightWinds, lastStage = 0, 0, nil
+        local function watch()
+            local st = ragdoll.getState(player)
+            if not st then return end
+            local stage = st.hsc and st.hsc.stage
+            if stage == 1 and lastStage ~= 1 then rightWinds = rightWinds + 1 end
+            lastStage = stage
+            local h, sh, fa = body(st, 'left_hand'), body(st, 'left_upper_arm'), body(st, 'left_forearm')
+            local arm = (fa.position - sh.position):length() + (h.position - fa.position):length()
+            leftReach = math.max(leftReach, (h.position - sh.position):length() / math.max(1, arm))
+        end
+        for _ = 1, 3 do
+            ragdoll.injectMouseInput(0, 0, true, 1)
+            waitSeconds(0.05, watch)
+            for _ = 1, 6 do
+                ragdoll.injectMouseInput(-30, 0, true, 1)
+                waitSeconds(1 / 60, watch)
+            end
+            waitSeconds(0.5, watch)
+            ragdoll.injectMouseInput(0, 0, false, 1)
+            waitSeconds(0.4, watch)
+        end
+        -- One drag to the right: the right fist winds up, no left punch.
+        local jabsLeft = ((ragdoll.getState(player).hsc or {}).jabs or 0) - jabs0
+        ragdoll.injectMouseInput(0, 0, true, 1)
+        waitSeconds(0.05, watch)
+        for _ = 1, 6 do
+            ragdoll.injectMouseInput(30, 0, true, 1)
+            waitSeconds(1 / 60, watch)
+        end
+        waitSeconds(0.3, watch)
+        ragdoll.injectMouseInput(0, 0, false, 1)
+        waitSeconds(0.8, watch)
+        local jabsAfter = ((ragdoll.getState(player).hsc or {}).jabs or 0) - jabs0
+        local lost = fatigue0 - types.Actor.stats.dynamic.fatigue(victim).current
+        print(string.format('FIST04 left_punches=%d after_right=%d right_winds=%d left_reach=%.2f fatigue_lost=%.1f',
+            jabsLeft, jabsAfter, rightWinds, leftReach, lost))
+        if jabsLeft < 2 then error('FIST-04: left drags threw ' .. jabsLeft .. ' left punches (want 2+)', 0) end
+        if jabsAfter ~= jabsLeft then error('FIST-04: a right drag threw the left fist', 0) end
+        if rightWinds < 1 then error('FIST-04: the right drag never wound the right fist up', 0) end
+        if lost <= 0 then error('FIST-04: no left punch landed (target fatigue unchanged)', 0) end
+    end)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPlayerAlwaysHits(false)
+    ragdoll.reactionScale(savedReaction)
+    ragdoll.setPowered(player, false)
+    if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+end)
+
+-- FIST-05 (K2_FIGHT_NIGHT, user 11-07: "something like fight night
+-- fistfighting"): bare fists against a dummy, eight presses - flicks up-left
+-- (the left jab), up-right (the right cross), to the left (the right hook),
+-- to the right (the left hook), down-left and down-right (the uppercuts), a
+-- long up-left (the left haymaker) and a press without a drag (the next
+-- straight: the right's, after the left haymaker). FIST05 lines: the left
+-- punches (hsc.jabs), the right's wind-ups, the left hand's reach share, the
+-- fatigue the target lost, and the player's own fatigue spent by the quick
+-- haymaker. FAIL: the hands' counts (4 and 4), the left short of 0.8 of its
+-- reach, or no landing.
+registerTest('FIST-05 flicks throw both hands', 919532, function()
+    local player = placePlayer()
+    local victim
+    local savedReaction = ragdoll.reactionScale()
+    local ok, message = pcall(function()
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', '0,300') -- FIST-05's control, not FIST-06's
+        player:sendEvent('fixPlayerConfigure', { sequence = 952, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 952 end)
+        waitSeconds(1)
+        powerAndStand(player, 'FIST-05 player')
+        ragdoll.setPlayerAlwaysHits(true)
+        ragdoll.reactionScale(0)
+        ragdoll.prepareMouseInput()
+        victim = spawnDummy('FIST-05 target', util.vector3(0, 200, 0), false)
+        victim:sendEvent('fixActorHealth', 1000)
+        powerAndStand(victim, 'FIST-05 target')
+        local p = ragdoll.getState(player)
+        local shoulder = body(p, 'right_upper_arm').position
+        local reach = (body(p, 'right_forearm').position - shoulder):length()
+            + (body(p, 'right_hand').position - body(p, 'right_forearm').position):length()
+        local pivot = (body(p, 'left_upper_arm').position + shoulder) * 0.5
+        placeVictimPoint(victim, function()
+            local vs = ragdoll.getState(victim)
+            return vs and body(vs, 'spine2').position or victim.position
+        end, pivot + util.vector3(0, reach + 8, 0), util.transform.rotateZ(math.pi))
+        waitSeconds(1.2)
+        local jabs0 = (ragdoll.getState(player).hsc or {}).jabs or 0
+        local fatigue0 = types.Actor.stats.dynamic.fatigue(victim).current
+        local leftReach, rightWinds, lastStage = 0, 0, nil
+        local flickTurn, flickStart, turns = 0, nil, {}
+        local function watch()
+            local st = ragdoll.getState(player)
+            if not st then return end
+            local stage = st.hsc and st.hsc.stage
+            if stage == 1 and lastStage ~= 1 then rightWinds = rightWinds + 1 end
+            lastStage = stage
+            local h, sh, fa = body(st, 'left_hand'), body(st, 'left_upper_arm'), body(st, 'left_forearm')
+            local arm = (fa.position - sh.position):length() + (h.position - fa.position):length()
+            leftReach = math.max(leftReach, (h.position - sh.position):length() / math.max(1, arm))
+            -- The shoulder line's turn since the flick began (deg, + = to the
+            -- right: the left shoulder in), its extreme within this flick.
+            local ls, rs = body(st, 'left_upper_arm').position, body(st, 'right_upper_arm').position
+            local yaw = player.rotation:getYaw()
+            local across = rs - ls
+            -- (the actor faces (sin yaw, cos yaw))
+            local turn = math.deg(math.atan2(-(across.x * math.sin(yaw) + across.y * math.cos(yaw)),
+                across.x * math.cos(yaw) - across.y * math.sin(yaw)))
+            if flickStart == nil then flickStart = turn end
+            if math.abs(turn - flickStart) > math.abs(flickTurn) then flickTurn = turn - flickStart end
+        end
+        local function flick(dx, dy, steps)
+            flickTurn, flickStart = 0, nil
+            ragdoll.injectMouseInput(0, 0, true, 1)
+            waitSeconds(0.05, watch)
+            for _ = 1, steps do
+                ragdoll.injectMouseInput(dx, dy, true, 1)
+                waitSeconds(1 / 60, watch)
+            end
+            ragdoll.injectMouseInput(0, 0, false, 1)
+            waitSeconds(0.8, watch)
+            turns[#turns + 1] = string.format('%.0f', flickTurn)
+        end
+        local own = types.Actor.stats.dynamic.fatigue(player)
+        -- (the injected mouse's y grows downward: up is a negative dy)
+        flick(-40, -40, 6) -- up-left: the left jab
+        flick(40, -40, 6) -- up-right: the right cross
+        flick(-60, 0, 6) -- left: the right hook
+        flick(60, 0, 6) -- right: the left hook
+        flick(-40, 40, 6) -- down-left: the left uppercut
+        flick(40, 40, 6) -- down-right: the right uppercut
+        local beforeHay = own.current
+        flick(-120, -120, 8) -- a long up-left: the left haymaker
+        local hay = beforeHay - own.current
+        flick(0, 0, 0) -- a press without a drag: the next straight (the right's)
+        local left = ((ragdoll.getState(player).hsc or {}).jabs or 0) - jabs0
+        local lost = fatigue0 - types.Actor.stats.dynamic.fatigue(victim).current
+        print(string.format('FIST05 left_punches=%d right_winds=%d left_reach=%.2f fatigue_lost=%.1f haymaker_cost=%.1f',
+            left, rightWinds, leftReach, lost, hay))
+        -- In the flicks' order: jab L, cross R, hook R, hook L, uppercut L, uppercut R, haymaker L, straight R.
+        print('FIST05 chest_turn_deg=' .. table.concat(turns, ','))
+        if left ~= 4 then error('FIST-05: the left threw ' .. left .. ' punches (want 4)', 0) end
+        if rightWinds ~= 4 then error('FIST-05: the right threw ' .. rightWinds .. ' punches (want 4)', 0) end
+        if leftReach < 0.8 then error(string.format('FIST-05: the left fist reached %.2f of the arm (want 0.8+)', leftReach), 0) end
+        if lost <= 0 then error('FIST-05: no punch landed (target fatigue unchanged)', 0) end
+    end)
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', nil)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPlayerAlwaysHits(false)
+    ragdoll.reactionScale(savedReaction)
+    ragdoll.setPowered(player, false)
+    if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+end)
+
+-- FIST-06 (K2_FIST_STEER; user 11-12: "when I click and hold with fists
+-- nothing happens", "it must feel like... really good /controllable"): bare
+-- fists against a dummy. A tap of each button throws that hand's straight
+-- (the left button the right fist, the right button the left); a held button
+-- moves its fist with the mouse (dragged to the hand's own side: the hook's
+-- wind-up) and letting go throws it from there; both buttons raise the guard
+-- and throw nothing. FIST06 lines: per step the punches each hand threw, how
+-- far each held fist went to its own side (units, in the actor's frame) and
+-- the fatigue the target lost. FAIL: a tap or a release that throws nothing
+-- or the wrong hand, a held fist under 6 u to its own side, the guard not
+-- up under both buttons or a punch thrown from it, or no landing.
+registerTest('FIST-06 steered fists', 919533, function()
+    if (tonumber((ragdoll.tuningText('OPENMW_RAGDOLL_K2_FIST_STEER') or '0'):match('^[^,]+')) or 0) <= 0 then
+        print('FIST06 skipped: K2_FIST_STEER is off')
+        return
+    end
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', '1,300') -- the steered fists (mode 2 is FIST-07's)
+    local LEFT_BUTTON, RIGHT_BUTTON = 1, 3
+    local player = placePlayer()
+    local victim
+    local savedReaction = ragdoll.reactionScale()
+    local ok, message = pcall(function()
+        player:sendEvent('fixPlayerConfigure', { sequence = 953, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 953 end)
+        waitSeconds(1)
+        powerAndStand(player, 'FIST-06 player')
+        ragdoll.setPlayerAlwaysHits(true)
+        ragdoll.reactionScale(0)
+        ragdoll.prepareMouseInput()
+        victim = spawnDummy('FIST-06 target', util.vector3(0, 200, 0), false)
+        victim:sendEvent('fixActorHealth', 1000)
+        powerAndStand(victim, 'FIST-06 target')
+        local p = ragdoll.getState(player)
+        local shoulder = body(p, 'right_upper_arm').position
+        local reach = (body(p, 'right_forearm').position - shoulder):length()
+            + (body(p, 'right_hand').position - body(p, 'right_forearm').position):length()
+        local pivot = (body(p, 'left_upper_arm').position + shoulder) * 0.5
+        placeVictimPoint(victim, function()
+            local vs = ragdoll.getState(victim)
+            return vs and body(vs, 'spine2').position or victim.position
+        end, pivot + util.vector3(0, reach + 8, 0), util.transform.rotateZ(math.pi))
+        waitSeconds(1.2)
+        local fatigue0 = types.Actor.stats.dynamic.fatigue(victim).current
+        local rightWinds, lastStage = 0, nil
+        local function jabs() return (ragdoll.getState(player).hsc or {}).jabs or 0 end
+        -- A hand's place to the actor's right of the middle of the shoulders
+        -- and ahead of it (units).
+        local function handAt(name)
+            local st = ragdoll.getState(player)
+            local yaw = player.rotation:getYaw()
+            local mid = (body(st, 'left_upper_arm').position + body(st, 'right_upper_arm').position) * 0.5
+            local d = body(st, name).position - mid
+            return d.x * math.cos(yaw) - d.y * math.sin(yaw), d.x * math.sin(yaw) + d.y * math.cos(yaw)
+        end
+        local function watch()
+            local st = ragdoll.getState(player)
+            local stage = st and st.hsc and st.hsc.stage
+            if stage == 1 and lastStage ~= 1 then rightWinds = rightWinds + 1 end
+            lastStage = stage
+        end
+        local function counts() return jabs(), rightWinds end
+        local function expect(label, left0, right0, wantLeft, wantRight)
+            local left, right = jabs() - left0, rightWinds - right0
+            print(string.format('FIST06 %s left_punches=%d right_punches=%d', label, left, right))
+            if left ~= wantLeft or right ~= wantRight then
+                error(string.format('FIST-06 %s: threw left %d right %d (want %d and %d)', label, left, right,
+                    wantLeft, wantRight), 0)
+            end
+        end
+        local function tap(button)
+            ragdoll.injectMouseInput(0, 0, true, button)
+            waitSeconds(0.05, watch)
+            ragdoll.injectMouseInput(0, 0, false, button)
+            waitSeconds(0.9, watch)
+        end
+        -- Holds `button`, drags (dx, 0) over 6 steps, holds on; the hand's
+        -- travel to its own side since before the press. Then lets go.
+        local function holdAndThrow(button, hand, dx, side)
+            local rest = handAt(hand)
+            local restAt = body(ragdoll.getState(player), hand).position
+            ragdoll.injectMouseInput(0, 0, true, button)
+            waitSeconds(0.35, watch)
+            for _ = 1, 6 do
+                ragdoll.injectMouseInput(dx, 0, true, button)
+                waitSeconds(1 / 60, watch)
+            end
+            waitSeconds(0.5, watch)
+            local held = (handAt(hand) - rest) * side
+            -- The held arm's joints, right of and ahead of the shoulders' middle, and their height over it.
+            do
+                local st = ragdoll.getState(player)
+                local mid = (body(st, 'left_upper_arm').position + body(st, 'right_upper_arm').position) * 0.5
+                local prefix = hand:match('^(%a+)_')
+                local row = {}
+                for _, part in ipairs({ '_upper_arm', '_forearm', '_hand' }) do
+                    local x, y = handAt(prefix .. part)
+                    row[#row + 1] = string.format('%s=%.1f,%.1f,%.1f', part, x, y, body(st, prefix .. part).position.z - mid.z)
+                end
+                print('FIST06 held ' .. prefix .. ' arm ' .. table.concat(row, ' '))
+            end
+            local moved = (body(ragdoll.getState(player), hand).position - restAt):length()
+            ragdoll.injectMouseInput(0, 0, false, button)
+            waitSeconds(1.0, watch)
+            return held, moved
+        end
+
+        local l0, r0 = counts()
+        tap(RIGHT_BUTTON)
+        expect('right button tap', l0, r0, 1, 0)
+        l0, r0 = counts()
+        tap(LEFT_BUTTON)
+        expect('left button tap', l0, r0, 0, 1)
+
+        l0, r0 = counts()
+        local rightHeld = holdAndThrow(LEFT_BUTTON, 'right_hand', 50, 1)
+        print(string.format('FIST06 right fist held to its side %.1f u', rightHeld))
+        expect('right fist held and let go', l0, r0, 0, 1)
+        l0, r0 = counts()
+        local leftHeld, leftMoved = holdAndThrow(RIGHT_BUTTON, 'left_hand', -50, -1)
+        print(string.format('FIST06 left fist held to its side %.1f u, moved %.1f u', leftHeld, leftMoved))
+        expect('left fist held and let go', l0, r0, 1, 0)
+        if rightHeld < 6 then error(string.format('FIST-06: the held right fist moved %.1f u (want 6+)', rightHeld), 0) end
+        if leftHeld < 6 then error(string.format('FIST-06: the held left fist moved %.1f u (want 6+)', leftHeld), 0) end
+
+        -- Both buttons: the guard, and nothing thrown when they come up.
+        l0, r0 = counts()
+        ragdoll.injectMouseInput(0, 0, true, LEFT_BUTTON)
+        waitSeconds(0.3, watch)
+        ragdoll.injectMouseInput(0, 0, true, RIGHT_BUTTON)
+        waitSeconds(0.6, watch)
+        local guarded = ragdoll.getState(player).guardActive == true
+        ragdoll.injectMouseInput(0, 0, false, RIGHT_BUTTON)
+        waitSeconds(0.1, watch)
+        ragdoll.injectMouseInput(0, 0, false, LEFT_BUTTON)
+        waitSeconds(0.9, watch)
+        print('FIST06 both buttons guard=' .. tostring(guarded))
+        expect('both buttons', l0, r0, 0, 0)
+        if not guarded then error('FIST-06: both buttons did not raise the guard', 0) end
+        if ragdoll.getState(player).guardActive then error('FIST-06: the guard stayed up', 0) end
+
+        local lost = fatigue0 - types.Actor.stats.dynamic.fatigue(victim).current
+        print(string.format('FIST06 fatigue_lost=%.1f', lost))
+        if lost <= 0 then error('FIST-06: no punch landed (target fatigue unchanged)', 0) end
+    end)
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', nil)
+    ragdoll.injectMouseInput(0, 0, false, 3)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPlayerAlwaysHits(false)
+    ragdoll.reactionScale(savedReaction)
+    ragdoll.setPowered(player, false)
+    if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+end)
+
+-- FIST-12 (K2_FIST_STEER 4, the registry's value; the user's 11-17 play:
+-- "my left hand/arm moves very little! can't do any punches"): the hub's own
+-- fist control against a dummy. A tap of each button; each button held, the
+-- fist wound down, to its own side and up (300 counts) and thrown by a stroke
+-- back (240 counts in 0.05 s), the button let go 0.1 s on so 1.4 s of rest
+-- follow; each button held, wound and let go (nothing thrown). FIST12 lines:
+-- each hand's place from its own shoulder at rest (right, ahead, up; the left
+-- against its guard's place 0.12, 0.46, 0.16 of the arm), how far each held
+-- fist went from its rest, the punches thrown (the left's count, the wheel's
+-- strikes for the right) and per punch the hand's farthest travel, its path
+-- out and after that point, the right fist's commanded path after it, the
+-- top speed after it, the settle time (within 8 u of where it ends, under
+-- 60 u/s), how far from its rest place before the press it ends (ends_off),
+-- how far ahead of its shoulder the strike got and how far that is from the
+-- rest place. "That point" is the hand farthest ahead of its shoulder. With OPENMW_RAGDOLL_HSC_TRACE the engine's
+-- RAGDOLL_FIST_HOLD rows give the held fists' asked and real places, owner,
+-- applied and reach error. FAIL: the left hand over 8 u from its guard at
+-- rest, a held fist that moved under 6 u, a stroke that threw nothing or the
+-- other hand, a let-go that threw.
+registerTest('FIST-12 the weapons\' charge', 919541, function()
+    local mode = tonumber((ragdoll.tuningText('OPENMW_RAGDOLL_K2_FIST_STEER') or '0'):match('^[^,]+')) or 0
+    if mode <= 0 then
+        print('FIST12 skipped: K2_FIST_STEER is off')
+        return
+    end
+    local LEFT_BUTTON, RIGHT_BUTTON = 1, 3
+    local player = placePlayer()
+    local victim
+    local savedReaction = ragdoll.reactionScale()
+    local failures = {}
+    local function fail(text)
+        failures[#failures + 1] = text
+        print('FIST12 FAIL ' .. text)
+    end
+    local ok, message = pcall(function()
+        player:sendEvent('fixPlayerConfigure', { sequence = 961, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 961 end)
+        waitSeconds(1)
+        powerAndStand(player, 'FIST-12 player')
+        ragdoll.setPlayerAlwaysHits(true)
+        ragdoll.reactionScale(0)
+        ragdoll.prepareMouseInput()
+        victim = spawnDummy('FIST-12 target', util.vector3(0, 200, 0), false)
+        victim:sendEvent('fixActorHealth', 1000)
+        powerAndStand(victim, 'FIST-12 target')
+        local p = ragdoll.getState(player)
+        local shoulder = body(p, 'right_upper_arm').position
+        local reach = (body(p, 'right_forearm').position - shoulder):length()
+            + (body(p, 'right_hand').position - body(p, 'right_forearm').position):length()
+        local pivot = (body(p, 'left_upper_arm').position + shoulder) * 0.5
+        placeVictimPoint(victim, function()
+            local vs = ragdoll.getState(victim)
+            return vs and body(vs, 'spine2').position or victim.position
+        end, pivot + util.vector3(0, reach + 8, 0), util.transform.rotateZ(math.pi))
+        waitSeconds(1.2)
+        print(string.format('FIST12 mode=%d steer=%s arm=%.1f first_person=false', mode,
+            tostring(ragdoll.tuningText('OPENMW_RAGDOLL_K2_FIST_STEER')), reach))
+        -- The right fist's punches are the wheel's strikes (stage 2): a fist
+        -- held winding up is published as stage 1 for the reticle, either hand's.
+        local rightWinds, lastStage = 0, nil
+        local function jabs() return (ragdoll.getState(player).hsc or {}).jabs or 0 end
+        local function watch()
+            local st = ragdoll.getState(player)
+            local stage = st and st.hsc and st.hsc.stage
+            if stage == 2 and lastStage ~= 2 then rightWinds = rightWinds + 1 end
+            lastStage = stage
+        end
+        -- A hand from its own shoulder in the actor's frame: right, ahead, up.
+        local function fromShoulder(side)
+            local st = ragdoll.getState(player)
+            local yaw = player.rotation:getYaw()
+            local d = body(st, side .. '_hand').position - body(st, side .. '_upper_arm').position
+            return util.vector3(d.x * math.cos(yaw) - d.y * math.sin(yaw), d.x * math.sin(yaw) + d.y * math.cos(yaw), d.z)
+        end
+        local function meanPlace(side, seconds)
+            local sum, n = util.vector3(0, 0, 0), 0
+            waitSeconds(seconds, function()
+                watch()
+                sum = sum + fromShoulder(side)
+                n = n + 1
+            end)
+            return sum / math.max(n, 1)
+        end
+        local guard = util.vector3(0.12, 0.46, 0.16) * reach
+        local function rest(label)
+            local l, r = meanPlace('left', 0.4), meanPlace('right', 0.4)
+            local off = (l - guard):length()
+            print(string.format('FIST12 rest %s left=%.1f,%.1f,%.1f guard=%.1f,%.1f,%.1f left_off=%.1f right=%.1f,%.1f,%.1f',
+                label, l.x, l.y, l.z, guard.x, guard.y, guard.z, off, r.x, r.y, r.z))
+            return off
+        end
+        -- A punch and the rest after it, the button let go `letGo` s in (nil:
+        -- it is up already): over 1.5 s the farthest the hand goes from where
+        -- it is now, its path up to that point and after it, its top speed
+        -- after it, and the time from that point until it stays within 8 u of
+        -- where it ends and under 60 u/s (-1: never). The right fist's
+        -- commanded place (the wheel's grip) too: its path after that point.
+        local function punchAndRest(side, button, letGo, restAt)
+            local from, samples, grips, times = fromShoulder(side), {}, {}, {}
+            local began = core.getSimulationTime()
+            waitSeconds(1.5, function()
+                watch()
+                local now = core.getSimulationTime() - began
+                if letGo and now >= letGo then
+                    ragdoll.injectMouseInput(0, 0, false, button)
+                    letGo = nil
+                end
+                samples[#samples + 1] = fromShoulder(side)
+                times[#times + 1] = now
+                local st = ragdoll.getState(player)
+                grips[#grips + 1] = side == 'right' and st.hsc and st.hsc.grip
+                    and (st.hsc.grip - body(st, 'right_upper_arm').position) or false
+            end)
+            if letGo then ragdoll.injectMouseInput(0, 0, false, button) end
+            -- The strike's end: the hand farthest ahead of its shoulder (a
+            -- wound fist starts far from its guard, so not the farthest from
+            -- where it began).
+            local far, at, ahead = 0, 1, -1e9
+            for i, place in ipairs(samples) do
+                far = math.max(far, (place - from):length())
+                if place.y > ahead then ahead, at = place.y, i end
+            end
+            local out, back, top, gripBack = 0, 0, 0, 0
+            for i = 2, #samples do
+                local step = (samples[i] - samples[i - 1]):length()
+                if i <= at then
+                    out = out + step
+                else
+                    back = back + step
+                    top = math.max(top, step / math.max(1e-3, times[i] - times[i - 1]))
+                    if grips[i] and grips[i - 1] then gripBack = gripBack + (grips[i] - grips[i - 1]):length() end
+                end
+            end
+            local last = samples[#samples]
+            local settle = -1
+            for i = #samples, math.max(at, 2), -1 do
+                local speed = (samples[i] - samples[i - 1]):length() / math.max(1e-3, times[i] - times[i - 1])
+                if (samples[i] - last):length() > 8 or speed > 60 then break end
+                settle = times[i] - times[at]
+            end
+            return { far = far, out = out, back = back, top = top, settle = settle,
+                gripBack = side == 'right' and gripBack or -1, home = (last - (restAt or from)):length(),
+                ahead = ahead, shortOf = (samples[at] - (restAt or from)):length() }
+        end
+        local function thrown(label, side, left0, right0, wantLeft, wantRight, m)
+            local left, right = jabs() - left0, rightWinds - right0
+            local hsc = ragdoll.getState(player).hsc or {}
+            m = m or { far = -1, out = -1, back = -1, top = -1, settle = -1, gripBack = -1, home = -1, ahead = -1, shortOf = -1 }
+            print(string.format('FIST12 %s hand=%s left_punches=%d right_punches=%d travel=%.1f path_out=%.1f '
+                .. 'path_after=%.1f command_after=%.1f top_after=%.0f settle=%.2f ends_off=%.1f ahead=%.1f from_rest=%.1f kind=%s', label, side,
+                left, right, m.far, m.out, m.back, m.gripBack, m.top, m.settle, m.home, m.ahead, m.shortOf,
+                tostring(hsc[side .. 'Punch'])))
+            if left ~= wantLeft or right ~= wantRight then
+                fail(string.format('%s: threw left %d right %d (want %d and %d)', label, left, right, wantLeft, wantRight))
+            end
+        end
+
+        local restOff = rest('start')
+        if restOff > 8 then fail(string.format('the left hand rests %.1f u from its guard (want 8 or less)', restOff)) end
+
+        for _, hand in ipairs({ { 'right', LEFT_BUTTON, 1 }, { 'left', RIGHT_BUTTON, -1 } }) do
+            local side, button, own = hand[1], hand[2], hand[3]
+            local wantLeft, wantRight = side == 'left' and 1 or 0, side == 'right' and 1 or 0
+            -- The click.
+            local l0, r0 = jabs(), rightWinds
+            ragdoll.injectMouseInput(0, 0, true, button)
+            waitSeconds(0.05, watch)
+            ragdoll.injectMouseInput(0, 0, false, button)
+            thrown('tap', side, l0, r0, wantLeft, wantRight, punchAndRest(side, button))
+            -- Wound and thrown by the stroke back; the mouse's y grows downward.
+            for _, draw in ipairs({ { 'down', 0, 50 }, { 'own side', 50 * own, 0 }, { 'up', 0, -50 } }) do
+                l0, r0 = jabs(), rightWinds
+                local restAt = fromShoulder(side)
+                ragdoll.injectMouseInput(0, 0, true, button)
+                waitSeconds(0.3, watch)
+                for _ = 1, 6 do
+                    ragdoll.injectMouseInput(draw[2], draw[3], true, button)
+                    waitSeconds(1 / 60, watch)
+                end
+                waitSeconds(0.5, watch)
+                local heldAt = fromShoulder(side)
+                local held = (heldAt - restAt):length()
+                local hsc = ragdoll.getState(player).hsc or {}
+                print(string.format('FIST12 held %s %s moved=%.1f at=%.1f,%.1f,%.1f charge=%.2f kind=%s', side, draw[1], held,
+                    heldAt.x, heldAt.y, heldAt.z, hsc[side .. 'Charge'] or -1, tostring(hsc[side .. 'Punch'])))
+                if held < 6 then fail(string.format('the held %s fist moved %.1f u wound %s (want 6+)', side, held, draw[1])) end
+                for _ = 1, 3 do
+                    ragdoll.injectMouseInput(-draw[2] * 1.6, -draw[3] * 1.6, true, button)
+                    waitSeconds(1 / 60, watch)
+                end
+                -- Let go as the punch goes out: the rest of it and the return with no hold.
+                thrown('swing from ' .. draw[1], side, l0, r0, wantLeft, wantRight, punchAndRest(side, button, 0.1, restAt))
+            end
+            -- Wound and let go: nothing.
+            l0, r0 = jabs(), rightWinds
+            ragdoll.injectMouseInput(0, 0, true, button)
+            waitSeconds(0.3, watch)
+            for _ = 1, 6 do
+                ragdoll.injectMouseInput(50 * own, 0, true, button)
+                waitSeconds(1 / 60, watch)
+            end
+            waitSeconds(0.5, watch)
+            ragdoll.injectMouseInput(0, 0, false, button)
+            waitSeconds(0.9, watch)
+            local release = (tonumber((ragdoll.tuningText('OPENMW_RAGDOLL_K2_FIST_STEER') or ''):match('^[^,]+,[^,]+,[^,]+,([^,]+)')) or 0) > 0
+            thrown('let go', side, l0, r0, release and wantLeft or 0, release and wantRight or 0)
+            restOff = rest('after the ' .. side)
+            if restOff > 8 then fail(string.format('after the %s hand the left rests %.1f u from its guard', side, restOff)) end
+        end
+    end)
+    ragdoll.injectMouseInput(0, 0, false, 3)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPlayerAlwaysHits(false)
+    ragdoll.reactionScale(savedReaction)
+    ragdoll.setPowered(player, false)
+    if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+    if #failures > 0 then error('FIST-12: ' .. table.concat(failures, '; '), 0) end
+end)
+
+-- FIST-07 (K2_FIST_STEER 2; user 11-16 on the steered fists: "better than
+-- before but still pretty bad", "I kinda want to not use the weapon
+-- swinging style"; research/FISTS-02): the feet pick the punch and the mouse
+-- stays the view's. Bare fists against a dummy: a tap of each button (that
+-- hand's straight), a tap while strafing (the hook; the log's
+-- RAGDOLL_FIST_STEER / RAGDOLL_FIST_PUNCH rows name it), a held left button
+-- (the right fist winds up, the view still turns with the mouse) let go, and
+-- both buttons (the guard). FIST07 lines: the punches each step threw, each
+-- fist's top speed in its tap (u/s; K2_FIST_DRIVE), how far the held fist
+-- went from its guard, the view's turn under the held button, the fatigue
+-- the target lost. FAIL: a tap or a release that throws nothing or the wrong
+-- hand, a held fist under 3 u from its guard, a view that does not turn, the
+-- guard not up under both buttons or a punch thrown from it, no landing.
+registerTest('FIST-07 the feet pick the punch', 919534, function()
+    if (tonumber((ragdoll.tuningText('OPENMW_RAGDOLL_K2_FIST_STEER') or '0'):match('^[^,]+')) or 0) < 2 then
+        print('FIST07 skipped: K2_FIST_STEER is not 2')
+        return
+    end
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', '2,300') -- the feet pick the punch (mode 3 is FIST-09's)
+    local LEFT_BUTTON, RIGHT_BUTTON = 1, 3
+    local player = placePlayer()
+    local victim
+    local savedReaction = ragdoll.reactionScale()
+    local ok, message = pcall(function()
+        player:sendEvent('fixPlayerConfigure', { sequence = 954, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 954 end)
+        waitSeconds(1)
+        powerAndStand(player, 'FIST-07 player')
+        ragdoll.setPlayerAlwaysHits(true)
+        ragdoll.reactionScale(0)
+        ragdoll.prepareMouseInput()
+        victim = spawnDummy('FIST-07 target', util.vector3(0, 200, 0), false)
+        victim:sendEvent('fixActorHealth', 1000)
+        powerAndStand(victim, 'FIST-07 target')
+        local function place()
+            local p = ragdoll.getState(player)
+            local shoulder = body(p, 'right_upper_arm').position
+            local reach = (body(p, 'right_forearm').position - shoulder):length()
+                + (body(p, 'right_hand').position - body(p, 'right_forearm').position):length()
+            local pivot = (body(p, 'left_upper_arm').position + shoulder) * 0.5
+            placeVictimPoint(victim, function()
+                local vs = ragdoll.getState(victim)
+                return vs and body(vs, 'spine2').position or victim.position
+            end, pivot + util.vector3(0, reach + 8, 0), util.transform.rotateZ(math.pi))
+        end
+        place()
+        waitSeconds(1.2)
+        local fatigue0 = types.Actor.stats.dynamic.fatigue(victim).current
+        local rightWinds, lastStage = 0, nil
+        -- (kept through a step with no attack state: under the guard it read 0)
+        local jabsSeen = 0
+        local function jabs()
+            local st = ragdoll.getState(player)
+            if st and st.hsc and st.hsc.jabs then jabsSeen = math.max(jabsSeen, st.hsc.jabs) end
+            return jabsSeen
+        end
+        -- Each hand's top speed against the player's own middle (u/s).
+        local top = { left_hand = 0, right_hand = 0 }
+        local path = { left_hand = {}, right_hand = {} }
+        local last, lastTime = {}, nil
+        local function watch()
+            local st = ragdoll.getState(player)
+            if not st then return end
+            local now = core.getSimulationTime()
+            local dt = lastTime and now - lastTime
+            lastTime = now
+            local stage = st.hsc and st.hsc.stage
+            if stage == 1 and lastStage ~= 1 then rightWinds = rightWinds + 1 end
+            lastStage = stage
+            local mid = (body(st, 'left_upper_arm').position + body(st, 'right_upper_arm').position) * 0.5
+            for name in pairs(top) do
+                local at = body(st, name).position - mid
+                if last[name] and dt and dt > 0 then
+                    top[name] = math.max(top[name], (at - last[name]):length() / dt)
+                end
+                last[name] = at
+                local row = { at = at }
+                if name == 'right_hand' and st.hsc and st.hsc.grip then
+                    row.lag = (st.hsc.grip - body(st, name).position):length()
+                end
+                table.insert(path[name], row)
+            end
+        end
+        local function reset()
+            top.left_hand, top.right_hand, last, lastTime = 0, 0, {}, nil
+            path = { left_hand = {}, right_hand = {} }
+        end
+        -- K2_FIST_TRUE (user 11-16: "the fists feel wobbly and they are not
+        -- straight/weighted at all"): the fist's path since reset(), about the
+        -- shoulders' middle - the chord from its start to its farthest point,
+        -- the path's length over it (1 = a straight line), the farthest it
+        -- left that line on the way out, how far it swung off the line in the
+        -- 0.3 s after (the ring at the end), and the most it trailed its
+        -- commanded place (the right fist; the left's is not exposed).
+        local function shape(label, name)
+            local rows = path[name]
+            if #rows < 4 then return end
+            local start, far, farAt = rows[1].at, 0, 1
+            for i, row in ipairs(rows) do
+                local d = (row.at - start):length()
+                if d > far then far, farAt = d, i end
+            end
+            if far < 5 then
+                print(string.format('FIST07 path %s: the fist moved %.1f u', label, far))
+                return
+            end
+            local chord = (rows[farAt].at - start) / far
+            local function off(at, from)
+                local v = at - from
+                return (v - chord * v:dot(chord)):length()
+            end
+            local length, offLine, lag = 0, 0, 0
+            for i = 2, farAt do
+                length = length + (rows[i].at - rows[i - 1].at):length()
+                offLine = math.max(offLine, off(rows[i].at, start))
+            end
+            for i = 1, farAt do lag = math.max(lag, rows[i].lag or 0) end
+            local ring = 0
+            for i = farAt + 1, math.min(#rows, farAt + 18) do
+                ring = math.max(ring, off(rows[i].at, rows[farAt].at))
+            end
+            print(string.format(
+                'FIST07 path %s: chord %.1f u, path/chord %.2f, off the line %.1f u, ring %.1f u, behind its command %.1f u',
+                label, far, length / far, offLine, ring, lag))
+        end
+        local function counts() return jabs(), rightWinds end
+        local function expect(label, left0, right0, wantLeft, wantRight)
+            local left, right = jabs() - left0, rightWinds - right0
+            print(string.format('FIST07 %s left_punches=%d right_punches=%d', label, left, right))
+            if left ~= wantLeft or right ~= wantRight then
+                error(string.format('FIST-07 %s: threw left %d right %d (want %d and %d)', label, left, right,
+                    wantLeft, wantRight), 0)
+            end
+        end
+        local function tap(button)
+            ragdoll.injectMouseInput(0, 0, true, button)
+            waitSeconds(0.05, watch)
+            ragdoll.injectMouseInput(0, 0, false, button)
+            waitSeconds(0.9, watch)
+        end
+
+        local l0, r0 = counts()
+        reset()
+        tap(RIGHT_BUTTON)
+        expect('right button tap', l0, r0, 1, 0)
+        print(string.format('FIST07 left straight top speed %.0f u/s', top.left_hand))
+        shape('left straight', 'left_hand')
+        l0, r0 = counts()
+        reset()
+        tap(LEFT_BUTTON)
+        expect('left button tap', l0, r0, 0, 1)
+        print(string.format('FIST07 right straight top speed %.0f u/s', top.right_hand))
+        shape('right straight', 'right_hand')
+        -- Three more of each, for the spread.
+        for i = 1, 3 do
+            reset()
+            tap(RIGHT_BUTTON)
+            shape('left straight ' .. i, 'left_hand')
+            reset()
+            tap(LEFT_BUTTON)
+            shape('right straight ' .. i, 'right_hand')
+        end
+        -- Two right straights back to back (the second pressed as the first returns).
+        reset()
+        ragdoll.injectMouseInput(0, 0, true, LEFT_BUTTON)
+        waitSeconds(0.05, watch)
+        ragdoll.injectMouseInput(0, 0, false, LEFT_BUTTON)
+        waitSeconds(0.55, watch)
+        reset()
+        tap(LEFT_BUTTON)
+        shape('right straight, chained', 'right_hand')
+        -- The guard at rest and under a turning view: how far each fist strays
+        -- from its mean place about the shoulders (u, the worst of 1 s).
+        local function strayed(label, turn)
+            local sum, n, rows = { left_hand = util.vector3(0, 0, 0), right_hand = util.vector3(0, 0, 0) }, 0, {}
+            for step = 1, 60 do
+                if turn then ragdoll.injectMouseInput(step <= 30 and 12 or -12, 0, false) end
+                waitSeconds(1 / 60)
+                local st = ragdoll.getState(player)
+                local mid = (body(st, 'left_upper_arm').position + body(st, 'right_upper_arm').position) * 0.5
+                local yaw = player.rotation:getYaw()
+                local back = util.transform.rotateZ(-yaw)
+                local row = {}
+                for name in pairs(sum) do
+                    row[name] = back * (body(st, name).position - mid)
+                    sum[name] = sum[name] + row[name]
+                end
+                n = n + 1
+                rows[n] = row
+            end
+            local worst = { left_hand = 0, right_hand = 0 }
+            for _, row in ipairs(rows) do
+                for name in pairs(worst) do
+                    worst[name] = math.max(worst[name], (row[name] - sum[name] / n):length())
+                end
+            end
+            print(string.format('FIST07 guard %s: left fist strays %.1f u, right %.1f u', label, worst.left_hand,
+                worst.right_hand))
+        end
+        waitSeconds(0.8)
+        strayed('at rest', false)
+        strayed('view turning', true)
+        place()
+        waitSeconds(0.8)
+
+        -- A tap while strafing: the hook.
+        l0, r0 = counts()
+        reset()
+        player:sendEvent('fixPlayerControls', { side = 1 })
+        waitSeconds(0.4, watch)
+        ragdoll.injectMouseInput(0, 0, true, LEFT_BUTTON)
+        waitSeconds(0.05, watch)
+        ragdoll.injectMouseInput(0, 0, false, LEFT_BUTTON)
+        waitSeconds(0.1, watch)
+        player:sendEvent('fixPlayerControls', { side = 0, stop = true })
+        waitSeconds(0.9, watch)
+        expect('left button tap, strafing', l0, r0, 0, 1)
+        print(string.format('FIST07 right hook top speed %.0f u/s', top.right_hand))
+        shape('right hook', 'right_hand')
+        place()
+        waitSeconds(0.8)
+
+        -- Held: the right fist winds up, and the mouse still turns the view.
+        l0, r0 = counts()
+        local st = ragdoll.getState(player)
+        local mid = (body(st, 'left_upper_arm').position + body(st, 'right_upper_arm').position) * 0.5
+        local rest = body(st, 'right_hand').position - mid
+        local yaw0 = player.rotation:getYaw()
+        ragdoll.injectMouseInput(0, 0, true, LEFT_BUTTON)
+        waitSeconds(0.5, watch)
+        for _ = 1, 6 do
+            ragdoll.injectMouseInput(20, 0, true, LEFT_BUTTON)
+            waitSeconds(1 / 60, watch)
+        end
+        waitSeconds(0.4, watch)
+        st = ragdoll.getState(player)
+        mid = (body(st, 'left_upper_arm').position + body(st, 'right_upper_arm').position) * 0.5
+        local wound = (body(st, 'right_hand').position - mid - rest):length()
+        local turned = math.deg(player.rotation:getYaw() - yaw0)
+        -- (back to the target before it is let go)
+        for _ = 1, 6 do
+            ragdoll.injectMouseInput(-20, 0, true, LEFT_BUTTON)
+            waitSeconds(1 / 60, watch)
+        end
+        waitSeconds(0.2, watch)
+        reset()
+        ragdoll.injectMouseInput(0, 0, false, LEFT_BUTTON)
+        waitSeconds(1.0, watch)
+        print(string.format('FIST07 held right fist %.1f u from its guard, view turned %.1f deg, thrown at %.0f u/s',
+            wound, turned, top.right_hand))
+        expect('right fist held and let go', l0, r0, 0, 1)
+        -- (the straight's wind-up is 8 u from the guard; the held fist sat 3.9-5.5 u out, 11-16)
+        if wound < 3 then error(string.format('FIST-07: the held right fist moved %.1f u (want 3+)', wound), 0) end
+        if math.abs(turned) < 2 then
+            error(string.format('FIST-07: the view turned %.1f deg under the held button (want 2+)', turned), 0)
+        end
+
+        -- Both buttons: the guard, and nothing thrown when they come up.
+        l0, r0 = counts()
+        ragdoll.injectMouseInput(0, 0, true, LEFT_BUTTON)
+        waitSeconds(0.3, watch)
+        ragdoll.injectMouseInput(0, 0, true, RIGHT_BUTTON)
+        waitSeconds(0.6, watch)
+        local guarded = ragdoll.getState(player).guardActive == true
+        ragdoll.injectMouseInput(0, 0, false, RIGHT_BUTTON)
+        waitSeconds(0.1, watch)
+        ragdoll.injectMouseInput(0, 0, false, LEFT_BUTTON)
+        waitSeconds(0.9, watch)
+        print('FIST07 both buttons guard=' .. tostring(guarded))
+        expect('both buttons', l0, r0, 0, 0)
+        if not guarded then error('FIST-07: both buttons did not raise the guard', 0) end
+
+        local lost = fatigue0 - types.Actor.stats.dynamic.fatigue(victim).current
+        print(string.format('FIST07 fatigue_lost=%.1f', lost))
+        if lost <= 0 then error('FIST-07: no punch landed (target fatigue unchanged)', 0) end
+    end)
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', nil)
+    player:sendEvent('fixPlayerControls', { side = 0, stop = true })
+    ragdoll.injectMouseInput(0, 0, false, 3)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPlayerAlwaysHits(false)
+    ragdoll.reactionScale(savedReaction)
+    ragdoll.setPowered(player, false)
+    if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+end)
+
+-- FIST-08 (K2_PALM_PARRY; user 11-16: "I'm not sure if the blocking is
+-- working ... 'parrying' would be something like throwing a palm in that
+-- direction and that causing weapons to be deflected"): a Hlaalu guard (steel
+-- longsword, AI combat) attacks the bare-fisted player for 30 s a phase -
+-- hands down ("none"), both buttons held with the palm parry off ("guard",
+-- the old two-button guard), both held with it on ("palm"). FIST08 lines per
+-- phase: the health and fatigue the player lost; the engine's rows between
+-- FIST08_BEGIN/END (RAGDOLL_DEFENSE, RAGDOLL_DAMAGE, RAGDOLL_PALM_PARRY) are
+-- counted by tools/body/analysis/fist08.py. FAIL: the guard not up under
+-- both buttons, or (the parry on) no blow deflected by a palm.
+-- The "tap" phase (K2_PALM_TAP; user 11-17: "I'm not able to parry", their
+-- presses of both buttons were down a median 0.127 s): nothing is held; at
+-- each wind-up of the guard both buttons are tapped for 0.12 s, 0.1, 0.25 and
+-- 0.4 s after the wind-up begins in turn. FIST08_TAP: the taps, how many had
+-- the guard still up 0.25 s after the press (the buttons long let go), the
+-- palm's deflections. FAIL: no tap kept the guard up. The deflections are
+-- reported, not judged (not measured yet). Skipped with K2_PALM_TAP's window 0.
+registerTest('FIST-08 palm parry against a longsword', 919535, function()
+    local LEFT_BUTTON, RIGHT_BUTTON = 1, 3
+    local player = placePlayer()
+    local attacker
+    -- The palm phase turns the parry on with the switch's own values.
+    local palmOn = true
+    local palmValue = '1' .. ((ragdoll.tuningText('OPENMW_RAGDOLL_K2_PALM_PARRY') or ''):match(',.*') or '')
+    local ok, message = pcall(function()
+        player:sendEvent('fixPlayerConfigure', { sequence = 955, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 955 end)
+        waitSeconds(1)
+        powerAndStand(player, 'FIST-08 player')
+        cameraReadyMode = nil
+        player:sendEvent('fixPlayerCamera', true)
+        waitFor('FIST-08 first-person camera', function() return cameraReadyMode == true end)
+        ragdoll.prepareMouseInput()
+        local record = world.createRecord(types.NPC.createRecordDraft({
+            template = types.NPC.record('hlaalu guard'), name = 'FIST-08 guard',
+            isEssential = false, isPersistent = false, isRespawning = false,
+        }))
+        attacker = world.createObject(record.id)
+        if not types.Actor.inventory(attacker):find('steel longsword') then
+            world.createObject('steel longsword', 1):moveInto(types.Actor.inventory(attacker))
+        end
+        attacker:teleport(testArea.cell, testArea.player + util.vector3(0, 160, 0), { onGround = true })
+        attacker:addScript('stance.lua')
+        coroutine.yield()
+        attacker:sendEvent('fixActorConfigure', { weaponStance = 'steel longsword' })
+        waitFor('FIST-08 guard stance', function() return readyActors[attacker.id] ~= nil end, 10)
+        attacker:sendEvent('fixActorHealth', 5000)
+        powerAndStand(attacker, 'FIST-08 guard')
+        attacker:sendEvent('fixActorFight', true)
+        ragdoll.setCombatTarget(attacker, player)
+        local phases = { { 'none', false, nil }, { 'guard', true, '0' } }
+        if palmOn then phases[#phases + 1] = { 'palm', true, palmValue } end
+        local tapWindow = tonumber((ragdoll.tuningText('OPENMW_RAGDOLL_K2_PALM_TAP') or '0'):match('^[^,]+')) or 0
+        if palmOn and tapWindow > 0 then phases[#phases + 1] = { 'tap', false, palmValue, true } end
+        local tapDelays = { 0.1, 0.25, 0.4 }
+        local deflected = 0
+        -- (kept through a step with no attack state: it reads nothing then)
+        local parriesSeen = 0
+        local function palmParries()
+            local st = ragdoll.getState(player)
+            if st and st.hsc and st.hsc.palmParries then parriesSeen = math.max(parriesSeen, st.hsc.palmParries) end
+            return parriesSeen
+        end
+        for _, phase in ipairs(phases) do
+            if phase[3] then ragdoll.setTuning('OPENMW_RAGDOLL_K2_PALM_PARRY', phase[3]) end
+            player:sendEvent('fixHealPlayer')
+            player:sendEvent('fixSetFatigue', 1)
+            waitSeconds(0.3)
+            if phase[2] then
+                ragdoll.injectMouseInput(0, 0, true, LEFT_BUTTON)
+                waitSeconds(0.1)
+                ragdoll.injectMouseInput(0, 0, true, RIGHT_BUTTON)
+                waitSeconds(0.4)
+            end
+            local st = ragdoll.getState(player)
+            -- Each hand from the middle of the shoulders: to the right, ahead, up (units).
+            local function handAt(name)
+                local yaw = player.rotation:getYaw()
+                local mid = (body(st, 'left_upper_arm').position + body(st, 'right_upper_arm').position) * 0.5
+                local d = body(st, name).position - mid
+                return string.format('%.0f,%.0f,%.0f', d.x * math.cos(yaw) - d.y * math.sin(yaw),
+                    d.x * math.sin(yaw) + d.y * math.cos(yaw), d.z)
+            end
+            print(string.format('FIST08_BEGIN phase=%s guard=%s left_hand=%s right_hand=%s', phase[1],
+                tostring(st.guardActive), handAt('left_hand'), handAt('right_hand')))
+            if phase[2] and not st.guardActive then
+                error('FIST-08: both buttons did not raise the guard (' .. phase[1] .. ')', 0)
+            end
+            local function stat(name) return types.Actor.stats.dynamic[name](player) end
+            local lastHealth, lastFatigue = stat('health').current, stat('fatigue').current
+            local healthLost, fatigueLost = 0, 0
+            local parries0 = palmParries()
+            local lastRefresh = core.getSimulationTime()
+            -- A rebuilt body comes back with its guard down though the buttons
+            -- are held (11-16: the guard phase of two runs blocked nothing):
+            -- the buttons are let go and pressed again, as a player would.
+            local guardDrops, repress = 0, 0
+            local taps, tapsGuarded, tapAt, tapUp, tapCheck, foeStage = 0, 0, 0, 0, 0, 0
+            waitSeconds(30, function()
+                local now = core.getSimulationTime()
+                if phase[4] then
+                    local foe = ragdoll.getState(attacker)
+                    local stage = foe and foe.hsc and foe.hsc.stage or 0
+                    if stage == 1 and foeStage ~= 1 and tapAt == 0 and tapUp == 0 then
+                        tapAt = now + tapDelays[taps % #tapDelays + 1]
+                    end
+                    foeStage = stage
+                    if tapAt > 0 and now >= tapAt then
+                        ragdoll.injectMouseInput(0, 0, true, LEFT_BUTTON)
+                        ragdoll.injectMouseInput(0, 0, true, RIGHT_BUTTON)
+                        taps = taps + 1
+                        tapAt, tapUp, tapCheck = 0, now + 0.12, now + 0.25
+                    elseif tapUp > 0 and now >= tapUp then
+                        ragdoll.injectMouseInput(0, 0, false, RIGHT_BUTTON)
+                        ragdoll.injectMouseInput(0, 0, false, LEFT_BUTTON)
+                        tapUp = 0
+                    end
+                    if tapCheck > 0 and now >= tapCheck then
+                        local state = ragdoll.getState(player)
+                        if state and state.guardActive then tapsGuarded = tapsGuarded + 1 end
+                        tapCheck = 0
+                    end
+                end
+                if phase[2] then
+                    local state = ragdoll.getState(player)
+                    if repress == 0 and state and state.guardActive == false then
+                        guardDrops = guardDrops + 1
+                        ragdoll.injectMouseInput(0, 0, false, RIGHT_BUTTON)
+                        ragdoll.injectMouseInput(0, 0, false, LEFT_BUTTON)
+                        repress = now + 0.3
+                    elseif repress > 0 and now >= repress + 0.15 then
+                        ragdoll.injectMouseInput(0, 0, true, RIGHT_BUTTON)
+                        repress = 0
+                    elseif repress > 0 and now >= repress then
+                        ragdoll.injectMouseInput(0, 0, true, LEFT_BUTTON)
+                    end
+                end
+                if now - lastRefresh >= 2 then
+                    lastRefresh = now
+                    ragdoll.setCombatTarget(attacker, player)
+                end
+                palmParries()
+                local health, fatigue = stat('health'), stat('fatigue')
+                if health.current < lastHealth then healthLost = healthLost + lastHealth - health.current end
+                if fatigue.current < lastFatigue then fatigueLost = fatigueLost + lastFatigue - fatigue.current end
+                lastHealth, lastFatigue = health.current, fatigue.current
+                -- (kept alive and able: the count is of blows, not of one fight)
+                if health.current < health.base * 0.5 then
+                    player:sendEvent('fixHealPlayer')
+                    lastHealth = health.base
+                end
+                if fatigue.current < fatigue.base * 0.3 then
+                    player:sendEvent('fixSetFatigue', 1)
+                    lastFatigue = fatigue.base
+                end
+                -- The player turns to face the NPC, as a guarding player does.
+                local to = attacker.position - player.position
+                local err = math.atan2(to.x, to.y) - player.rotation:getYaw()
+                err = (err + math.pi) % (2 * math.pi) - math.pi
+                player:sendEvent('fixPlayerControls', { forward = 0, side = 0, run = 0,
+                    yaw = math.max(-0.08, math.min(0.08, err * 0.3)) })
+            end)
+            player:sendEvent('fixPlayerControls', nil)
+            local parries = palmParries() - parries0
+            print(string.format('FIST08_END phase=%s health_lost=%.1f fatigue_lost=%.1f palm_parries=%d guard_drops=%d',
+                phase[1], healthLost, fatigueLost, parries, guardDrops))
+            if phase[1] == 'palm' then deflected = parries end
+            if phase[4] then
+                if tapUp > 0 then
+                    ragdoll.injectMouseInput(0, 0, false, RIGHT_BUTTON)
+                    ragdoll.injectMouseInput(0, 0, false, LEFT_BUTTON)
+                end
+                waitSeconds(0.6)
+                print(string.format('FIST08_TAP taps=%d guard_up_after=%d palm_parries=%d window=%.2f', taps,
+                    tapsGuarded, parries, tapWindow))
+                if taps > 0 and tapsGuarded < 1 then
+                    error('FIST-08: no tap of both buttons kept the guard up (K2_PALM_TAP)', 0)
+                end
+            end
+            if phase[2] then
+                ragdoll.injectMouseInput(0, 0, false, RIGHT_BUTTON)
+                waitSeconds(0.1)
+                ragdoll.injectMouseInput(0, 0, false, LEFT_BUTTON)
+                waitSeconds(0.5)
+            end
+        end
+        if palmOn and deflected < 1 then error('FIST-08: no blow was deflected by a palm in 30 s', 0) end
+    end)
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_PALM_PARRY', nil)
+    player:sendEvent('fixPlayerControls', nil)
+    ragdoll.injectMouseInput(0, 0, false, RIGHT_BUTTON)
+    ragdoll.injectMouseInput(0, 0, false)
+    player:sendEvent('fixHealPlayer')
+    player:sendEvent('fixSetFatigue', 1)
+    ragdoll.setPowered(player, false)
+    if attacker and attacker:isValid() then attacker:remove() end
+    if not ok then error(message, 0) end
+end)
+
+-- FIST-09 (K2_FIST_STEER 3, K2_FIST_STEP; user 11-16 on FIST-07: "its still
+-- really hard to aim", "its really hard to land hits"; their sessions: punches
+-- thrown with the foe a median 70-76 u off, a fist reaches about 40, 11-14%
+-- landed): a punch at a foe out of reach steps in. Bare fists against a
+-- standing dummy put 50, 65 and 80 u from the player's chest, and 65 u off to
+-- the side by 15 degrees; four taps at each (left, right, left, right), the
+-- dummy put back before each. FIST09 lines: how many of the four cost the
+-- dummy fatigue, and how far the player's chest went toward it in each tap.
+-- Run with OPENMW_RAGDOLL_K2_FIST_STEP=0 for the same without the step.
+-- FAIL: with the step on, fewer than 2 of 4 land at 65 u, or the player ends
+-- a tap on the ground.
+registerTest('FIST-09 the step in', 919537, function()
+    if (tonumber((ragdoll.tuningText('OPENMW_RAGDOLL_K2_FIST_STEER') or '0'):match('^[^,]+')) or 0) < 3 then
+        print('FIST09 skipped: K2_FIST_STEER is not 3')
+        return
+    end
+    local stepOn = (tonumber((ragdoll.tuningText('OPENMW_RAGDOLL_K2_FIST_STEP') or '0'):match('^[^,]+')) or 0) > 0
+    local LEFT_BUTTON, RIGHT_BUTTON = 1, 3
+    local player = placePlayer()
+    local victim
+    local savedReaction = ragdoll.reactionScale()
+    local ok, message = pcall(function()
+        player:sendEvent('fixPlayerConfigure', { sequence = 957, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 957 end)
+        waitSeconds(1)
+        powerAndStand(player, 'FIST-09 player')
+        ragdoll.setPlayerAlwaysHits(true)
+        ragdoll.reactionScale(0)
+        ragdoll.prepareMouseInput()
+        victim = spawnDummy('FIST-09 target', util.vector3(0, 200, 0), false)
+        victim:sendEvent('fixActorHealth', 1000)
+        powerAndStand(victim, 'FIST-09 target')
+        local function chest()
+            local st = ragdoll.getState(player)
+            return (body(st, 'left_upper_arm').position + body(st, 'right_upper_arm').position) * 0.5
+        end
+        local function place(distance, degrees)
+            local turn = util.transform.rotateZ(player.rotation:getYaw() + math.rad(degrees or 0))
+            local at = chest() + turn * util.vector3(0, distance, 0)
+            placeVictimPoint(victim, function()
+                local vs = ragdoll.getState(victim)
+                return vs and body(vs, 'spine2').position or victim.position
+            end, at, util.transform.rotateZ(player.rotation:getYaw() + math.pi))
+        end
+        local function fatigue() return types.Actor.stats.dynamic.fatigue(victim).current end
+        local landedAt65 = 0
+        local tall = body(ragdoll.getState(victim), 'spine2').position.z - victim.position.z
+        for _, set in ipairs({ { 50, 0 }, { 65, 0 }, { 80, 0 }, { 65, 15 } }) do
+            local landed, steps = 0, {}
+            for tap = 1, 4 do
+                -- (the dummy is never knocked out: each tap starts it at 2000 fatigue;
+                -- a dummy knocked off its feet is stood up again)
+                victim:sendEvent('fixActorFatigue', 2000)
+                do
+                    local up = false
+                    for _ = 1, 40 do
+                        local vs = ragdoll.getState(victim)
+                        if vs and body(vs, 'spine2').position.z - victim.position.z > 0.8 * tall then up = true break end
+                        waitSeconds(0.1)
+                    end
+                    if not up then powerAndStand(victim, 'FIST-09 target') end
+                end
+                place(set[1], set[2])
+                waitSeconds(0.9)
+                local from = chest()
+                local toward = body(ragdoll.getState(victim), 'spine2').position - from
+                toward = util.vector3(toward.x, toward.y, 0):normalize()
+                local before = fatigue()
+                local button = tap % 2 == 1 and RIGHT_BUTTON or LEFT_BUTTON
+                ragdoll.injectMouseInput(0, 0, true, button)
+                waitSeconds(0.05)
+                ragdoll.injectMouseInput(0, 0, false, button)
+                local most, near, nearOff, nearUp = 0, 1e9, 0, 0
+                local handName = button == RIGHT_BUTTON and 'left_hand' or 'right_hand'
+                for _ = 1, 54 do
+                    waitSeconds(1 / 60)
+                    most = math.max(most, (chest() - from):dot(toward))
+                    -- The fist against the dummy's chest: nearest, and there
+                    -- how far to the side and above it.
+                    local hand = body(ragdoll.getState(player), handName).position
+                    local vs = ragdoll.getState(victim)
+                    local to = vs and hand - body(vs, 'spine2').position or util.vector3(1e6, 0, 0)
+                    if to:length() < near then
+                        near = to:length()
+                        nearOff = to:dot(util.vector3(toward.y, -toward.x, 0))
+                        nearUp = to.z
+                    end
+                end
+                local hit = before - fatigue() > 1
+                if hit then landed = landed + 1 end
+                steps[#steps + 1] = string.format('%.0f', most)
+                print(string.format('FIST09   %s tap at %d u: %s, chest %.0f u in, fist nearest %.0f u from its chest (%.0f to the right, %.0f up)',
+                    handName, set[1], hit and 'landed' or 'missed', most, near, nearOff, nearUp))
+                if from.z - chest().z > 35 then error('FIST-09: the player fell after a tap at ' .. set[1] .. ' u', 0) end
+            end
+            print(string.format('FIST09 step=%s foe at %d u, %d deg off: %d of 4 landed, the chest went %s u toward it',
+                tostring(stepOn), set[1], set[2], landed, table.concat(steps, ' / ')))
+            if set[1] == 65 and set[2] == 0 then landedAt65 = landed end
+        end
+        -- K2_FIST_CHARGE (user 11-16: "I wasnt able to charge the attacks in
+        -- hand to hand"): each fist held 0.9 s at a dummy 50 u off - how far
+        -- the fist drew from its guard, how far the shoulders' line turned
+        -- (degrees, the punching shoulder back is positive), and the fatigue
+        -- the charged blow cost the dummy against a tap's of the same hand.
+        for _, hand in ipairs({ { 'right_hand', LEFT_BUTTON, 1 }, { 'left_hand', RIGHT_BUTTON, -1 } }) do
+            local function blow(held)
+                victim:sendEvent('fixActorFatigue', 2000)
+                if not ragdoll.getState(victim) then powerAndStand(victim, 'FIST-09 target') end
+                place(50, 0)
+                waitSeconds(0.9)
+                local st = ragdoll.getState(player)
+                local function shoulders(s)
+                    local line = body(s, 'right_upper_arm').position - body(s, 'left_upper_arm').position
+                    return math.atan2(line.y, line.x)
+                end
+                local rest = body(st, hand[1]).position - chest()
+                local turn0 = shoulders(st)
+                local before = fatigue()
+                local drawn, coil = 0, 0
+                ragdoll.injectMouseInput(0, 0, true, hand[2])
+                if held then
+                    for _ = 1, 54 do
+                        waitSeconds(1 / 60)
+                        local s = ragdoll.getState(player)
+                        drawn = math.max(drawn, (body(s, hand[1]).position - chest() - rest):length())
+                        local d = shoulders(s) - turn0
+                        d = math.atan2(math.sin(d), math.cos(d))
+                        if math.abs(d) > math.abs(coil) then coil = d end
+                    end
+                else
+                    waitSeconds(0.05)
+                end
+                ragdoll.injectMouseInput(0, 0, false, hand[2])
+                waitSeconds(1.0)
+                -- (seen from above the right shoulder going back turns the line clockwise: negative)
+                return before - fatigue(), drawn, -math.deg(coil) * hand[3]
+            end
+            local tapCost = blow(false)
+            local heldCost, drawn, coil = blow(true)
+            print(string.format('FIST09 charge %s: drawn %.1f u, shoulders turned %.1f deg, the blow cost %.1f fatigue (a tap %.1f)',
+                hand[1], drawn, coil, heldCost, tapCost))
+        end
+        if stepOn and landedAt65 < 2 then
+            error(string.format('FIST-09: %d of 4 taps landed at 65 u with the step on (want 2+)', landedAt65), 0)
+        end
+    end)
+    ragdoll.injectMouseInput(0, 0, false, 3)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPlayerAlwaysHits(false)
+    ragdoll.reactionScale(savedReaction)
+    ragdoll.setPowered(player, false)
+    if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+end)
+
+-- FIST-10 (K2_FIST_STANCE; user 11-16: "when moving, the whole body moves
+-- right and sometimes the chest grabs an angle or the hips fall a bit, can we
+-- actually make a firmer stance? maybe even keep some sort of southpaw or
+-- orthodox"): the bare-fisted player standing, then running forward, to each
+-- side and back, 2 s each. FIST10 lines, per phase: the shoulders' line
+-- from square to the view (degrees, negative = the left shoulder forward; mean
+-- and spread), its side tilt (spread), the pelvis' height over the feet (mean
+-- and spread), how often the body's controller changed mode. Run with
+-- OPENMW_RAGDOLL_K2_FIST_STANCE=0,0,0 for the same without the stance.
+-- FAIL: the player off its feet; with the stance on, a moving phase whose
+-- mean line has the right shoulder forward. (The body gives about a third of
+-- the turn the chest's target asks, and the trim the rest it can: 7-24 degrees
+-- left-lead on the move against 40 standing; without, 0 to 31 right-lead.)
+-- FIST-11: actual hands against the live crosshair during movement, plus
+-- the per-hand HUD feed. No damage/range assistance is used by this case.
+registerTest('FIST-11 crosshair punches on the move', 919539, function()
+    local player = placePlayer()
+    local ok, message = pcall(function()
+        player:sendEvent('fixPlayerConfigure', { sequence = 959, firstPerson = true })
+        waitFor('player loadout', function() return playerReadySequence == 959 end)
+        waitSeconds(1)
+        powerAndStand(player, 'FIST-11 player')
+        ragdoll.prepareMouseInput()
+        for _, move in ipairs({ { 'forward', 1, 0 }, { 'right', 0, 1 }, { 'left', 0, -1 } }) do
+            player:sendEvent('fixPlayerControls', { forward = move[2], side = move[3], run = 0 })
+            waitSeconds(0.4)
+            for _, hand in ipairs({ { 'right', 1 }, { 'left', 3 } }) do
+                ragdoll.injectMouseInput(0, 0, true, hand[2])
+                waitSeconds(0.85)
+                local held = ragdoll.getState(player)
+                assert(held and held.hsc and held.hsc.fists, 'FIST-11: fist HUD not published')
+                assert(held.hsc[hand[1] .. 'Charge'] > 0.9, 'FIST-11: charge missing for ' .. hand[1])
+                ragdoll.injectMouseInput(0, 0, false, hand[2])
+                local nearest, samples = 1e9, 0
+                for _ = 1, 48 do
+                    waitSeconds(1 / 60)
+                    local st = ragdoll.getState(player)
+                    local h = st and st.hsc
+                    if h and h.aimOrigin and (h[hand[1] .. 'Aim'] or 0) > 0.5 then
+                        local ray = h.aimDirection:normalize()
+                        local delta = body(st, hand[1] .. '_hand').position - h.aimOrigin
+                        if delta:dot(ray) > 0 then
+                            nearest = math.min(nearest, (delta - ray * delta:dot(ray)):length())
+                            samples = samples + 1
+                        end
+                    end
+                end
+                print(string.format('FIST11 %s %s: nearest physical hand %.2f u from crosshair, %d samples',
+                    move[1], hand[1], nearest, samples))
+                assert(samples > 0, 'FIST-11: no aimed strike for ' .. hand[1])
+                assert(nearest < 16, 'FIST-11: physical hand missed the crosshair during ' .. move[1])
+            end
+            player:sendEvent('fixPlayerControls', { forward = 0, side = 0, stop = true })
+            waitSeconds(0.3)
+        end
+        ragdoll.injectMouseInput(0, 0, true, 1)
+        ragdoll.injectMouseInput(0, 0, true, 3)
+        waitSeconds(0.25)
+        local st = ragdoll.getState(player)
+        assert(st and st.guardActive, 'FIST-11: guard did not raise')
+        assert(st.hsc.leftCharge < 0 and st.hsc.rightCharge < 0, 'FIST-11: charge remains under guard')
+        assert(st.hsc.leftAim == 0 and st.hsc.rightAim == 0, 'FIST-11: punch aiming steers guard')
+    end)
+    ragdoll.injectMouseInput(0, 0, false, 1)
+    ragdoll.injectMouseInput(0, 0, false, 3)
+    player:sendEvent('fixPlayerControls', { forward = 0, side = 0, stop = true })
+    ragdoll.setPowered(player, false)
+    if not ok then error(message, 0) end
+end)
+
+registerTest('FIST-10 the fists keep their stance on the move', 919538, function()
+    local stance = ragdoll.tuningText('OPENMW_RAGDOLL_K2_FIST_STANCE') or '0,0,0'
+    local stanceOn = (tonumber(stance:match('^[^,]+,([^,]+)')) or 0) > 0
+    local player = placePlayer()
+    local ok, message = pcall(function()
+        player:sendEvent('fixPlayerConfigure', { sequence = 958, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 958 end)
+        waitSeconds(1)
+        powerAndStand(player, 'FIST-10 player')
+        ragdoll.prepareMouseInput()
+        waitSeconds(1.5)
+        local means = {}
+        local function phase(label, controls)
+            if controls then player:sendEvent('fixPlayerControls', controls) end
+            waitSeconds(0.5)
+            local yaws, tilts, heights, flips, lastMode = {}, {}, {}, 0, nil
+            for _ = 1, 120 do
+                waitSeconds(1 / 60)
+                local st = ragdoll.getState(player)
+                if not st then error('FIST-10: the player went down (' .. label .. ')', 0) end
+                local back = util.transform.rotateZ(-player.rotation:getYaw())
+                local line = back * (body(st, 'right_upper_arm').position - body(st, 'left_upper_arm').position)
+                yaws[#yaws + 1] = math.deg(math.atan2(line.y, line.x))
+                tilts[#tilts + 1] = math.deg(math.atan2(line.z, math.sqrt(line.x * line.x + line.y * line.y)))
+                local feet = math.min(body(st, 'left_foot').position.z, body(st, 'right_foot').position.z)
+                heights[#heights + 1] = (body(st, 'left_upper_arm').position.z + body(st, 'right_upper_arm').position.z) / 2 - feet
+                local mode = st.controller and st.controller.mode
+                if lastMode and mode ~= lastMode then flips = flips + 1 end
+                lastMode = mode
+            end
+            local function stat(values)
+                local sum = 0
+                for _, v in ipairs(values) do sum = sum + v end
+                local mean, var = sum / #values, 0
+                for _, v in ipairs(values) do var = var + (v - mean) ^ 2 end
+                return mean, math.sqrt(var / #values)
+            end
+            local yaw, yawSpread = stat(yaws)
+            local _, tiltSpread = stat(tilts)
+            local height, heightSpread = stat(heights)
+            means[label] = yaw
+            print(string.format(
+                'FIST10 stance=%s %s: shoulders %.0f deg (spread %.0f), tilt spread %.1f deg, shoulders %.0f u over the feet (spread %.1f), %d mode changes',
+                tostring(stanceOn), label, yaw, yawSpread, tiltSpread, height, heightSpread, flips))
+            if controls then
+                player:sendEvent('fixPlayerControls', { forward = 0, side = 0, stop = true })
+                waitSeconds(1.0)
+            end
+        end
+        phase('standing')
+        phase('forward', { forward = 1, run = 1 })
+        phase('right', { side = 1, run = 1 })
+        phase('left', { side = -1, run = 1 })
+        phase('back', { forward = -1, run = 1 })
+        if stanceOn then
+            for label, yaw in pairs(means) do
+                if yaw > 0 then
+                    error(string.format('FIST-10: moving %s the shoulders stand %.0f deg, standing %.0f (want the left shoulder forward)',
+                        label, yaw, means.standing), 0)
+                end
+            end
+        end
+    end)
+    player:sendEvent('fixPlayerControls', { forward = 0, side = 0, stop = true })
+    ragdoll.setPowered(player, false)
     if not ok then error(message, 0) end
 end)
 
@@ -5083,6 +7092,280 @@ registerTest('AIM-04 look at head chest and legs with iron longsword', 918310, f
     if not ok then error(message, 0) end
 end)
 
+-- DOWN-01 (user 11-03 bookmark 1: "an enemy NPC fell and couldn't get up and
+-- I couldn't hit them because the dagger is too short"): a dummy knocked down
+-- at the dagger player's feet, the player looking at its chest, six clicks.
+-- Prints the tip's closest approach to the dummy's chest and the hits;
+-- compare OPENMW_RAGDOLL_HSC_DOWN_AIM=0 (the standing floor, 0.9 below level).
+registerTest('DOWN-01 a dagger reaches a downed foe', 918420, function()
+    local weapon = 'iron dagger'
+    local player = placePlayer()
+    local victim
+    local ok, message = pcall(function()
+        ragdoll.setPlayerAlwaysHits(true)
+        if not types.Actor.inventory(player):find(weapon) then
+            world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+            coroutine.yield()
+        end
+        player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 420, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 420 end)
+        waitSeconds(1)
+        powerAndStand(player, 'DOWN-01 player')
+        cameraReadyMode = nil
+        player:sendEvent('fixPlayerCamera', true)
+        waitFor('DOWN-01 first-person camera', function() return cameraReadyMode == true end)
+        victim = spawnDummy('DOWN-01 target', util.vector3(0, 110, 0), false)
+        powerAndStand(victim, 'DOWN-01 target')
+        ragdoll.setAutomaticRecovery(false)
+        victim:sendEvent('fixActorFatigue', -200)
+        local seen = {}
+        local downed = pcall(waitFor, 'DOWN-01 knock-down', function()
+            local s = ragdoll.getState(victim)
+            if s and s.controller then seen[s.controller.mode] = true end
+            return s and s.controller and (s.controller.mode == 'falling' or s.controller.mode == 'fallen')
+        end, 6)
+        local modes = {}
+        for mode in pairs(seen) do modes[#modes + 1] = mode end
+        print('DOWN-01 knock-down=' .. tostring(downed) .. ' modes=' .. table.concat(modes, ','))
+        testing.expect(downed, 'the dummy did not fall')
+        waitSeconds(2)
+        -- The player stands 55 units from the lying chest, facing it.
+        local lying = body(ragdoll.getState(victim), 'spine2').position
+        player:teleport(testArea.cell, util.vector3(lying.x, lying.y - 55, player.position.z),
+            { onGround = true, rotation = util.transform.rotateZ(0) })
+        waitSeconds(1.5)
+        local chest = body(ragdoll.getState(victim), 'spine2').position
+        local own = body(ragdoll.getState(player), 'spine2').position
+        local flat = util.vector3(chest.x - own.x, chest.y - own.y, 0):length()
+        local health = types.Actor.stats.dynamic.health(victim).current
+        ragdoll.prepareMouseInput()
+        local closest = math.huge
+        local function sample()
+            local s = ragdoll.getState(player)
+            local v = ragdoll.getState(victim)
+            if not s or not s.weapon or not v then return end
+            local b = s.bodies[s.weapon.bodyIndex]
+            local tip = b.position + (b.rotation * util.vector3(0, 0, 1)):normalize() * (s.weapon.length * 0.5)
+            closest = math.min(closest, (tip - body(v, 'spine2').position):length())
+        end
+        for click = 1, 6 do
+            contactAimReady = false
+            player:sendEvent('fixAimAt', body(ragdoll.getState(victim), 'spine2').position)
+            pcall(waitFor, 'DOWN-01 look', function() return contactAimReady end, 4)
+            ragdoll.injectMouseInput(0, 0, true, 1)
+            waitSeconds(0.08, sample)
+            ragdoll.injectMouseInput(0, 0, false, 1)
+            waitSeconds(1.2, sample)
+        end
+        local lost = health - types.Actor.stats.dynamic.health(victim).current
+        print(string.format('DOWN-01 flat=%.1f chest_height=%.1f closest=%.1f health_lost=%.1f',
+            flat, chest.z - player.position.z, closest, lost))
+        testing.expect(lost > 0, 'no click reached the downed foe')
+    end)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPlayerAlwaysHits(false)
+    ragdoll.setAutomaticRecovery(true)
+    ragdoll.setPowered(player, false)
+    if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+end)
+
+-- PACE-01 (user 11-03: "implement being able to swing faster with dagger"):
+-- six clicks, then four drags of the same mouse travel; prints the median
+-- time from a click's press until the wheel is back in the guard, and the
+-- drags' median peak swing speed. 11-03: dagger 0.43 s and 1423-1453 u/s,
+-- longsword 0.55 s and 2018-2028; a quicker hold and return (0.43 -> 0.40,
+-- 0.75 at half) and a dagger cut on 0.6 of the mouse travel (no change)
+-- were tried and dropped.
+for index, weapon in ipairs({ 'iron dagger', 'iron longsword' }) do
+registerTest('PACE-01 click cycle with ' .. weapon, 918430 + index, function()
+    local player = placePlayer()
+    local ok, message = pcall(function()
+        if not types.Actor.inventory(player):find(weapon) then
+            world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+            coroutine.yield()
+        end
+        player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 430 + index, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 430 + index end)
+        waitSeconds(1)
+        powerAndStand(player, 'PACE-01 player')
+        ragdoll.prepareMouseInput()
+        local cycles = {}
+        for click = 1, 6 do
+            local started = core.getSimulationTime()
+            ragdoll.injectMouseInput(0, 0, true, 1)
+            waitSeconds(0.08)
+            ragdoll.injectMouseInput(0, 0, false, 1)
+            waitSeconds(0.1)
+            -- Back in the guard: the wheel's stage 0 (Guard; 3 = Recover).
+            pcall(waitFor, 'PACE-01 return', function()
+                local s = ragdoll.getState(player)
+                return s and s.hsc and s.hsc.stage == 0
+            end, 4)
+            cycles[#cycles + 1] = core.getSimulationTime() - started
+            waitSeconds(0.5)
+        end
+        table.sort(cycles)
+        local peaks = {}
+        for drag = 1, 4 do
+            local peak = 0
+            local function watch()
+                peak = math.max(peak, ragdoll.getSwingSpeed(player) or 0)
+            end
+            ragdoll.injectMouseInput(0, 0, true, 1)
+            waitSeconds(0.25, watch)
+            for _, leg in ipairs({ { x = HSC_WIND, seconds = 0.4 }, { x = -HSC_CUT, seconds = 0.3 } }) do
+                local started, sentX = core.getSimulationTime(), 0
+                waitSeconds(leg.seconds, function()
+                    local x = math.floor(leg.x * math.min(1, (core.getSimulationTime() - started) / leg.seconds))
+                    ragdoll.injectMouseInput(x - sentX, 0)
+                    sentX = x
+                    watch()
+                end)
+                ragdoll.injectMouseInput(leg.x - sentX, 0)
+            end
+            ragdoll.injectMouseInput(0, 0, false, 1)
+            waitSeconds(1.0, watch)
+            peaks[#peaks + 1] = peak
+        end
+        table.sort(peaks)
+        print(string.format('PACE-01 weapon=%s cycle_median=%.2f min=%.2f max=%.2f drag_peak_median=%.0f', weapon,
+            cycles[math.floor(#cycles / 2)], cycles[1], cycles[#cycles], peaks[2]))
+    end)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPowered(player, false)
+    if not ok then error(message, 0) end
+end)
+end
+
+-- FIST-03 (user 11-03: "fix fists"): bare fists at Hand-to-hand 100 and 20;
+-- a second click during the first punch's cut. At 100 the punch chains (the
+-- wheel goes from the cut to the next wind-up without the return: stages
+-- 2,0,1); at 20 it waits through the return (2,3,0,1). Before 11-03 fists
+-- read skill 0 and never chained (11-03: 2,3,0,1 at 100 too). The wheel's
+-- punches only: with FIST_ALTERNATE (play) every other click is the jab, so
+-- the case turns it off for its run (and needs the play values: the code
+-- fallbacks have no wheel fists). 11-03: passes; the previous engine fails
+-- at 100.
+for index, level in ipairs({ 100, 20 }) do
+registerTest('FIST-03 fists chain at hand-to-hand ' .. level, 918440 + index, function()
+    local player = placePlayer()
+    local ok, message = pcall(function()
+        player:sendEvent('fixPlayerConfigure', { sequence = 440 + index, firstPerson = true })
+        waitFor('player loadout', function() return playerReadySequence == 440 + index end)
+        player:sendEvent('fixSetWeaponSkill', level)
+        waitSeconds(1)
+        ragdoll.setTuning('OPENMW_RAGDOLL_FIST_ALTERNATE', '0')
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIGHT_NIGHT', '0') -- FIST-05's flicks alternate hands
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', '0,300')
+        powerAndStand(player, 'FIST-03 player')
+        ragdoll.prepareMouseInput()
+        waitSeconds(0.8)
+        local chained = 0
+        for attempt = 1, 4 do
+            local stages, last = {}, nil
+            local function sample()
+                local s = ragdoll.getState(player)
+                local stage = s and s.hsc and s.hsc.stage
+                if stage and stage ~= last then stages[#stages + 1] = stage; last = stage end
+            end
+            ragdoll.injectMouseInput(0, 0, true)
+            waitSeconds(0.05, sample)
+            ragdoll.injectMouseInput(0, 0, false)
+            pcall(waitFor, 'FIST-03 cut', function() sample(); return last == 2 end, 2)
+            ragdoll.injectMouseInput(0, 0, true)
+            waitSeconds(0.05, sample)
+            ragdoll.injectMouseInput(0, 0, false)
+            waitSeconds(1.5, sample)
+            local seen = false
+            for i = 3, #stages do
+                if stages[i - 2] == 2 and stages[i - 1] == 0 and stages[i] == 1 then seen = true end
+            end
+            if seen then chained = chained + 1 end
+            print(string.format('FIST-03 level=%d attempt=%d stages=%s chained=%s', level, attempt,
+                table.concat(stages, ''), tostring(seen)))
+            waitSeconds(0.5)
+        end
+        if level >= 50 then
+            testing.expect(chained >= 3, 'skilled fists did not chain')
+        else
+            testing.expect(chained == 0, 'unskilled fists chained')
+        end
+    end)
+    ragdoll.setTuning('OPENMW_RAGDOLL_FIST_ALTERNATE', nil)
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIGHT_NIGHT', nil)
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_FIST_STEER', nil)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPowered(player, false)
+    if not ok then error(message, 0) end
+end)
+end
+
+-- ELBOW-02 (user 11-03 bookmark 2: "my left arm looks weird, the elbow is
+-- pointing too much inside"): the free left arm beside a one-handed weapon in
+-- first person, after four drags and at rest. Prints how far the left elbow
+-- sits inside the left shoulder, along the shoulders' line (the clip holds it
+-- about 8 outside, -8); compare OPENMW_RAGDOLL_FREE_ARM_BEND=0.
+for index, weapon in ipairs({ 'iron dagger', 'iron longsword' }) do
+registerTest('ELBOW-02 the free elbow beside ' .. weapon, 918420 + index, function()
+    local player = placePlayer()
+    local ok, message = pcall(function()
+        if not types.Actor.inventory(player):find(weapon) then
+            world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+            coroutine.yield()
+        end
+        player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 420 + index, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 420 + index end)
+        waitSeconds(1)
+        powerAndStand(player, 'ELBOW-02 player')
+        cameraReadyMode = nil
+        player:sendEvent('fixPlayerCamera', true)
+        waitFor('ELBOW-02 first-person camera', function() return cameraReadyMode == true end)
+        ragdoll.prepareMouseInput()
+        local function inward()
+            local s = ragdoll.getState(player)
+            local ls = body(s, 'left_upper_arm').position
+            local line = (body(s, 'right_upper_arm').position - ls):normalize()
+            return (body(s, 'left_forearm').position - ls):dot(line)
+        end
+        local samples = {}
+        local function rest(seconds)
+            waitSeconds(seconds, function() samples[#samples + 1] = inward() end)
+        end
+        rest(2)
+        for drag = 1, 4 do
+            ragdoll.injectMouseInput(0, 0, true, 1)
+            waitSeconds(0.25)
+            local sign = drag % 2 == 1 and 1 or -1
+            for _, leg in ipairs({ { x = sign * HSC_WIND, seconds = 0.4 }, { x = -sign * HSC_CUT, seconds = 0.2 } }) do
+                local started, sentX = core.getSimulationTime(), 0
+                waitSeconds(leg.seconds, function()
+                    local x = math.floor(leg.x * math.min(1, (core.getSimulationTime() - started) / leg.seconds))
+                    ragdoll.injectMouseInput(x - sentX, 0)
+                    sentX = x
+                end)
+                ragdoll.injectMouseInput(leg.x - sentX, 0)
+            end
+            ragdoll.injectMouseInput(0, 0, false, 1)
+            waitSeconds(0.8)
+        end
+        local before = #samples
+        rest(3)
+        local settled = {}
+        for i = before + 1, #samples do settled[#settled + 1] = samples[i] end
+        table.sort(settled)
+        table.sort(samples)
+        local median = settled[math.max(1, math.floor(#settled / 2))]
+        print(string.format('ELBOW-02 weapon=%s settled_inward_median=%.1f settled_p90=%.1f all_p90=%.1f',
+            weapon, median, settled[math.max(1, math.floor(#settled * 0.9))], samples[math.max(1, math.floor(#samples * 0.9))]))
+        testing.expect(median < 3, 'the free elbow rests inside the shoulder')
+    end)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.setPowered(player, false)
+    if not ok then error(message, 0) end
+end)
+end
+
 -- AIM-03 (whiffs, user 10-05 build 57: "chops whiff and side slashes don't
 -- connect where they should"): a foe off the facing at the distances the user
 -- missed from (play 10-05/06: half the misses passed within 35 units of the
@@ -5339,7 +7622,13 @@ for index, weapon in ipairs({ 'iron dagger', 'iron longsword', 'iron claymore', 
                 end
                 for _, drag in ipairs(directions) do
                     if round == 'rest' then
-                        waitFor('guard before the drag', function() return ragdoll.getSwingSpeed(player) == nil end, 4)
+                        -- The wheel's guard too: a released drag can keep its
+                        -- stance a while (the claymore's did past 16 steps, so
+                        -- its next "rest" drag started on another line).
+                        waitFor('guard before the drag', function()
+                            local st = ragdoll.getState(player)
+                            return ragdoll.getSwingSpeed(player) == nil and (not st.hsc or st.hsc.stage == 0)
+                        end, 4)
                         waitSeconds(0.8)
                     else
                         waitSeconds(0.15)
@@ -5552,6 +7841,148 @@ local function prepareContactPlayer(weapon, sequence, firstPerson)
     ragdoll.prepareMouseInput()
     waitSeconds(0.5)
     return player
+end
+
+-- BLADE-BLOOD-01 (user bookmark 11-16, first person, a steel spear on a Hlaalu
+-- guard: "it looks like the tip of the spear isnt getting bloodied"). The
+-- player's weapon stabs (a staged receipt naming the player as the attacker,
+-- the contact 0.9 of the way to the point) a bare dummy and a guard in
+-- bonemold, in the chest, the head, the neck and a forearm. BLADEBLOOD01 rows:
+-- the wound marks and the weapon's blood marks each stab added; the engine's
+-- RAGDOLL_WEAPON_BLOOD rows say why (surface 0 skin, 1 cloth, 2 armour: a stab
+-- that hurt through armour leaves a little on the very point) and
+-- RAGDOLL_WEAPON_BLOOD_DRAWN where on the mesh (ends, grip, tip, stretch).
+-- Then the old rule's mark (the tip = the end further from the grip: a steel
+-- spear's butt), the view changed and changed back (the weapon node is kept:
+-- nothing to redraw), and both ends photographed (shots 1-2 the +z end, the
+-- point; 3-4 the other; before them one of the point after the armoured stabs
+-- alone). FAIL: a stab into the bare dummy's chest, or one that hurt through
+-- the guard's armour, left no blood on the weapon.
+for index, case in ipairs({
+    { weapon = 'steel spear', firstPerson = true }, { weapon = 'steel spear', firstPerson = false },
+    { weapon = 'iron spear', firstPerson = true }, { weapon = 'iron longsword', firstPerson = true },
+}) do
+    local tag = string.format('BLADEBLOOD01 %s %s', case.weapon, case.firstPerson and 'first' or 'third')
+    registerTest(string.format('BLADE-BLOOD-01 %s %s person', case.weapon, case.firstPerson and 'first' or 'third'),
+        918340 + index, function()
+        local player = prepareContactPlayer(case.weapon, 960 + index, case.firstPerson)
+        local victims = {}
+        local ok, message = pcall(function()
+            local failures = {}
+            local bare = spawnDummy('BLADE-BLOOD-01 dummy', util.vector3(-70, 130, 0), false)
+            victims[#victims + 1] = bare
+            local record = world.createRecord(types.NPC.createRecordDraft({
+                template = types.NPC.record('hlaalu guard'), name = 'BLADE-BLOOD-01 guard',
+                isEssential = false, isPersistent = false, isRespawning = false,
+            }))
+            local guard = world.createObject(record.id)
+            victims[#victims + 1] = guard
+            guard:teleport(testArea.cell, testArea.player + util.vector3(70, 130, 0),
+                { onGround = true, rotation = util.transform.rotateZ(math.pi) })
+            guard:addScript('stance.lua')
+            coroutine.yield()
+            for _, victim in ipairs(victims) do
+                victim:sendEvent('fixActorHealth', 5000)
+                powerAndStand(victim, 'BLADE-BLOOD-01 victim')
+            end
+            waitSeconds(2)
+            local up = util.vector3(0, 0, 1)
+            local function stab(victim, name, part)
+                local state = ragdoll.getState(victim)
+                local shoulders = body(state, 'right_upper_arm').position - body(state, 'left_upper_arm').position
+                local forward = up:cross(util.vector3(shoulders.x, shoulders.y, 0):normalize()):normalize()
+                local point = body(state, part).centerOfMass + forward * 8
+                local wounds, blood = state.woundMarks, ragdoll.getWeaponBloodFx(player)
+                local id = ragdoll.stageWoundReceipt(victim, part, 3, point, forward, player, 0.9)
+                testing.expect(id > 0, 'failed to stage the receipt')
+                victim:sendEvent('Hit', { physicalHitId = id, successful = true, sourceType = 'melee', hitPos = point,
+                    damage = { health = 25, fatigue = 0 }, ignoreStagger = true })
+                waitSeconds(0.6)
+                local drawn = ragdoll.getWeaponBloodFx(player) - blood
+                print(string.format('%s victim=%s part=%s wound_marks=%d weapon_blood=%d', tag, name, part,
+                    ragdoll.getState(victim).woundMarks - wounds, drawn))
+                return drawn
+            end
+            -- The guard first (his armoured chest and head: the light mark
+            -- alone on the point, photographed), then the bare dummy.
+            local function shots(label)
+                local state = ragdoll.getState(player)
+                local blade = state.bodies[state.weapon.bodyIndex]
+                local axis = (blade.rotation * util.vector3(0, 0, 1)):normalize()
+                local at = (blade.renderPosition or blade.position) + axis * (0.4 * state.weapon.length)
+                local side = axis:cross(up)
+                side = side:length() > 0.2 and side:normalize() or util.vector3(1, 0, 0)
+                local position = at + side * 40 + up * 12
+                local look = at - position
+                world.players[1]:sendEvent('fixWoundCamera', { position = position, yaw = math.atan2(look.x, look.y),
+                    pitch = math.atan2(-look.z, math.sqrt(look.x * look.x + look.y * look.y)) })
+                coroutine.yield()
+                coroutine.yield()
+                coroutine.yield()
+                print(string.format('%s shot %s', tag, label))
+                ragdoll.captureScreenshot()
+                waitSeconds(0.1)
+                cameraReadyMode = nil
+                player:sendEvent('fixPlayerCamera', case.firstPerson)
+                waitFor('camera back', function() return cameraReadyMode == case.firstPerson end)
+            end
+            for _, part in ipairs({ 'spine2', 'head' }) do
+                if stab(guard, 'guard', part) < 1 then failures[#failures + 1] = 'no blood through the armoured ' .. part end
+            end
+            shots('through armour only')
+            for _, part in ipairs({ 'neck', 'right_forearm' }) do stab(guard, 'guard', part) end
+            for _, part in ipairs({ 'spine2', 'head', 'neck', 'right_forearm' }) do
+                local drawn = stab(bare, 'dummy', part)
+                if part == 'spine2' and drawn < 1 then failures[#failures + 1] = 'no blood from the bare chest' end
+            end
+            -- The rule before the fix, for its RAGDOLL_WEAPON_BLOOD_DRAWN row.
+            ragdoll.addWeaponBloodFx(player, 0.8, 1.0, 0.9)
+            waitSeconds(0.3)
+            local function view(firstPerson, label)
+                local before = ragdoll.getWeaponBloodFx(player)
+                cameraReadyMode = nil
+                player:sendEvent('fixPlayerCamera', firstPerson)
+                waitFor('camera', function() return cameraReadyMode == firstPerson end)
+                waitSeconds(0.5)
+                local back = ragdoll.getWeaponBloodFx(player) - before
+                print(string.format('%s view=%s marks_redrawn=%d', tag, label, back))
+                return back
+            end
+            local there = view(not case.firstPerson, case.firstPerson and 'third' or 'first')
+            local back = view(case.firstPerson, case.firstPerson and 'first' or 'third')
+            -- Both ends of the weapon, from the side.
+            local state = ragdoll.getState(player)
+            local blade = state.bodies[state.weapon.bodyIndex]
+            local axis = (blade.rotation * util.vector3(0, 0, 1)):normalize()
+            local shot = 0
+            for _, sign in ipairs({ 1, -1 }) do
+                local at = (blade.renderPosition or blade.position) + axis * (sign * 0.4 * state.weapon.length)
+                local side = axis:cross(up)
+                side = side:length() > 0.2 and side:normalize() or util.vector3(1, 0, 0)
+                for _, way in ipairs({ 1, -1 }) do
+                    local position = at + side * (way * 40) + up * 12
+                    local look = at - position
+                    world.players[1]:sendEvent('fixWoundCamera', { position = position, yaw = math.atan2(look.x, look.y),
+                        pitch = math.atan2(-look.z, math.sqrt(look.x * look.x + look.y * look.y)) })
+                    coroutine.yield()
+                    coroutine.yield()
+                    coroutine.yield()
+                    shot = shot + 1
+                    print(string.format('%s shot=%d end=%s side=%d', tag, shot, sign > 0 and '+z' or '-z', way))
+                    ragdoll.captureScreenshot()
+                    waitSeconds(0.1)
+                end
+            end
+            print(string.format('%s result %s %s', tag, #failures == 0 and 'PASS' or 'FAIL', table.concat(failures, '; ')))
+            testing.expect(#failures == 0, table.concat(failures, '; '))
+        end)
+        world.players[1]:sendEvent('fixWoundCamera', {})
+        for _, victim in ipairs(victims) do
+            if victim:isValid() then victim:remove() end
+        end
+        ragdoll.setPowered(player, false)
+        if not ok then error(message, 0) end
+    end)
 end
 
 
@@ -5874,6 +8305,11 @@ end)
 local rangedCases = {
     { label = 'shoots a bow', weapon = 'long bow', ammo = 'iron arrow', spent = 'iron arrow' },
     { label = 'throws knives', weapon = 'iron throwing knife', spent = 'iron throwing knife' },
+    -- Third person, the camera the game is played in.
+    { label = 'shoots a bow in third person', weapon = 'long bow', ammo = 'iron arrow', spent = 'iron arrow',
+        thirdPerson = true },
+    { label = 'shoots a crossbow', weapon = 'steel crossbow', ammo = 'iron bolt', spent = 'iron bolt' },
+    { label = 'throws stars', weapon = 'steel throwing star', spent = 'steel throwing star' },
 }
 for caseIndex, rangedCase in ipairs(rangedCases) do
 for index, powered in ipairs({ true, false }) do
@@ -5890,7 +8326,7 @@ registerTest('RANGED-01 a ' .. (powered and 'powered' or 'vanilla') .. ' player 
         coroutine.yield()
         ragdoll.setPlayerAlwaysHits(true)
         player:sendEvent('fixPlayerConfigure', { weapon = rangedCase.weapon, ammo = rangedCase.ammo, marksman = true,
-            sequence = 393, firstPerson = true })
+            sequence = 393, firstPerson = not rangedCase.thirdPerson })
         waitFor('player loadout', function() return playerReadySequence == 393 end)
         waitSeconds(1)
         if powered then powerAndStand(player, 'bow') end
@@ -5961,6 +8397,263 @@ registerTest('SHIELD-02 a powered player walks with a shield', 918396, function(
     ragdoll.setPowered(player, false)
     if not ok then error(message, 0) end
 end)
+
+-- SHIELD-03 (user 11-10: "hold - guard (with 1 hand weapon the weapon blocks,
+-- with shield the shield blocks)", "tap ONCE! + direction - parry"): the
+-- player with a longsword and an iron shield holds the right button in each
+-- guard zone. The guard must come up, read its zone and go down on release;
+-- then a tap with the flick after the release must read the flick's zone
+-- (K2_TAP_PARRY_AIM). The shield block itself is not built: the shield arm
+-- does not follow its guard target (26 u under it at rest and in the block,
+-- 11-09), so the weapon still blocks. SHIELD03 lines: each hand about the
+-- chest (right, forward, up), per zone and at rest, for that work.
+registerTest('SHIELD-03 the right button guards with a shield, a tap aims its parry', 918397, function()
+    local player = placePlayer()
+    local ok, message = pcall(function()
+        local inventory = types.Actor.inventory(player)
+        if not inventory:find('iron_shield') then world.createObject('iron_shield', 1):moveInto(inventory) end
+        if not inventory:find('iron longsword') then world.createObject('iron longsword', 1):moveInto(inventory) end
+        coroutine.yield()
+        player:sendEvent('fixPlayerConfigure', { weapon = 'iron longsword', shield = 'iron_shield', sequence = 397, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 397 end)
+        waitSeconds(1)
+        powerAndStand(player, 'SHIELD-03 player')
+        waitSeconds(1.5)
+        ragdoll.prepareMouseInput()
+        local RIGHT = 3
+        local function measure(label)
+            local st = ragdoll.getState(player)
+            local chest = body(st, 'spine2').position
+            local yaw = player.rotation:getYaw()
+            local c, sn = math.cos(-yaw), math.sin(-yaw)
+            local out = { active = st.guardActive, zone = st.guardZone }
+            for _, hand in ipairs({ 'left_hand', 'right_hand' }) do
+                local rel = body(st, hand).position - chest
+                out[hand] = { right = rel.x * c - rel.y * sn, forward = rel.x * sn + rel.y * c, up = rel.z }
+            end
+            print(string.format('SHIELD03 zone=%s read=%s active=%s left=%.1f,%.1f,%.1f right=%.1f,%.1f,%.1f', label,
+                tostring(st.guardZone), tostring(st.guardActive), out.left_hand.right, out.left_hand.forward,
+                out.left_hand.up, out.right_hand.right, out.right_hand.forward, out.right_hand.up))
+            return out
+        end
+        local rest = measure('rest')
+        local seen = {}
+        for _, zone in ipairs({ { 'middle', 0, 0 }, { 'high', 0, -500 }, { 'low', 0, 500 } }) do
+            ragdoll.injectMouseInput(0, 0, true, RIGHT)
+            waitSeconds(0.1)
+            ragdoll.injectMouseInput(zone[2], zone[3])
+            waitSeconds(0.7)
+            seen[zone[1]] = measure(zone[1])
+            ragdoll.injectMouseInput(0, 0, false, RIGHT)
+            waitSeconds(0.8)
+        end
+        local after = measure('released')
+        ragdoll.injectMouseInput(0, 0, true, RIGHT)
+        waitSeconds(0.08)
+        ragdoll.injectMouseInput(0, 0, false, RIGHT)
+        ragdoll.injectMouseInput(0, -500)
+        waitSeconds(0.12)
+        local tap = measure('tap-high')
+        waitSeconds(0.8)
+        local tapOver = measure('tap-over')
+        testing.expect(tap.active == true, 'the tap did not hold the guard up')
+        testing.expect(tap.zone == seen.high.zone,
+            'the tap did not take the flick after its release: zone ' .. tostring(tap.zone))
+        testing.expect(tapOver.active ~= true, 'the tapped guard stayed up')
+        testing.expect(seen.middle.active == true, 'the right button did not raise the guard')
+        testing.expect(after.active ~= true, 'the guard stayed up after the release')
+        testing.expect(seen.high.active == true and seen.low.active == true, 'the guard dropped in a zone')
+        testing.expect(rest.active ~= true, 'the guard was up before the press')
+    end)
+    ragdoll.setPowered(player, false)
+    if not ok then error(message, 0) end
+end)
+
+-- TOOL-01 (bug report 2026-11-03): a lockpick or probe in hand froze the
+-- player in place and the fatigue bar with it, until a weapon was equipped.
+-- The player holds each tool ready, walks 4 s and rests 3 s at half fatigue.
+for index, tool in ipairs({ 'pick_apprentice_01', 'probe_apprentice_01' }) do
+registerTest('TOOL-01 a powered player walks with ' .. tool, 918410 + index, function()
+    local player = placePlayer()
+    local ok, message = pcall(function()
+        local inventory = types.Actor.inventory(player)
+        if not inventory:find(tool) then world.createObject(tool, 1):moveInto(inventory) end
+        coroutine.yield()
+        player:sendEvent('fixPlayerConfigure', { weapon = tool, sequence = 400 + index, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 400 + index end)
+        powerAndStand(player, 'tool')
+        waitSeconds(1)
+        local start = player.position
+        player:sendEvent('fixPlayerMove', 1)
+        waitSeconds(4)
+        player:sendEvent('fixPlayerMove', 0)
+        local walked = (player.position - start):length()
+        player:sendEvent('fixSetFatigue', 0.5)
+        waitSeconds(0.5)
+        local fatigue = types.Actor.stats.dynamic.fatigue(player)
+        local before = fatigue.current
+        waitSeconds(3)
+        local regained = fatigue.current - before
+        local held = types.Actor.getEquipment(player)[types.Actor.EQUIPMENT_SLOT.CarriedRight]
+        print(string.format('TOOL-01 tool=%s held=%s stance=%s walked=%.1f fatigue=%.1f->%.1f',
+            tool, tostring(held and held.recordId), tostring(types.Actor.getStance(player)), walked, before, fatigue.current))
+        testing.expect(held ~= nil and held.recordId == tool, 'the tool is not held')
+        testing.expect(walked > 100, 'the player did not walk')
+        testing.expect(regained > 0, 'fatigue did not recover')
+    end)
+    player:sendEvent('fixPlayerMove', 0)
+    ragdoll.setPowered(player, false)
+    if not ok then error(message, 0) end
+end)
+end
+
+-- EQUIP-01 (user 11-14: "previously we had some bug with the thief tools,
+-- when equipped the player couldnt move. can you check if the other
+-- equippable items work?"): one case for every kind of thing the hands can
+-- hold - each weapon type, bow and crossbow with ammunition, thrown weapons,
+-- pick and probe, torch and lantern, a shield, and their pairings, readied
+-- or sheathed. The powered player holds it, walks 4 s, turns and walks back
+-- 2 s, then rests 3 s at half fatigue. Passes when the items are held, the
+-- player walked both ways, never fell, and fatigue recovered.
+local equipCases = {
+    { label = 'bare fists' },
+    { label = 'a dagger', weapon = 'iron dagger' },
+    { label = 'a longsword', weapon = 'iron longsword' },
+    { label = 'a claymore', weapon = 'iron claymore' },
+    { label = 'a mace', weapon = 'iron mace' },
+    { label = 'a warhammer', weapon = 'iron warhammer' },
+    { label = 'a staff', weapon = 'wooden staff' },
+    { label = 'a spear', weapon = 'iron spear' },
+    { label = 'a war axe', weapon = 'iron war axe' },
+    { label = 'a battle axe', weapon = 'iron battle axe' },
+    { label = 'a bow and arrows', weapon = 'long bow', ammo = 'iron arrow' },
+    { label = 'a crossbow and bolts', weapon = 'steel crossbow', ammo = 'iron bolt' },
+    { label = 'a bow and no arrows', weapon = 'long bow' },
+    { label = 'throwing stars', weapon = 'steel throwing star', count = 20 },
+    { label = 'darts', weapon = 'steel dart', count = 20 },
+    { label = 'a lockpick and a torch', weapon = 'pick_apprentice_01', left = 'light_com_torch_01' },
+    { label = 'a probe and a shield', weapon = 'probe_apprentice_01', left = 'iron_shield' },
+    { label = 'a torch and fists', left = 'light_com_torch_01' },
+    { label = 'a torch, sheathed', left = 'light_com_torch_01', sheathed = true },
+    { label = 'a lantern and a longsword', weapon = 'iron longsword', left = 'light_com_lantern_02' },
+    { label = 'a shield and fists', left = 'iron_shield' },
+    { label = 'a shield and a spear', weapon = 'iron spear', left = 'iron_shield' },
+    { label = 'a claymore, sheathed', weapon = 'iron claymore', sheathed = true },
+}
+for index, case in ipairs(equipCases) do
+registerTest('EQUIP-01 a powered player walks with ' .. case.label, 918500 + index, function()
+    local player = placePlayer()
+    local ok, message = pcall(function()
+        local inventory = types.Actor.inventory(player)
+        for _, id in ipairs({ case.weapon or false, case.left or false, case.ammo or false }) do
+            if id and not inventory:find(id) then
+                world.createObject(id, (id == case.ammo and 30) or (id == case.weapon and case.count) or 1)
+                    :moveInto(inventory)
+            end
+        end
+        coroutine.yield()
+        player:sendEvent('fixPlayerConfigure', { weapon = case.weapon, shield = case.left, ammo = case.ammo,
+            sheathed = case.sheathed, sequence = 500 + index, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 500 + index end)
+        powerAndStand(player, 'equip')
+        local modes = {}
+        local count = function()
+            local s = ragdoll.getState(player)
+            local m = s and s.controller and s.controller.mode or 'none'
+            modes[m] = (modes[m] or 0) + 1
+        end
+        waitSeconds(1, count)
+        local start = player.position
+        player:sendEvent('fixPlayerMove', 1)
+        waitSeconds(4, count)
+        local out = (player.position - start):length()
+        player:sendEvent('fixPlayerMove', -1)
+        waitSeconds(2, count)
+        player:sendEvent('fixPlayerMove', 0)
+        local back = out - (player.position - start):length()
+        player:sendEvent('fixSetFatigue', 0.5)
+        waitSeconds(0.5, count)
+        local fatigue = types.Actor.stats.dynamic.fatigue(player)
+        local before = fatigue.current
+        waitSeconds(3, count)
+        local equipment = types.Actor.getEquipment(player)
+        local right = equipment[types.Actor.EQUIPMENT_SLOT.CarriedRight]
+        local left = equipment[types.Actor.EQUIPMENT_SLOT.CarriedLeft]
+        local list = {}
+        for m, n in pairs(modes) do list[#list + 1] = m .. '=' .. n end
+        table.sort(list)
+        print(string.format('EQUIP-01 %s right=%s left=%s stance=%s out=%.1f back=%.1f fatigue=%.1f->%.1f modes %s',
+            case.label, tostring(right and right.recordId), tostring(left and left.recordId),
+            tostring(types.Actor.getStance(player)), out, back, before, fatigue.current, table.concat(list, ' ')))
+        testing.expect((right and right.recordId) == case.weapon, 'the right hand does not hold ' .. tostring(case.weapon))
+        testing.expect((left and left.recordId) == case.left, 'the left hand does not hold ' .. tostring(case.left))
+        testing.expect(out > 100, string.format('the player did not walk forward (%.1f)', out))
+        testing.expect(back > 40, string.format('the player did not walk back (%.1f)', back))
+        testing.expect(fatigue.current > before, 'fatigue did not recover')
+        testing.expect(not modes.falling and not modes.fallen, 'the body fell')
+    end)
+    player:sendEvent('fixPlayerMove', 0)
+    ragdoll.setPowered(player, false)
+    if not ok then error(message, 0) end
+end)
+end
+
+-- REGRIP-01 (user bookmark 11-16: "I think I broke the spear stance somehow
+-- lol now it looks like its onlly attached to the right hand"; K2_REGRIP):
+-- the grip joint of a drawn weapon is broken with the dev call. Passes when
+-- the same weapon is held again within 2 s (the body rebuilt at a quiet
+-- standing step) and is still equipped; a weapon let go as dropped must stay
+-- let go for the 2.5 s watched.
+local regripCases = {
+    { label = 'a steel spear, grip broken', weapon = 'steel spear', reason = 'break' },
+    { label = 'a steel staff, grip broken', weapon = 'steel staff', reason = 'break' },
+    { label = 'an iron longsword, grip broken', weapon = 'iron longsword', reason = 'break' },
+    { label = 'a steel spear, dropped', weapon = 'steel spear', reason = 'drop' },
+}
+for index, case in ipairs(regripCases) do
+registerTest('REGRIP-01 ' .. case.label, 918560 + index, function()
+    local player = placePlayer()
+    local ok, message = pcall(function()
+        local inventory = types.Actor.inventory(player)
+        if not inventory:find(case.weapon) then world.createObject(case.weapon, 1):moveInto(inventory) end
+        coroutine.yield()
+        player:sendEvent('fixPlayerConfigure', { weapon = case.weapon, sequence = 560 + index, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 560 + index end)
+        powerAndStand(player, 'regrip')
+        local function held()
+            local s = ragdoll.getState(player)
+            return s and s.weapon and s.weapon.attached and s.weapon.recordId == case.weapon and s
+        end
+        waitFor('REGRIP-01 weapon held', held, 6)
+        -- Past the ready rebuild (0.8 s drawn), which builds the body again.
+        waitSeconds(1.5)
+        waitFor('REGRIP-01 weapon held after the ready rebuild', held, 6)
+        testing.expect(ragdoll.releaseWeapon(player, case.reason), 'the dev call released nothing')
+        local start = core.getSimulationTime()
+        coroutine.yield()
+        local lost = not held()
+        local back
+        repeat
+            coroutine.yield()
+            if held() then back = core.getSimulationTime() - start end
+        until back or core.getSimulationTime() >= start + 2.5
+        local right = types.Actor.getEquipment(player)[types.Actor.EQUIPMENT_SLOT.CarriedRight]
+        local state = ragdoll.getState(player)
+        print(string.format('REGRIP-01 %s reason=%s lost=%s back=%s equipped=%s mode=%s', case.weapon, case.reason,
+            tostring(lost), back and string.format('%.2f', back) or 'never', tostring(right and right.recordId),
+            tostring(state and state.controller and state.controller.mode)))
+        testing.expect(lost, 'the weapon was never let go')
+        testing.expect((right and right.recordId) == case.weapon, 'the weapon is no longer equipped')
+        if case.reason == 'break' then
+            testing.expect(back and back <= 2.0, 'a broken grip was not gripped again within 2 s')
+        else
+            testing.expect(not back, 'a weapon let go as dropped was gripped again')
+        end
+    end)
+    ragdoll.setPowered(player, false)
+    if not ok then error(message, 0) end
+end)
+end
 
 -- SPELL-01 (Alpha 1.0: "spells cast from a physical body with vanilla
 -- effects"): the powered player casts a fireball at a dummy 300 units ahead.
@@ -7862,17 +10555,86 @@ registerTest('FLOW-01 iron warhammer', 918752, flowTest('FLOW-01 warhammer', 'ir
 registerTest('FLOW-01 iron battle axe', 918753, flowTest('FLOW-01 battle axe', 'iron battle axe', 3))
 registerTest('FLOW-01 iron spear', 918754, flowTest('FLOW-01 spear', 'iron spear', 4))
 registerTest('FLOW-01 wooden staff', 918755, flowTest('FLOW-01 staff', 'wooden staff', 5))
+-- The same strokes with other materials of one weapon (user 11-06: "glass
+-- claymore control was pretty bad ... couldn't swing like steel claymore";
+-- the steel spear "can't hold it properly"): weight and mesh differ.
+registerTest('FLOW-01 steel claymore', 918756, flowTest('FLOW-01 steel claymore', 'steel claymore', 6))
+registerTest('FLOW-01 glass claymore', 918757, flowTest('FLOW-01 glass claymore', 'glass claymore', 7))
+registerTest('FLOW-01 steel spear', 918758, flowTest('FLOW-01 steel spear', 'steel spear', 8))
+-- Weight against mesh: one material's model at the other's weight (records
+-- made for the test from the game's own).
+local function reweighed(template, weight)
+    return function()
+        local draft = types.Weapon.createRecordDraft({ template = types.Weapon.record(template), weight = weight })
+        return world.createRecord(draft).id
+    end
+end
+local function flowTestWith(tag, makeWeapon, sequence)
+    return function() return flowTest(tag, makeWeapon(), sequence)() end
+end
+registerTest('FLOW-01 glass claymore weighing 27', 918759,
+    flowTestWith('FLOW-01 glass claymore weighing 27', reweighed('glass claymore', 27), 9))
+registerTest('FLOW-01 steel claymore weighing 16.2', 918760,
+    flowTestWith('FLOW-01 steel claymore weighing 16.2', reweighed('steel claymore', 16.2), 10))
+
+-- VARIANT-01 / VARIANT-02 (user 11-07: "make sure variations of weapons do
+-- not change the behavior"): FLOW-01's strokes with every material and model
+-- of each kind. VARIANT-01 weighs each variant as its kind's iron one, so
+-- only the model differs and the strokes must read like the iron weapon's;
+-- VARIANT-02 keeps the variant's own weight (heavier is slower by design,
+-- Morrowind's weight). The kinds' references are the iron ones (the staff's
+-- the wooden). tools/body/variants.py reads the logs against the reference.
+local variantKinds = {
+    { 'iron dagger', 3, { 'chitin dagger', 'glass dagger', 'silver dagger', 'steel dagger', 'daedric dagger',
+        'iron tanto', 'steel tanto', 'daedric tanto' } },
+    { 'iron shortsword', 8, { 'chitin shortsword', 'silver shortsword', 'steel shortsword', 'dwarven shortsword',
+        'imperial shortsword', 'ebony shortsword', 'daedric shortsword', 'iron wakizashi', 'daedric wakizashi' } },
+    { 'iron longsword', 20, { 'iron broadsword', 'steel broadsword', 'imperial broadsword', 'nordic broadsword',
+        'ebony broadsword', 'glass longsword', 'silver longsword', 'steel longsword', 'ebony longsword',
+        'daedric longsword', 'iron saber', 'steel saber', 'steel katana', 'daedric katana' } },
+    { 'iron claymore', 27, { 'glass claymore', 'silver claymore', 'steel claymore', 'dwarven claymore',
+        'nordic claymore', 'daedric claymore', 'steel dai-katana', 'daedric dai-katana' } },
+    { 'iron mace', 15, { 'iron club', 'steel club', 'chitin club', 'dreugh club', 'daedric club', 'steel mace',
+        'dwarven mace', 'ebony mace', 'daedric mace' } },
+    { 'iron warhammer', 32, { 'steel warhammer', 'dwarven warhammer', 'orcish warhammer', 'daedric warhammer' } },
+    { 'wooden staff', 8, { 'glass staff', 'silver staff', 'steel staff', 'dreugh staff', 'ebony staff',
+        'daedric staff' } },
+    { 'iron spear', 14, { 'chitin spear', 'silver spear', 'steel spear', 'dwarven spear', 'ebony spear',
+        'daedric spear', 'iron long spear', 'iron halberd', 'steel halberd', 'glass halberd', 'dwarven halberd' } },
+    { 'iron war axe', 24, { 'chitin war axe', 'glass war axe', 'silver war axe', 'steel war axe', 'dwarven war axe',
+        'ebony war axe', 'daedric war axe', 'steel axe' } },
+    { 'iron battle axe', 30, { 'orcish battle axe', 'nordic battle axe', 'steel battle axe', 'dwarven battle axe',
+        'daedric battle axe' } },
+}
+do
+    local sequence = 1300
+    for _, kind in ipairs(variantKinds) do
+        local reference, weight, variants = kind[1], kind[2], kind[3]
+        local all = { reference }
+        for _, v in ipairs(variants) do all[#all + 1] = v end
+        for _, v in ipairs(all) do
+            sequence = sequence + 1
+            local tag = 'VARIANT-01 ' .. v
+            registerTest(tag, 918800 + sequence, flowTestWith(tag, reweighed(v, weight), sequence))
+            sequence = sequence + 1
+            local own = 'VARIANT-02 ' .. v
+            registerTest(own, 918800 + sequence, flowTest(own, v, sequence))
+        end
+    end
+end
 
 -- THRUST-01 (user 10-31: "can we make it so the thrust is more evident? ...
 -- thrusting with the claymore the sword doesnt travel that much"): from the
--- guard, standing, no foe, a dragged thrust (down, back up) and a clicked one
--- (the thrust button). Per thrust, along the facing the player had at the
+-- guard, standing, no foe, a dragged thrust (down, back up). The clicked one
+-- left with 11-03: the middle button kicks since, and a click thrusts only
+-- with a forward or back key held, which walks the body this case measures
+-- from. Per thrust, along the facing the player had at the
 -- guard: the tip's place at the guard, its least through the wind-up and its
 -- most through the drive (travel = most - least, reach = most - guard), the
 -- pelvis's most forward shift, the tip's top speed (u/s), the wrist outside
 -- its limits and, two-handed, the support grip. FAIL: the support hand let
 -- go, or the thrust drove less than 30 units.
-local function thrustTest(tag, weapon, sequence)
+local function thrustTest(tag, weapon, sequence, chop)
     return function()
         local player = placePlayer()
         local ok, message = pcall(function()
@@ -7885,6 +10647,8 @@ local function thrustTest(tag, weapon, sequence)
             waitSeconds(1)
             powerAndStand(player, weapon)
             ragdoll.prepareMouseInput()
+            -- The wheel's dragged thrust (K2_POINT_AIM's is POINT-01's).
+            if not chop then ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_AIM', '0') end
             local function q(t, f)
                 if #t == 0 then return -1 end
                 local c = {}
@@ -7913,6 +10677,7 @@ local function thrustTest(tag, weapon, sequence)
                     stats.least = math.min(stats.least, along)
                 else
                     stats.most = math.max(stats.most, along)
+                    stats.path[#stats.path + 1] = tip
                 end
                 stats.pelvis = math.max(stats.pelvis, (body(s, 'pelvis').position - pelvis0):dot(forward))
                 if prevTip then stats.speed = math.max(stats.speed, (tip - prevTip):length() * 60 / dsteps) end
@@ -7951,7 +10716,7 @@ local function thrustTest(tag, weapon, sequence)
                 forward = util.vector3(math.sin(yaw), math.cos(yaw), 0)
                 origin = body(s, 'pelvis').position
                 pelvis0 = origin
-                stats = { guard = {}, least = 1e9, most = -1e9, pelvis = 0, speed = 0, outside = {}, support = {}, lost = 0 }
+                stats = { guard = {}, least = 1e9, most = -1e9, pelvis = 0, speed = 0, outside = {}, support = {}, lost = 0, path = {} }
                 prevTip, prevStep, prevAttached = nil, nil, nil
                 run(0.4, 'guard')
             end
@@ -7964,42 +10729,93 @@ local function thrustTest(tag, weapon, sequence)
                     for _, v in ipairs(stats.support) do support = support + v / #stats.support end
                 end
                 local travel = stats.most - stats.least
-                print(string.format('%s %-7s guard=%.1f least=%.1f most=%.1f travel=%.1f reach=%.1f pelvis=%.1f speed_max=%.0f wrist_out_p90=%.0f support=%.2f lost=%d',
+                print(string.format('%s %-7s guard=%.1f least=%.1f most=%.1f travel=%.1f reach=%.1f pelvis=%.1f speed_max=%.0f wrist_out_p90=%.0f wrist_out_max=%.0f support=%.2f lost=%d',
                     tag, name, guard, stats.least, stats.most, travel, stats.most - guard, stats.pelvis, stats.speed,
-                    q(stats.outside, 0.9), support, stats.lost))
+                    q(stats.outside, 0.9), q(stats.outside, 1.0), support, stats.lost))
+                -- THRUST01_LINE: the point's path through the drive, from where
+                -- it starts forward to its furthest: its length, its rise and
+                -- its turn off the facing (degrees), its bow (the furthest it
+                -- leaves the straight line between the two, units), and where
+                -- it ends against the level line ahead from the eye.
+                local first, last = 1, 1
+                for i, pnt in ipairs(stats.path) do
+                    if (pnt - origin):dot(forward) > (stats.path[last] - origin):dot(forward) then last = i end
+                end
+                for i = 1, last do
+                    if (stats.path[i] - origin):dot(forward) < (stats.path[first] - origin):dot(forward) then first = i end
+                end
+                if last > first then
+                    local a, b = stats.path[first], stats.path[last]
+                    local d = b - a
+                    local n = d:normalize()
+                    local right = util.vector3(forward.y, -forward.x, 0)
+                    local bow = 0
+                    for i = first, last do
+                        local r = stats.path[i] - a
+                        bow = math.max(bow, (r - n * r:dot(n)):length())
+                    end
+                    local eye = body(ragdoll.getState(player), 'head').position
+                    print(string.format('THRUST01_LINE %s %s length=%.1f rise=%.1f turn=%.1f bow=%.1f steps=%d end_right=%.1f end_up=%.1f',
+                        tag, name, d:length(), math.deg(math.asin(n.z)), math.deg(math.atan2(n:dot(right), n:dot(forward))), bow,
+                        last - first, (b - eye):dot(right), b.z - eye.z))
+                end
                 if stats.lost > 0 then failures[#failures + 1] = name .. ' support lost ' .. stats.lost end
-                if travel < 30 then failures[#failures + 1] = string.format('%s travel %.1f', name, travel) end
+                if not chop and travel < 30 then failures[#failures + 1] = string.format('%s travel %.1f', name, travel) end
+            end
+            -- THRUST01_POSE rows: where the hands are against the wheel's
+            -- command, in the facing frame from the chest (right, forward,
+            -- up), and the shaft's direction against the commanded one.
+            local function pose(name)
+                local s = ragdoll.getState(player)
+                if not s or not s.weapon or not s.hsc then return end
+                local chest = body(s, 'spine2').position
+                local right = util.vector3(forward.y, -forward.x, 0)
+                local function loc(v, direction)
+                    local d = direction and v or (v - chest)
+                    return string.format('%.0f,%.0f,%.0f', d:dot(right), d:dot(forward), d.z)
+                end
+                local shaft = (s.bodies[s.weapon.bodyIndex].rotation * util.vector3(0, 0, 1)):normalize()
+                local hand, grip = body(s, 'right_hand').position, s.hsc.grip
+                local blade = s.hsc.blade
+                local off = (blade and blade:length() > 0.5)
+                    and math.deg(math.acos(math.max(-1, math.min(1, shaft:dot(blade:normalize()))))) or -1
+                local across = body(s, 'right_upper_arm').position - body(s, 'left_upper_arm').position
+                print(string.format('THRUST01_POSE %s %s hand=%s asked=%s (%.1f off) support=%s shaft=%s asked=%s (%.0f deg off) tip=%s chest_turn=%.0f r_shoulder=%s l_shoulder=%s',
+                    tag, name, loc(hand), grip and loc(grip) or '-', grip and (hand - grip):length() or -1,
+                    loc(body(s, 'left_hand').position), loc(shaft * 100, true), blade and loc(blade:normalize() * 100, true) or '-',
+                    off, loc(tipOf(s)), math.deg(math.atan2(-across:dot(forward), across:dot(right))),
+                    loc(body(s, 'right_upper_arm').position), loc(body(s, 'left_upper_arm').position)))
             end
             -- Dragged: down to the chamber, a short hold, back up through the
             -- centre (the thrust), the follow-through, the release.
             begin()
+            pose('guard')
             local presses = ragdoll.getState(player).playerPressCount
             ragdoll.injectMouseInput(0, 0, true, 1)
             waitFor('press', function() return ragdoll.getState(player).playerPressCount > presses end, 3)
-            run(0.45, 'wind', 0, HSC_WIND)
+            -- CHOP-02: the drag the other way (up to the chamber, down the
+            -- cut), the chamber held a second.
+            local way = chop and -1 or 1
+            run(0.45, 'wind', 0, way * HSC_WIND)
             run(0.25, 'wind', 0, 0)
-            run(0.3, 'drive', 0, -HSC_CUT)
+            pose('chamber')
+            if chop then
+                run(0.75, 'wind', 0, 0)
+                pose('chamber 1 s')
+            end
+            run(0.1, 'drive', 0, -way * HSC_CUT * 0.3)
+            pose('drive 0.1 s')
+            run(0.2, 'drive', 0, -way * HSC_CUT * 0.7)
+            pose('drive 0.3 s')
             run(0.4, 'drive', 0, 0)
+            pose('end')
             ragdoll.injectMouseInput(0, 0, false, 1)
             run(1.0, 'recover')
             report('dragged')
-            -- Clicked: the thrust button pressed and let go; the wind-up and
-            -- the drive play on their own.
-            begin()
-            ragdoll.injectMouseInput(0, 0, true, 2)
-            coroutine.yield()
-            coroutine.yield()
-            ragdoll.injectMouseInput(0, 0, false, 2)
-            local stage = 'wind'
-            waitSeconds(1.6, function()
-                local s = ragdoll.getState(player)
-                if stage == 'wind' and s and s.hsc and s.hsc.stage == 2 then stage = 'drive' end
-                sample(stage)
-            end)
-            report('clicked')
             print(string.format('%s result %s %s', tag, #failures == 0 and 'PASS' or 'FAIL', table.concat(failures, '; ')))
             if #failures > 0 then error(tag .. ' ' .. table.concat(failures, '; '), 0) end
         end)
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_AIM', nil)
         ragdoll.injectMouseInput(0, 0, false, 1)
         ragdoll.setPowered(player, false)
         if not ok then error(message, 0) end
@@ -8008,7 +10824,219 @@ end
 registerTest('THRUST-01 iron longsword', 918790, thrustTest('THRUST-01 longsword', 'iron longsword', 0))
 registerTest('THRUST-01 iron claymore', 918791, thrustTest('THRUST-01 claymore', 'iron claymore', 1))
 registerTest('THRUST-01 iron spear', 918792, thrustTest('THRUST-01 spear', 'iron spear', 2))
+-- CHOP-02 (user 11-12: "dragging up should wind the spear more like the spear
+-- should go behind the character back"): a haft's dragged chop with its
+-- chamber held a second; THRUST01_POSE rows say where the hands and the shaft
+-- are against the command, speed_max how fast the point comes down. FAIL: the
+-- support hand let go.
+registerTest('CHOP-02 iron spear', 918797, thrustTest('CHOP-02 spear', 'iron spear', 4, true))
+registerTest('CHOP-02 wooden staff', 918798, thrustTest('CHOP-02 staff', 'wooden staff', 5, true))
 registerTest('THRUST-01 wooden staff', 918793, thrustTest('THRUST-01 staff', 'wooden staff', 3))
+
+-- PLANT-01 (user bookmark 11-16: "why is it that when I thrust and it moves
+-- the player slightly forward it tries to do a front step? ... thrusting would
+-- have the character planted as best as possible no?"): standing still, no
+-- foe, no move keys, six thrusts one after another - a tap of the left button
+-- with the spear, of the middle one (Physical thrust) with a sword. Per thrust
+-- a PLANT01 row: how far each foot went from where it stood when the button
+-- went down (units, horizontal, the most through the thrust and its return),
+-- the pelvis's most forward and back shift and the tip's reach past its guard
+-- place along the facing (the lunge is kept). PLANT01_TOTAL: thrusts in which
+-- a foot left its place (12 u: a planted rear foot rolls 6-10 with the weight,
+-- a step went 14-41). FAIL: any (K2_THRUST_PLANT 0: 2-6 of 6).
+local function plantTest(tag, weapon, sequence, button)
+    return function()
+        local player = placePlayer()
+        local ok, message = pcall(function()
+            if not types.Actor.inventory(player):find(weapon) then
+                world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+                coroutine.yield()
+            end
+            player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 990 + sequence, firstPerson = false })
+            waitFor('player loadout', function() return playerReadySequence == 990 + sequence end)
+            waitSeconds(1)
+            powerAndStand(player, weapon)
+            ragdoll.prepareMouseInput()
+            local yaw = player.rotation:getYaw()
+            local forward = util.vector3(math.sin(yaw), math.cos(yaw), 0)
+            local function flat2(v) return util.vector3(v.x, v.y, 0) end
+            local function tipOf(s)
+                local b = s.bodies[s.weapon.bodyIndex]
+                return b.position + (b.rotation * util.vector3(0, 0, 1)):normalize() * (s.weapon.length * 0.5)
+            end
+            waitFor('guard', function() return ragdoll.getSwingSpeed(player) == nil end, 4)
+            waitSeconds(2.5)
+            local stepped, thrusts, reaches = 0, 6, {}
+            for n = 1, thrusts do
+                waitFor('guard', function() return ragdoll.getSwingSpeed(player) == nil end, 4)
+                waitSeconds(0.6)
+                local s0 = ragdoll.getState(player)
+                local feet0 = { flat2(body(s0, 'left_foot').centerOfMass), flat2(body(s0, 'right_foot').centerOfMass) }
+                local pelvis0, tip0 = body(s0, 'pelvis').position, tipOf(s0)
+                local went, ahead, back, reach = { 0, 0 }, 0, 0, -1e9
+                local function watch()
+                    local s = ragdoll.getState(player)
+                    if not s or not s.weapon then return end
+                    for i, name in ipairs({ 'left_foot', 'right_foot' }) do
+                        went[i] = math.max(went[i], (flat2(body(s, name).centerOfMass) - feet0[i]):length())
+                    end
+                    local shift = (body(s, 'pelvis').position - pelvis0):dot(forward)
+                    ahead, back = math.max(ahead, shift), math.min(back, shift)
+                    reach = math.max(reach, (tipOf(s) - tip0):dot(forward))
+                end
+                local presses = s0.playerPressCount
+                print(string.format('PLANT01_BEGIN %s n=%d', tag, n))
+                ragdoll.injectMouseInput(0, 0, true, button)
+                if button == 1 then
+                    waitFor('press', function() return ragdoll.getState(player).playerPressCount > presses end, 3)
+                end
+                waitSeconds(0.08, watch)
+                ragdoll.injectMouseInput(0, 0, false, button)
+                waitSeconds(1.9, watch)
+                print(string.format('PLANT01_END %s n=%d', tag, n))
+                local moved = (went[1] > 12 or went[2] > 12) and 1 or 0
+                stepped = stepped + moved
+                reaches[#reaches + 1] = reach
+                print(string.format('PLANT01 %s n=%d left_foot=%.1f right_foot=%.1f stepped=%d pelvis_ahead=%.1f pelvis_back=%.1f reach=%.1f',
+                    tag, n, went[1], went[2], moved, ahead, -back, reach))
+            end
+            table.sort(reaches)
+            print(string.format('PLANT01_TOTAL %s stepped=%d of %d reach_median=%.1f', tag, stepped, thrusts,
+                reaches[math.ceil(#reaches / 2)]))
+            if reaches[math.ceil(#reaches / 2)] < 15 then
+                error(string.format('%s: the thrusts reached %.1f u (no thrust thrown?)', tag, reaches[math.ceil(#reaches / 2)]), 0)
+            end
+            if stepped > 0 then
+                error(string.format('%s: a foot left its place in %d of %d standing thrusts', tag, stepped, thrusts), 0)
+            end
+        end)
+        ragdoll.injectMouseInput(0, 0, false, button)
+        ragdoll.setPowered(player, false)
+        if not ok then error(message, 0) end
+    end
+end
+registerTest('PLANT-01 standing thrusts iron spear', 918811, plantTest('PLANT-01 spear', 'iron spear', 0, 1))
+registerTest('PLANT-01 standing thrusts iron longsword', 918812, plantTest('PLANT-01 longsword', 'iron longsword', 1, 2))
+
+-- SPEAR-01 (user 11-11: spears "unsatisfying"; the 11-09 spear session: 46 of
+-- 64 thrusts landed, 36 of the 40 thrust hits read as shaft bruises and paid
+-- the chop's band). Dragged thrusts at a standing dummy's chest at the point's
+-- reach, four with K2_POINT_LEAD off and four with the game's value. SPEAR01
+-- rows: the health each thrust took. Bar: with the game's value, at least two
+-- land and their median takes the thrust band's low end or more.
+registerTest('SPEAR-01 thrusts pay the thrust band', 918801, function()
+    local weapon = 'iron spear'
+    local player = placePlayer()
+    local victim
+    local savedReaction = ragdoll.reactionScale()
+    local ok, message = pcall(function()
+        ragdoll.setPlayerAlwaysHits(true)
+        if not types.Actor.inventory(player):find(weapon) then
+            world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+            coroutine.yield()
+        end
+        player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 947, firstPerson = false })
+        waitFor('player loadout', function() return playerReadySequence == 947 end)
+        waitSeconds(1)
+        powerAndStand(player, 'SPEAR-01 player')
+        -- The wheel's dragged thrust (K2_POINT_AIM's is POINT-01's).
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_AIM', '0')
+        ragdoll.reactionScale(0)
+        ragdoll.prepareMouseInput()
+        local function pivotOf()
+            local p = ragdoll.getState(player)
+            return (body(p, 'left_upper_arm').position + body(p, 'right_upper_arm').position) * 0.5
+        end
+        local function tipOf()
+            local s = ragdoll.getState(player)
+            if not s or not s.weapon then return nil end
+            local b = s.bodies[s.weapon.bodyIndex]
+            return b.position + (b.rotation * util.vector3(0, 0, 1)):normalize() * (s.weapon.length * 0.5)
+        end
+        local yaw = player.rotation:getYaw()
+        local forward = util.vector3(math.sin(yaw), math.cos(yaw), 0)
+        local most
+        local function watch()
+            local tip = tipOf()
+            if tip then most = math.max(most or -1e9, (tip - pivotOf()):dot(forward)) end
+        end
+        local function drag(dy, seconds)
+            local steps = math.max(1, math.floor(seconds * 60))
+            local sy = 0
+            for i = 1, steps do
+                local t = i / steps
+                local y = math.floor(dy * t * t * t * (10 - 15 * t + 6 * t * t))
+                if y ~= sy then ragdoll.injectMouseInput(0, y - sy) end
+                sy = y
+                waitSeconds(1 / 60, watch)
+            end
+        end
+        -- THRUST-01's dragged thrust: down to the chamber, a short hold, back
+        -- up through the centre, the follow-through, the release.
+        local function thrust()
+            waitFor('guard', function() return ragdoll.getSwingSpeed(player) == nil end, 4)
+            waitSeconds(0.5)
+            local presses = ragdoll.getState(player).playerPressCount
+            ragdoll.injectMouseInput(0, 0, true, 1)
+            waitFor('press', function() return ragdoll.getState(player).playerPressCount > presses end, 3)
+            drag(HSC_WIND, 0.45)
+            waitSeconds(0.25, watch)
+            drag(-HSC_CUT, 0.3)
+            waitSeconds(0.4, watch)
+            ragdoll.injectMouseInput(0, 0, false, 1)
+            waitSeconds(1.0, watch)
+        end
+        thrust()
+        local reach = most
+        victim = spawnDummy('SPEAR-01 target', util.vector3(0, 300, 0), false)
+        victim:sendEvent('fixActorHealth', 4000)
+        powerAndStand(victim, 'SPEAR-01 target')
+        local function damageTotal()
+            local total = 0
+            for _, value in pairs(ragdoll.getLimbDamage(victim)) do total = total + value end
+            return total
+        end
+        local results = {}
+        for _, setting in ipairs({ '0', 'game' }) do
+            ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_LEAD', setting ~= 'game' and setting or nil)
+            local taken = {}
+            for _ = 1, 4 do
+                local pivot = pivotOf()
+                placeVictimPoint(victim, function()
+                    local vs = ragdoll.getState(victim)
+                    return vs and body(vs, 'spine2').position or victim.position
+                end, pivot + forward * (reach - 10), util.transform.rotateZ(math.pi + yaw))
+                local vs = waitFor('SPEAR-01 target body', function() return ragdoll.getState(victim) end, 5)
+                contactAimReady = false
+                player:sendEvent('fixAimAt', body(vs, 'spine2').position)
+                pcall(waitFor, 'SPEAR-01 aim', function() return contactAimReady end, 4)
+                waitSeconds(0.3)
+                local before = damageTotal()
+                thrust()
+                local lost = damageTotal() - before
+                if lost > 0 then taken[#taken + 1] = lost end
+                print(string.format('SPEAR01 lead=%s reach=%.1f damage=%.2f', setting, reach, lost))
+            end
+            table.sort(taken)
+            results[setting] = { hits = #taken, median = #taken > 0 and taken[math.max(1, math.ceil(#taken / 2))] or 0 }
+            print(string.format('SPEAR01_TOTAL lead=%s hits=%d of 4 median=%.2f', setting, results[setting].hits,
+                results[setting].median))
+        end
+        local band = types.Weapon.record(weapon).thrustMinDamage
+        if results.game.hits < 2 then error('SPEAR-01: ' .. results.game.hits .. ' of 4 thrusts landed (want 2+)', 0) end
+        if results.game.median < band then
+            error(string.format('SPEAR-01: a thrust took %.1f, under the thrust band\'s %d', results.game.median, band), 0)
+        end
+    end)
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_LEAD', nil)
+    ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_AIM', nil)
+    ragdoll.injectMouseInput(0, 0, false)
+    ragdoll.reactionScale(savedReaction)
+    ragdoll.setPlayerAlwaysHits(false)
+    ragdoll.setPowered(player, false)
+    if victim and victim:isValid() then victim:remove() end
+    if not ok then error(message, 0) end
+end)
 
 -- FLOW-02: pictures of a weapon's attacks (side and behind at the chamber and
 -- the follow-through of the chop, forehand and thrust), for judging the arms -
@@ -8089,6 +11117,426 @@ registerTest('FLOW-02 views iron claymore', 918760, viewsTest('FLOW-02 claymore'
 registerTest('FLOW-02 views iron warhammer', 918761, viewsTest('FLOW-02 warhammer', 'iron warhammer', 2))
 registerTest('FLOW-02 views iron battle axe', 918762, viewsTest('FLOW-02 battle axe', 'iron battle axe', 3))
 registerTest('FLOW-02 views iron longsword', 918763, viewsTest('FLOW-02 longsword', 'iron longsword', 0))
+registerTest('FLOW-02 views iron spear', 918764, viewsTest('FLOW-02 spear', 'iron spear', 4))
+registerTest('FLOW-02 views wooden staff', 918765, viewsTest('FLOW-02 staff', 'wooden staff', 5))
+
+-- POINT-01 (K2_POINT_AIM; user 11-12: "holding click lets you control/aim the
+-- tip"): the button held, a spear is carried point-forward; a slow
+-- drag moves the point where the mouse goes, both ways; the release thrusts
+-- straight down its shaft. Measured on the physical weapon from the point
+-- between the shoulders: the point's bearing (radians, right positive), its
+-- distance ahead and its height. Pictures: the guard and the thrust's end,
+-- from the side and from behind.
+local function pointTest(tag, weapon, sequence)
+    return function()
+        local player = placePlayer()
+        local ok, message = pcall(function()
+            if not types.Actor.inventory(player):find(weapon) then
+                world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+                coroutine.yield()
+            end
+            player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 960 + sequence, firstPerson = false })
+            waitFor('player loadout', function() return playerReadySequence == 960 + sequence end)
+            waitSeconds(1)
+            powerAndStand(player, weapon)
+            ragdoll.prepareMouseInput()
+            -- Off in play from 11-16 (SPEAR-02): the case turns it on.
+            ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_AIM', '25,1800,500')
+            local yaw = player.rotation:getYaw()
+            local forward = util.vector3(math.sin(yaw), math.cos(yaw), 0)
+            local right = util.vector3(math.cos(yaw), -math.sin(yaw), 0)
+            local function point()
+                local s = ragdoll.getState(player)
+                local b = s.bodies[s.weapon.bodyIndex]
+                local axis = (b.rotation * util.vector3(0, 0, 1)):normalize()
+                local tip = b.position + axis * (s.weapon.length * 0.5)
+                local d = tip - (body(s, 'left_upper_arm').position + body(s, 'right_upper_arm').position) * 0.5
+                return math.atan2(d:dot(right), d:dot(forward)), d:dot(forward), d.z, d, axis
+            end
+            local function drag(dx, seconds)
+                local steps = math.max(1, math.floor(seconds * 60))
+                local sent = 0
+                for i = 1, steps do
+                    local x = math.floor(dx * i / steps + (dx >= 0 and 0.5 or -0.5))
+                    if x ~= sent then ragdoll.injectMouseInput(x - sent, 0) end
+                    sent = x
+                    waitSeconds(1 / 60)
+                end
+            end
+            local function views(name)
+                local s = ragdoll.getState(player)
+                local center = body(s, 'spine2').position
+                for _, view in ipairs({ { name = 'side', yaw = yaw - math.pi / 2, pitch = 0.05, distance = 170 },
+                    { name = 'behind', yaw = yaw + math.pi, pitch = 0.15, distance = 170 } }) do
+                    view.center = center
+                    player:sendEvent('fixInspectCamera', view)
+                    waitSeconds(0.08)
+                    print(tag .. ' view ' .. name .. ' ' .. view.name)
+                    ragdoll.captureScreenshot()
+                    waitSeconds(0.05)
+                end
+                player:sendEvent('fixInspectCamera', {})
+                waitSeconds(0.05)
+            end
+            waitFor('guard', function() return ragdoll.getSwingSpeed(player) == nil end, 4)
+            waitSeconds(0.5)
+            local presses = ragdoll.getState(player).playerPressCount
+            ragdoll.injectMouseInput(0, 0, true, 1)
+            waitFor('press', function() return ragdoll.getState(player).playerPressCount > presses end, 3)
+            waitSeconds(2.0)
+            local centre, ahead, height = point()
+            views('guard')
+            -- 0.2 rad at the game's counts a radian.
+            local counts = 0.2 * (tonumber((ragdoll.tuningText('OPENMW_RAGDOLL_K2_POINT_AIM') or ''):match('^[^,]*,([^,]*)')) or 1800)
+            drag(counts, 1.0)
+            waitSeconds(1.0)
+            local toRight = point()
+            drag(-2 * counts, 2.0)
+            waitSeconds(1.0)
+            local toLeft = point()
+            drag(counts, 1.0)
+            waitSeconds(1.0)
+            local back, from, _, place, shaft = point()
+            -- The thrust: the point's furthest place ahead; how far the
+            -- point's path bows off the straight line from where it was to
+            -- where it ends up furthest out (units; the held weapon lies a
+            -- few degrees off its command in the guard and not driven out, so
+            -- the shaft itself turns that much: `turned`, radians).
+            ragdoll.injectMouseInput(0, 0, false, 1)
+            local most, drawn, turned = from, from, 0
+            local path, furthest = {}, place
+            waitSeconds(0.9, function()
+                local _, y, _, at, axis = point()
+                if y > most then furthest = at end
+                most = math.max(most, y)
+                drawn = math.min(drawn, y)
+                path[#path + 1] = at
+                turned = math.max(turned, math.acos(math.max(-1, math.min(1, axis:dot(shaft)))))
+            end)
+            local strayed = 0
+            local line = furthest - place
+            if line:length() > 1 then
+                line = line:normalize()
+                for _, at in ipairs(path) do
+                    local moved = at - place
+                    local along = moved:dot(line)
+                    if along > 0 then strayed = math.max(strayed, (moved - line * along):length()) end
+                end
+            end
+            views('thrust')
+            waitSeconds(1.2)
+            print(string.format(
+                '%s centre=%.3f ahead=%.1f height=%.1f right=%.3f left=%.3f back=%.3f drawn=%.1f reach=%.1f strayed=%.1f turned=%.3f',
+                tag, centre, ahead, height, toRight - centre, toLeft - centre, back, from - drawn, most - from, strayed,
+                turned))
+            local failures = {}
+            local function want(okay, text) if not okay then failures[#failures + 1] = text end end
+            want(math.abs(centre) < 0.12, string.format('the held point is %.2f rad off the middle (0.12)', centre))
+            want(toRight - centre > 0.1 and toRight - centre < 0.3,
+                string.format('a 0.2 rad drag right moved the point %.2f', toRight - centre))
+            want(toLeft - centre < -0.1 and toLeft - centre > -0.3,
+                string.format('a 0.2 rad drag left moved the point %.2f', toLeft - centre))
+            want(most - from >= 10, string.format('the thrust reached %.1f u past the guard (10)', most - from))
+            want(strayed < 8, string.format('the thrust point bowed %.1f u off a straight line (8)', strayed))
+            want(turned < 0.25, string.format('the shaft turned %.2f rad through the thrust (0.25)', turned))
+            print(string.format('%s result %s %s', tag, #failures == 0 and 'PASS' or 'FAIL', table.concat(failures, '; ')))
+            if #failures > 0 then error(tag .. ' ' .. table.concat(failures, '; '), 0) end
+        end)
+        ragdoll.setTuning('OPENMW_RAGDOLL_K2_POINT_AIM', nil)
+        ragdoll.injectMouseInput(0, 0, false, 1)
+        ragdoll.setPowered(player, false)
+        if not ok then error(message, 0) end
+    end
+end
+-- POINT-02 (user 11-12 bookmarks "what is causing my model to vibrate?", "left
+-- hand keeps going behind the back"; "can we make it so the left hand doesnt
+-- go behind the back"): point thrusts one after another, and the guard each
+-- comes back to. Per thrust a POINT02 row: the chest's most turn through it
+-- (degrees), the support hand's furthest place behind the chest's own plane
+-- and to the weapon side of its midline (units, chest frame), and in the
+-- guard after it the shaft off its command (degrees), the support hand's
+-- place in the chest frame and the point's tick-to-tick shake (units).
+-- FAIL: a guard with the shaft 25 degrees off, the support hand on the weapon
+-- side of the midline, or the point shaking 1.5 u.
+local function pointGuardTest(tag, weapon, sequence)
+    return function()
+        local player = placePlayer()
+        local ok, message = pcall(function()
+            if not types.Actor.inventory(player):find(weapon) then
+                world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+                coroutine.yield()
+            end
+            player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 970 + sequence, firstPerson = false })
+            waitFor('player loadout', function() return playerReadySequence == 970 + sequence end)
+            waitSeconds(1)
+            powerAndStand(player, weapon)
+            ragdoll.prepareMouseInput()
+            local yaw = player.rotation:getYaw()
+            local forward = util.vector3(math.sin(yaw), math.cos(yaw), 0)
+            local right = util.vector3(math.cos(yaw), -math.sin(yaw), 0)
+            local function frame(s)
+                local across = body(s, 'right_upper_arm').position - body(s, 'left_upper_arm').position
+                across = util.vector3(across.x, across.y, 0):normalize()
+                local ahead = util.vector3(-across.y, across.x, 0)
+                local mid = (body(s, 'right_upper_arm').position + body(s, 'left_upper_arm').position) * 0.5
+                local hand = body(s, 'left_hand').position - mid
+                return math.deg(math.atan2(-across:dot(forward), across:dot(right))), hand:dot(across), hand:dot(ahead)
+            end
+            local function tipOf(s)
+                local b = s.bodies[s.weapon.bodyIndex]
+                local axis = (b.rotation * util.vector3(0, 0, 1)):normalize()
+                return b.position + axis * (s.weapon.length * 0.5) - body(s, 'pelvis').position, axis
+            end
+            waitFor('guard', function() return ragdoll.getSwingSpeed(player) == nil end, 4)
+            waitSeconds(0.5)
+            local failures = {}
+            -- Held and aimed a little aside, a tap, held long: the ways a
+            -- thrust is thrown in play.
+            local throws = { { 0.5, 250 }, { 0.5, -250 }, { 0.08, 0 }, { 0.5, 400 }, { 0.08, 0 }, { 1.2, -400 }, { 0.5, 0 }, { 0.08, 0 } }
+            for n, throw in ipairs(throws) do
+                local presses = ragdoll.getState(player).playerPressCount
+                ragdoll.injectMouseInput(0, 0, true, 1)
+                waitFor('press', function() return ragdoll.getState(player).playerPressCount > presses end, 3)
+                if throw[2] ~= 0 then ragdoll.injectMouseInput(throw[2], 0) end
+                waitSeconds(throw[1])
+                ragdoll.injectMouseInput(0, 0, false, 1)
+                local turnMost, behindMost, acrossMost = 0, 0, -1e9
+                waitSeconds(1.0, function()
+                    local s = ragdoll.getState(player)
+                    if not s or not s.weapon then return end
+                    local turn, x, y = frame(s)
+                    if math.abs(turn) > math.abs(turnMost) then turnMost = turn end
+                    behindMost = math.min(behindMost, y)
+                    acrossMost = math.max(acrossMost, x)
+                end)
+                waitFor('guard again', function() return ragdoll.getSwingSpeed(player) == nil end, 4)
+                waitSeconds(0.5)
+                local off, shake, tips, prevStep = {}, {}, {}, nil
+                local guardX, guardY, guardTurn = 0, 0, 0
+                waitSeconds(0.8, function()
+                    local s = ragdoll.getState(player)
+                    if not s or not s.weapon then return end
+                    local step = tonumber(s.physicsStep)
+                    if step == prevStep then return end
+                    prevStep = step
+                    local tip, axis = tipOf(s)
+                    tips[#tips + 1] = tip
+                    local blade = s.hsc and s.hsc.blade
+                    if blade and blade:length() > 0.5 then
+                        off[#off + 1] = math.deg(math.acos(math.max(-1, math.min(1, axis:dot(blade:normalize())))))
+                    end
+                    guardTurn, guardX, guardY = frame(s)
+                end)
+                for i = 2, #tips - 1 do shake[#shake + 1] = (tips[i] - (tips[i - 1] + tips[i + 1]) * 0.5):length() end
+                table.sort(off)
+                table.sort(shake)
+                local offMid = #off > 0 and off[math.ceil(#off / 2)] or -1
+                local shakeMid = #shake > 0 and shake[math.ceil(#shake / 2)] or -1
+                print(string.format(
+                    'POINT02 %s n=%d held=%.2f chest_turn_most=%.0f support_behind_most=%.1f support_across_most=%.1f guard: shaft_off=%.0f support=%.1f,%.1f chest_turn=%.0f shake=%.2f',
+                    tag, n, throw[1], turnMost, -behindMost, acrossMost, offMid, guardX, guardY, guardTurn, shakeMid))
+                if offMid > 25 then failures[#failures + 1] = string.format('guard %d: the shaft %.0f deg off', n, offMid) end
+                if guardX > 0 then failures[#failures + 1] = string.format('guard %d: the support hand %.1f u on the weapon side', n, guardX) end
+                if shakeMid > 1.5 then failures[#failures + 1] = string.format('guard %d: the point shakes %.1f u', n, shakeMid) end
+            end
+            -- The guard knocked about (user 11-12: the hand ends up behind
+            -- the back "after a winded up attack or moving a lot/getting hit"):
+            -- the butt struck to the weapon side and to the other, the chest
+            -- struck round both ways, then where the guard settles.
+            local function settled(name)
+                waitSeconds(1.6)
+                local off, guardTurn, guardX, guardY = {}, 0, 0, 0
+                waitSeconds(0.6, function()
+                    local s = ragdoll.getState(player)
+                    if not s or not s.weapon then return end
+                    local _, axis = tipOf(s)
+                    local blade = s.hsc and s.hsc.blade
+                    if blade and blade:length() > 0.5 then
+                        off[#off + 1] = math.deg(math.acos(math.max(-1, math.min(1, axis:dot(blade:normalize())))))
+                    end
+                    guardTurn, guardX, guardY = frame(s)
+                end)
+                table.sort(off)
+                local offMid = #off > 0 and off[math.ceil(#off / 2)] or -1
+                local g = ragdoll.getState(player).weapon.supportGrip
+                -- The weapon arm: its wrist past its limit (degrees), the hand
+                -- off its command (units), the elbow's place and the shaft's
+                -- direction in the facing frame from the chest.
+                local st = ragdoll.getState(player)
+                local chest = body(st, 'spine2').position
+                local function loc(v) return string.format('%.0f,%.0f,%.0f', v:dot(right), v:dot(forward), v.z) end
+                local _, axisNow = tipOf(st)
+                print(string.format('POINT02_KNOCK %s %s guard: shaft_off=%.0f support=%.1f,%.1f chest_turn=%.0f attached=%s wrist_out=%.0f/%.0f hand_off=%.1f elbow=%s hand=%s shaft=%s asked=%s',
+                    tag, name, offMid, guardX, guardY, guardTurn, tostring(g and g.attached), st.wristOutsideRight or -1,
+                    st.wristOutsideLeft or -1, st.hsc and st.hsc.grip and (body(st, 'right_hand').position - st.hsc.grip):length() or -1,
+                    loc(body(st, 'right_forearm').position - chest), loc(body(st, 'right_hand').position - chest), loc(axisNow * 100),
+                    st.hsc and st.hsc.blade and loc(st.hsc.blade:normalize() * 100) or '-'))
+                if offMid > 25 then failures[#failures + 1] = string.format('%s: the shaft %.0f deg off', name, offMid) end
+                if guardX > 0 or guardY < -4 then
+                    failures[#failures + 1] = string.format('%s: the support hand at %.1f, %.1f', name, guardX, guardY)
+                end
+            end
+            -- Wound-up dragged attacks held two seconds, then cut: the thrust
+            -- (down), the chop (up), the two sweeps.
+            for _, wound in ipairs({ { 'thrust', 0, 1 }, { 'chop', 0, -1 }, { 'forehand', 1, 0 }, { 'backhand', -1, 0 },
+                { 'thrust again', 0, 1 } }) do
+                local presses = ragdoll.getState(player).playerPressCount
+                ragdoll.injectMouseInput(0, 0, true, 1)
+                waitFor('press', function() return ragdoll.getState(player).playerPressCount > presses end, 3)
+                local function drag(dx, dy, seconds)
+                    local steps = math.max(1, math.floor(seconds * 60))
+                    local sx, sy = 0, 0
+                    for i = 1, steps do
+                        local x, y = math.floor(dx * i / steps), math.floor(dy * i / steps)
+                        if x ~= sx or y ~= sy then ragdoll.injectMouseInput(x - sx, y - sy) end
+                        sx, sy = x, y
+                        waitSeconds(1 / 60)
+                    end
+                end
+                drag(wound[2] * HSC_WIND, wound[3] * HSC_WIND, 0.3)
+                local behindMost, acrossMost = 0, -1e9
+                waitSeconds(2.0, function()
+                    local s = ragdoll.getState(player)
+                    if not s or not s.weapon then return end
+                    local _, x, y = frame(s)
+                    behindMost = math.min(behindMost, y)
+                    acrossMost = math.max(acrossMost, x)
+                end)
+                drag(-wound[2] * HSC_CUT, -wound[3] * HSC_CUT, 0.3)
+                waitSeconds(0.4)
+                ragdoll.injectMouseInput(0, 0, false, 1)
+                print(string.format('POINT02_WOUND %s %s support_behind_most=%.1f support_across_most=%.1f', tag, wound[1],
+                    -behindMost, acrossMost))
+                settled('after a held ' .. wound[1])
+            end
+            for _, knock in ipairs({ { 'butt to the weapon side', 1, 0, 0 }, { 'butt to the other side', -1, 0, 0 },
+                { 'butt back and to the weapon side', 0.7, -0.7, 0 }, { 'chest round', 0, 0, 1 }, { 'chest round the other way', 0, 0, -1 },
+                { 'held butt to the weapon side', 1, 0, 0, true } }) do
+                local s = ragdoll.getState(player)
+                local b = s.bodies[s.weapon.bodyIndex]
+                local axis = (b.rotation * util.vector3(0, 0, 1)):normalize()
+                local butt = b.position - axis * (s.weapon.length * 0.5)
+                if knock[5] then
+                    ragdoll.injectMouseInput(0, 0, true, 1)
+                    waitSeconds(0.8)
+                    s = ragdoll.getState(player)
+                    b = s.bodies[s.weapon.bodyIndex]
+                    axis = (b.rotation * util.vector3(0, 0, 1)):normalize()
+                    butt = b.position - axis * (s.weapon.length * 0.5)
+                end
+                local size = tonumber(ragdoll.tuningText('OPENMW_RAGDOLL_TEST_KNOCK') or '') or 600
+                if knock[4] ~= 0 then
+                    local chest
+                    for index, part in ipairs(s.bodies) do if part.name == 'spine2' then chest = index end end
+                    local arm = body(s, knock[4] > 0 and 'right_upper_arm' or 'left_upper_arm')
+                    ragdoll.applyImpulse(player, chest, forward * (-4 * size), arm.position)
+                else
+                    ragdoll.applyImpulse(player, s.weapon.bodyIndex, (right * knock[2] + forward * knock[3]) * size, butt)
+                end
+                if knock[5] then
+                    waitSeconds(0.6)
+                    ragdoll.injectMouseInput(0, 0, false, 1)
+                end
+                settled(knock[1])
+            end
+            print(string.format('%s result %s %s', tag, #failures == 0 and 'PASS' or 'FAIL', table.concat(failures, '; ')))
+            if #failures > 0 then error(tag .. ' ' .. table.concat(failures, '; '), 0) end
+        end)
+        ragdoll.injectMouseInput(0, 0, false, 1)
+        ragdoll.setPowered(player, false)
+        if not ok then error(message, 0) end
+    end
+end
+registerTest('POINT-02 guard after thrusts iron spear', 918784, pointGuardTest('POINT-02 spear', 'iron spear', 0))
+registerTest('POINT-02 guard after thrusts steel spear', 918785, pointGuardTest('POINT-02 steel spear', 'steel spear', 1))
+registerTest('POINT-01 iron spear', 918794, pointTest('POINT-01 spear', 'iron spear', 0))
+registerTest('POINT-01 steel spear', 918796, pointTest('POINT-01 steel spear', 'steel spear', 2))
+
+-- SPEAR-02 (user bookmark 11-16: "remove the 'click and aim' from the spear,
+-- it is currently making winding up back the spear for a thrust harder as I
+-- need to move my mouse down more than I'd like"): the button held, a slow
+-- drag down (10 counts a step: no flick) winds the thrust up. Three drags, 480,
+-- 600 and 900 counts; per drag a SPEAR02 row: whether the wheel wound up, on
+-- which line (radians; the thrust's is 4.71), the seconds from the drag's
+-- start, how far the point drew back, and the thrust's reach past the guard
+-- when the drag is then cut (units). FAIL: a drag that wound nothing, or on
+-- another line. With K2_POINT_AIM 25,1800,500 all three stay in the point
+-- guard.
+for index, weapon in ipairs({ 'iron spear', 'steel spear' }) do
+    registerTest('SPEAR-02 a slow drag down winds the thrust ' .. weapon, 918786 + index, function()
+        local player = placePlayer()
+        local tag = 'SPEAR-02 ' .. weapon
+        local ok, message = pcall(function()
+            if not types.Actor.inventory(player):find(weapon) then
+                world.createObject(weapon, 1):moveInto(types.Actor.inventory(player))
+                coroutine.yield()
+            end
+            player:sendEvent('fixPlayerConfigure', { weapon = weapon, sequence = 963 + index, firstPerson = false })
+            waitFor('player loadout', function() return playerReadySequence == 963 + index end)
+            waitSeconds(1)
+            powerAndStand(player, weapon)
+            ragdoll.prepareMouseInput()
+            local yaw = player.rotation:getYaw()
+            local forward = util.vector3(math.sin(yaw), math.cos(yaw), 0)
+            local function ahead()
+                local s = ragdoll.getState(player)
+                local b = s.bodies[s.weapon.bodyIndex]
+                local tip = b.position + (b.rotation * util.vector3(0, 0, 1)):normalize() * (s.weapon.length * 0.5)
+                return (tip - body(s, 'spine2').position):dot(forward)
+            end
+            local failures = {}
+            for _, counts in ipairs({ 480, 600, 900 }) do
+                waitFor('guard', function()
+                    local st = ragdoll.getState(player)
+                    return ragdoll.getSwingSpeed(player) == nil and (not st.hsc or st.hsc.stage == 0)
+                end, 6)
+                waitSeconds(0.8)
+                local presses = ragdoll.getState(player).playerPressCount
+                ragdoll.injectMouseInput(0, 0, true, 1)
+                waitFor('press', function() return ragdoll.getState(player).playerPressCount > presses end, 3)
+                local from = ahead()
+                local started = core.getSimulationTime()
+                local woundAt, line, back = -1, -1, from
+                local function watch()
+                    local st = ragdoll.getState(player)
+                    if woundAt < 0 and st.hsc and st.hsc.stage == 1 then
+                        woundAt = core.getSimulationTime() - started
+                        line = st.hsc.angle
+                    end
+                    back = math.min(back, ahead())
+                end
+                -- Injected mouse y is down.
+                local sent = 0
+                for i = 1, counts / 10 do
+                    ragdoll.injectMouseInput(0, 10)
+                    sent = sent + 10
+                    waitSeconds(1 / 60, watch)
+                end
+                waitSeconds(0.6, watch)
+                -- The cut: back up, fast.
+                local most = from
+                for i = 1, 18 do
+                    ragdoll.injectMouseInput(0, -math.floor(HSC_CUT / 18))
+                    waitSeconds(1 / 60, function() most = math.max(most, ahead()) end)
+                end
+                waitSeconds(0.6, function() most = math.max(most, ahead()) end)
+                ragdoll.injectMouseInput(0, 0, false, 1)
+                print(string.format('SPEAR02 %s drag=%d wound=%d line=%.2f after=%.2f drawn=%.1f reach=%.1f', weapon, counts,
+                    woundAt >= 0 and 1 or 0, line, woundAt, from - back, most - from))
+                if woundAt < 0 then
+                    failures[#failures + 1] = string.format('a %d-count drag down wound nothing', counts)
+                elseif math.abs(line - 1.5 * math.pi) > 0.4 then
+                    failures[#failures + 1] = string.format('a %d-count drag down wound on line %.2f', counts, line)
+                end
+            end
+            print(string.format('%s result %s %s', tag, #failures == 0 and 'PASS' or 'FAIL', table.concat(failures, '; ')))
+            if #failures > 0 then error(tag .. ' ' .. table.concat(failures, '; '), 0) end
+        end)
+        ragdoll.injectMouseInput(0, 0, false, 1)
+        ragdoll.setPowered(player, false)
+        if not ok then error(message, 0) end
+    end)
+end
 
 -- HANDOFF-01 (consolidation, 2026-10-03): changes of arm owner (draw, guard
 -- key during and after an attack, a click attack and a block) must not snap
@@ -8868,7 +12316,17 @@ local function controlTest(tag, weapon, sequence, kind)
                         stage = h.stage, x = h.stanceX, y = h.stanceY, angle = h.angle, line = h.line,
                         snap = h.snap, chain = h.chain, click = h.click, route = h.route,
                         bladeCommand = h.blade, blade = w.rotation * util.vector3(0, 0, 1) } or nil,
-                        wristRight = st.wristOutsideRight, wristLeft = st.wristOutsideLeft })
+                        wristRight = st.wristOutsideRight, wristLeft = st.wristOutsideLeft,
+                        -- the balance sigil (K2_BALANCE_SIGIL) is drawn from this
+                        balance = { x = st.balanceRight or 0, y = st.balanceForward or 0, tip = st.balanceTip or 0,
+                            shiftX = st.weightRight or 0, shiftY = st.weightForward or 0, edge = st.weightEdge or 0,
+                            risk = st.balanceRisk or 0, sigil = st.balanceSigil } })
+                    if st.balanceSigil and not shots.sigil then
+                        shots.sigil = true
+                        local g = st.balanceSigil
+                        print(string.format('%s sigil left=%.1f,%.1f right=%.1f,%.1f com=%.1f,%.1f tip=%.1f,%.1f load=%.2f/%.2f edge=%.0f',
+                            tag, g.leftX, g.leftY, g.rightX, g.rightY, g.comX, g.comY, g.tipX, g.tipY, g.leftLoad, g.rightLoad, g.edge))
+                    end
                     local stage = h and h.stage or -1
                     if not shots[stage] and stage >= 1 and (stage ~= 1 or (h.route or 0) > 0.6) then
                         shots[stage] = true
@@ -9049,6 +12507,7 @@ local function gripTest(tag, weapon, sequence)
             local hscStep, gripStep, lastGripKey
             waitSeconds(4, function()
                 local s = ragdoll.getState(player)
+                if not s then return end -- no state this frame (GRIP-01 flaked on it, 10-31 and 11-07)
                 local step = tonumber(s.physicsStep)
                 if not hscStep and s.hsc then hscStep = step end
                 local g = s.weapon and s.weapon.supportGrip

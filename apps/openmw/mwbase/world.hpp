@@ -390,6 +390,8 @@ namespace MWBase
         // SHOVE-01: the player shoves the body in front of it (a double
         // right click); false when nobody is in reach.
         virtual bool shoveActorRagdoll() { return false; }
+        // KICK-01: the player's kick (the middle button).
+        virtual bool kickActorRagdoll() { return false; }
         // GRIP-05: the player's long blade to its next grip (normal,
         // half-sword, murder-stroke); false when it has none to change.
         virtual bool cycleActorRagdollGrip() { return false; }
@@ -405,9 +407,18 @@ namespace MWBase
         // picks its zone (look units, as driveActorRagdollSwing); reset = back
         // to the middle.
         virtual bool driveActorRagdollGuardZone(float aimRight, float aimUp, bool reset) = 0;
+        // FIST-06 (K2_FIST_STEER): the right button as the player's left fist
+        // (look units, as driveActorRagdollSwing); cancel = the press ended
+        // without a release. False: the player has no powered body.
+        virtual bool driveActorRagdollLeftFist(float /*aimRight*/, float /*aimUp*/, bool /*held*/, bool /*cancel*/)
+        {
+            return false;
+        }
         // Physical weapon input must claim Use before the animation-driven
         // melee action sees it. False keeps ordinary input behavior.
         virtual bool isPlayerRagdollWeaponAttached() const { return false; }
+        // K2_PALM_TAP: the player's bare-handed guard reads a blow or has its palm out.
+        virtual bool isPlayerRagdollPalmBusy() const { return false; }
         virtual bool hasActorRagdollWeaponAttached(const MWWorld::ConstPtr&) const { return false; }
         virtual bool usesPlayerRagdollAttackAnimation() const { return false; }
         virtual bool queuePlayerRagdollAttackInput(bool) { return false; }
@@ -643,6 +654,10 @@ namespace MWBase
         /// True when the actor's body is currently driven by a powered
         /// ragdoll. Melee reach uses this to require physical contact.
         virtual bool isPoweredRagdoll(const MWWorld::ConstPtr& actor) const = 0;
+
+        /// The share of its movement speed a powered body asks for now (1 =
+        /// all; K2_STAIR_STRAFE: less while it strafes on stairs).
+        virtual float poweredMoveScale(const MWWorld::ConstPtr& actor) const = 0;
 
         /// Export scene graph to a file and return the filename.
         /// \param ptr object to export scene graph for (if empty, export entire scene graph)

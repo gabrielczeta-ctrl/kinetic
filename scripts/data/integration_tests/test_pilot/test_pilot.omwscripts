@@ -1,0 +1,4 @@
+MENU: menu.lua
+GLOBAL: pilot_global.lua
+PLAYER: pilot_player.lua
+CUSTOM: duelist.lua

@@ -1,6 +1,10 @@
 #include <ragdollcore/dueltactics.hpp>
 
+#include <ragdollcore/tuning.hpp>
+
 #include <algorithm>
+#include <array>
+#include <cmath>
 
 namespace RagdollCore
 {
@@ -23,6 +27,9 @@ namespace RagdollCore
             state.mTimeInPhase = 0.0f;
             state.mStruck = false;
             state.mOpeningSeen = 0.0f;
+            state.mPressCount = 0;
+            state.mBackCutting = false;
+            state.mBackCutRead = state.mBackCutOut = false;
             if (phase == DuelPhase::Measure)
                 state.mPatience = -1.0f;
         }
@@ -176,6 +183,12 @@ namespace RagdollCore
         // Toward the charger's off-hand (this fighter's right for a
         // right-handed foe), the other side 30%.
         state.mChargeSide = random01(state.mSeed) < 0.3f ? -1.0f : 1.0f;
+        // K2_AI_BACK_CUT: a backpedal that strikes as it goes (drawn only
+        // while on, so the old draws stay as they were).
+        state.mBackCut = false;
+        const auto& press = settings.mPress;
+        if (state.mChargeResponse == 3 && (press.mBackCut0 > 0.0f || press.mBackCut100 > 0.0f))
+            state.mBackCut = random01(state.mSeed) < mix(press.mBackCut0, press.mBackCut100, self.mAttackSkill);
         out.mThreatRead = state.mChargeResponse == 1 ? "cut-off"
             : state.mChargeResponse == 2             ? "side-step"
                                                      : "backpedal";
@@ -207,17 +220,23 @@ namespace RagdollCore
                 out.mReason = "side-step charge";
                 return true;
             case 3:
+            {
                 // Walking back (never running backwards), guard up; a fighter
-                // with nerve still cuts it off once it is in reach.
+                // with nerve still cuts it off once it is in reach. A back cut
+                // (K2_AI_BACK_CUT) strikes whatever its nerve, leading the
+                // charger by its strike's time, and keeps walking back.
                 out.mForward = -1.0f;
                 out.mStrafe = 0.0f;
                 out.mRun = false;
-                out.mAttack = self.mNerve > 0.6f && opponent.mDistance <= strike + 5.0f;
+                const float lead = state.mBackCut ? std::max(0.0f, opponent.mClosing) * self.mStrikeLead : 0.0f;
+                out.mAttack = (self.mNerve > 0.6f || state.mBackCut) && opponent.mDistance <= strike + 5.0f + lead;
                 // The guard only while not cutting off (raised into its own
                 // attack it ended the cut: review 10-08).
                 out.mGuard = !out.mAttack;
-                out.mReason = out.mAttack ? "cut off" : "backpedal";
+                out.mReason = !out.mAttack ? "backpedal" : state.mBackCut ? "back cut" : "cut off";
+                out.mAttackNow = out.mAttack && state.mBackCut;
                 return true;
+            }
             default:
                 return false;
         }
@@ -331,6 +350,43 @@ namespace RagdollCore
             }
         }
 
+        // K2_AI_STAGGER_CUT: staggered with the foe in reach, it swings back
+        // through the stagger (decided once per stagger, by attack skill).
+        bool staggerCutNow = false;
+        {
+            const auto& press = settings.mPress;
+            if (press.mStaggerCut0 > 0.0f || press.mStaggerCut100 > 0.0f)
+            {
+                if (!self.mStaggered)
+                {
+                    state.mStaggerRead = state.mStaggerCutting = false;
+                    state.mStaggerSeen = 0.0f;
+                }
+                else
+                {
+                    state.mStaggerSeen += dt;
+                    if (!state.mStaggerRead)
+                    {
+                        state.mStaggerRead = true;
+                        state.mStaggerCutting = random01(state.mSeed)
+                            < mix(press.mStaggerCut0, press.mStaggerCut100, self.mAttackSkill);
+                        out.mStaggerRead = state.mStaggerCutting ? "yes" : "no";
+                    }
+                    // Its attack started: this stagger's cut is spent.
+                    if (self.mAttacking && state.mStaggerSeen >= press.mStaggerDelay)
+                        state.mStaggerCutting = false;
+                    if (state.mStaggerCutting && !self.mAttacking && !tired && state.mPhase != DuelPhase::Recover
+                        && self.mSinceDown >= settings.mGetUpRest && state.mStaggerSeen >= press.mStaggerDelay
+                        && opponent.mDistance <= strike + 20.0f)
+                    {
+                        if (state.mPhase != DuelPhase::StepIn)
+                            enter(state, DuelPhase::StepIn);
+                        staggerCutNow = true;
+                    }
+                }
+            }
+        }
+
         switch (state.mPhase)
         {
             case DuelPhase::Chase:
@@ -367,7 +423,10 @@ namespace RagdollCore
                 {
                     chargeMove = true;
                     if (out.mAttack)
+                    {
                         enter(state, DuelPhase::StepIn);
+                        state.mBackCutting = out.mReason == "back cut";
+                    }
                     break;
                 }
                 if (opponent.mDistance <= hold + 30.0f)
@@ -391,7 +450,10 @@ namespace RagdollCore
                     {
                         chargeMove = true;
                         if (out.mAttack)
+                        {
                             enter(state, DuelPhase::StepIn);
+                            state.mBackCutting = out.mReason == "back cut";
+                        }
                         break;
                     }
                 }
@@ -489,11 +551,34 @@ namespace RagdollCore
                     }
                 }
                 out.mReason = out.mAttack ? "strike" : "closing";
+                // K2_AI_BACK_CUT: a cut at a charger keeps walking back.
+                if (state.mBackCutting)
+                {
+                    out.mForward = -0.6f;
+                    out.mRun = false;
+                    out.mReason = out.mAttack || self.mAttacking ? "back cut" : out.mReason;
+                }
                 if (self.mAttacking)
                     state.mStruck = true;
                 if ((state.mStruck && !self.mAttacking && (!settings.mAim || state.mAimQuiet >= settings.mAimGrace))
                     || (!self.mAttacking && !state.mStruck && state.mTimeInPhase > settings.mStrikeTimeout))
                 {
+                    // K2_AI_PRESS: its attack over, the foe still in reach,
+                    // it attacks again instead of stepping out.
+                    const auto& press = settings.mPress;
+                    if (state.mStruck && state.mPressCount + 1 < press.mAttacks && self.mFatigue >= 0.4f && !tired
+                        && !self.mGuardBroken && opponent.mDistance <= strike + 30.0f
+                        && random01(state.mSeed) < mix(press.mChance0, press.mChance100, self.mAttackSkill))
+                    {
+                        ++state.mPressCount;
+                        state.mStruck = false;
+                        state.mTimeInPhase = 0.0f;
+                        state.mAimQuiet = 0.0f;
+                        out.mAttack = true;
+                        out.mAttackNow = true;
+                        out.mReason = "press";
+                        break;
+                    }
                     out.mReason = state.mStruck ? "struck" : "gave up";
                     enter(state, DuelPhase::StepOut);
                     out.mAttack = false;
@@ -501,12 +586,39 @@ namespace RagdollCore
                 }
                 break;
             case DuelPhase::StepOut:
+            {
                 out.mForward = -1.0f;
                 out.mReason = "step out";
-                if ((state.mTimeInPhase >= settings.mStepOut && opponent.mDistance >= hold - 10.0f)
-                    || state.mTimeInPhase >= 2.0f * settings.mStepOut)
+                // K2_AI_BACK_CUT: the foe running after it is struck as it
+                // comes into reach, still walking back (read once a step-out).
+                const auto& press = settings.mPress;
+                if ((press.mBackCut0 > 0.0f || press.mBackCut100 > 0.0f) && !self.mAttacking && !tired
+                    && opponent.mClosing > settings.mChargeSpeed)
+                {
+                    if (!state.mBackCutRead)
+                    {
+                        state.mBackCutRead = true;
+                        state.mBackCutOut
+                            = random01(state.mSeed) < mix(press.mBackCut0, press.mBackCut100, self.mAttackSkill);
+                    }
+                    if (state.mBackCutOut
+                        && opponent.mDistance <= strike + 5.0f + opponent.mClosing * self.mStrikeLead)
+                    {
+                        enter(state, DuelPhase::StepIn);
+                        state.mBackCutting = true;
+                        out.mForward = -0.6f;
+                        out.mAttack = true;
+                        out.mAttackNow = true;
+                        out.mReason = "back cut";
+                        break;
+                    }
+                }
+                const float stepOut = press.mStepOut > 0.0f ? press.mStepOut : settings.mStepOut;
+                if ((state.mTimeInPhase >= stepOut && opponent.mDistance >= hold - 10.0f)
+                    || state.mTimeInPhase >= 2.0f * stepOut)
                     enter(state, DuelPhase::Measure);
                 break;
+            }
             case DuelPhase::Recover:
                 // AI_STAMINA (AI-02 item 3) holds farther while recovering.
                 out.mForward = hover(opponent.mDistance, hold + (stamina ? 80.0f : 50.0f), 0.7f);
@@ -524,6 +636,19 @@ namespace RagdollCore
             out.mRun = false;
             out.mGuard = false;
             out.mReason = "riposte";
+            chargeMove = false;
+        }
+        // The stagger cut swings now, where it stands.
+        if (staggerCutNow)
+        {
+            out.mAttack = true;
+            out.mAttackNow = true;
+            out.mFightThrough = true;
+            out.mForward = 0.0f;
+            out.mStrafe = 0.0f;
+            out.mRun = false;
+            out.mGuard = false;
+            out.mReason = "stagger cut";
             chargeMove = false;
         }
         // Footwork: circle while measuring, leave sideways, never stay pressed
@@ -553,6 +678,44 @@ namespace RagdollCore
                 out.mReason = "unlock";
             }
         }
+        // K2_AI_ARRIVE: stop at the mark, strike from the weapon's distance.
+        if (settings.mArriveDecel > 0.0f)
+        {
+            // `strike hold` 0: its own attack presses in as before (holding it
+            // back cost hits - NPCHIT-01 0-13 a run against 8-13); only the run
+            // in is braked.
+            const bool holdStrike = settings.mStrikeHold > 0.0f;
+            const float sweet = std::max(10.0f, strike * (holdStrike ? settings.mStrikeHold : 0.5f));
+            const float holdSweet = std::clamp((opponent.mDistance - sweet) / 25.0f, -1.0f, 0.6f);
+            if (holdStrike && self.mAttacking)
+            {
+                out.mForward = holdSweet;
+                out.mRun = false;
+            }
+            else if (holdStrike && out.mAttack)
+            {
+                out.mForward = std::min(out.mForward, holdSweet);
+                out.mRun = false;
+            }
+            const bool pressing = state.mPhase == DuelPhase::StepIn || state.mPhase == DuelPhase::Chase;
+            const float mark = pressing ? sweet : hold;
+            const float remaining = opponent.mDistance - mark;
+            const float speed = std::max(0.0f, self.mOwnClosing);
+            if (out.mForward > 0.0f && speed > 0.0f && (holdStrike || !self.mAttacking))
+            {
+                const float stopping = speed * speed / (2.0f * settings.mArriveDecel);
+                if (stopping >= remaining)
+                {
+                    out.mRun = false;
+                    out.mForward = remaining <= 0.0f ? 0.0f
+                                                     : std::min(out.mForward, remaining / std::max(1.0f, stopping));
+                }
+                else if (stopping >= 0.5f * remaining)
+                    out.mRun = false;
+            }
+            if (holdStrike && opponent.mDistance < 0.5f * strike && out.mForward > 0.0f)
+                out.mForward = 0.0f;
+        }
         // Just back up: steady first - no attack, no pressing in, no running.
         if (self.mSinceDown < settings.mGetUpRest && !self.mAttacking)
         {
@@ -563,5 +726,50 @@ namespace RagdollCore
         }
         out.mPhase = state.mPhase;
         return out;
+    }
+
+    float duelBearingsPace()
+    {
+        std::array<float, 1> pace{ 0.0f };
+        tuningList("OPENMW_RAGDOLL_K2_AI_BEARINGS", pace);
+        return std::isfinite(pace[0]) ? std::clamp(pace[0], 0.0f, 1.0f) : 0.0f;
+    }
+
+    void limitToBearings(DuelTacticsOutput& out, bool gettingBearings, float pace)
+    {
+        if (!gettingBearings || !(pace > 0.0f))
+            return;
+        out.mRun = false;
+        out.mDodgeBurst = false;
+        out.mForward = std::clamp(out.mForward, -pace, pace);
+        out.mStrafe = std::clamp(out.mStrafe, -pace, pace);
+    }
+
+    DuelPressSettings duelPressSettings()
+    {
+        const auto read = [](const char* name, auto& values, float most) {
+            tuningList(name, values);
+            for (float& v : values)
+                v = std::isfinite(v) ? std::clamp(v, 0.0f, most) : 0.0f;
+        };
+        DuelPressSettings settings;
+        std::array<float, 3> press{ 0.0f, 0.0f, 1.0f };
+        read("OPENMW_RAGDOLL_K2_AI_PRESS", press, 6.0f);
+        settings.mChance0 = std::min(press[0], 1.0f);
+        settings.mChance100 = std::min(press[1], 1.0f);
+        settings.mAttacks = std::max(1, static_cast<int>(std::lround(press[2])));
+        std::array<float, 1> stepOut{ 0.0f };
+        read("OPENMW_RAGDOLL_K2_AI_STEP_OUT", stepOut, 3.0f);
+        settings.mStepOut = stepOut[0];
+        std::array<float, 2> backCut{ 0.0f, 0.0f };
+        read("OPENMW_RAGDOLL_K2_AI_BACK_CUT", backCut, 1.0f);
+        settings.mBackCut0 = backCut[0];
+        settings.mBackCut100 = backCut[1];
+        std::array<float, 3> stagger{ 0.0f, 0.0f, 0.15f };
+        read("OPENMW_RAGDOLL_K2_AI_STAGGER_CUT", stagger, 2.0f);
+        settings.mStaggerCut0 = std::min(stagger[0], 1.0f);
+        settings.mStaggerCut100 = std::min(stagger[1], 1.0f);
+        settings.mStaggerDelay = stagger[2];
+        return settings;
     }
 }

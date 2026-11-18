@@ -31,8 +31,11 @@ local modes = {
             ['forward'] = true, ['backward'] = true, ['strafe left'] = true, ['strafe right'] = true,
             ['diagonal left'] = true, ['diagonal right'] = true, ['start stop'] = true,
             ['moving turn'] = true, ['reversal'] = true, ['RAMP-01 ship player up'] = true,
-            ['rebuild mid-run'] = true, ['run draw'] = true,
+            ['rebuild mid-run'] = true, ['run draw'] = true, ['course sprint'] = true,
         } },
+    -- The bookmark's weapon (user 11-09: "left arm still stiff with weapon sheathed").
+    { name = 'sheathed claymore', powered = true, prepare = 'PLAY-01 prepare ordinary controls with sheathed steel claymore',
+        weapon = 'steel claymore', protocols = { ['course sprint'] = true, ['course sprint drawn'] = true } },
     -- Test course loadouts (fists raised, dagger, claymore; longsword and
     -- warhammer are above).
     { name = 'fists', powered = true, prepare = 'PLAY-01 prepare ordinary controls with fists raised',
@@ -141,6 +144,7 @@ for modeIndex, mode in ipairs(modes) do
             -- ACRO-01: protocol.acrobatics is the player's Acrobatics for the
             -- case; every other case gets the character's own back.
             player:sendEvent('play01Acrobatics', protocol.acrobatics or false)
+            player:sendEvent('play01Sprint', protocol.sprint or false)
             waitFor(animationMode .. ' idle input acknowledgement', function()
                 return input and input.segment == 'setup'
                     and input.right_equipped == (mode.weapon ~= nil) and input.left_equipped == (mode.left ~= nil)
@@ -218,6 +222,109 @@ for modeIndex, mode in ipairs(modes) do
                     x0 = -60, x1 = 90, dx = 6 })
                 opponent:sendEvent('StartAIPackage', { type = 'Travel', destPosition = destination })
             end
+            -- protocol.path = { record id, start, { legs }, seconds per leg }
+            -- (MOVE-01 "paths that matter"): a copy of a cell NPC (its record
+            -- without its mwscript) walks a game script's AiTravel legs one by
+            -- one, powered (path.vanilla: unpowered, the control). Each leg
+            -- must be reached (96 units across, AI travel's own reach) within
+            -- its time on the NPC's own legs: a leg not reached, or the body
+            -- let go to the vanilla capsule (the stuck fallback) on the way,
+            -- fails the case. PATH01_LEG logs each leg.
+            if protocol.path then
+                for _, actor in ipairs(world.activeActors) do
+                    if actor.recordId == protocol.path[1] and actor ~= player then
+                        actor:teleport('', util.vector3(0, 0, -10000))
+                    end
+                end
+                local record = world.createRecord(types.NPC.createRecordDraft({
+                    template = protocol.path[1] == 'player' and types.NPC.record(player)
+                        or types.NPC.record(protocol.path[1]), mwscript = '',
+                    isEssential = false, isPersistent = false, isRespawning = false,
+                }))
+                local walker = world.createObject(record.id)
+                -- The case's opponent: removed when the case ends (a walker
+                -- left behind walked into the next case's cell).
+                opponent = walker
+                walker:teleport(player.cell.isExterior and '' or player.cell.name, protocol.path[2], { onGround = true })
+                waitFor('path walker at its start', function()
+                    local gap = walker.position - protocol.path[2]
+                    return util.vector2(gap.x, gap.y):length() < 60
+                end, 5)
+                ragdoll.setPowered(walker, not protocol.path.vanilla)
+                if not protocol.path.vanilla then
+                    waitFor('path walker standing', function()
+                        local state = ragdoll.getState(walker)
+                        return state and state.controller and state.controller.mode == 'standing'
+                    end, 10)
+                end
+                local letGo = false
+                -- A leg 'player': the walker fights the player (a Combat
+                -- package: it runs, as bookmark 15's NPC up the stairs).
+                for i, leg in ipairs(protocol.path[3]) do
+                    local started = core.getSimulationTime()
+                    if leg == 'player' then
+                        walker:sendEvent('StartAIPackage', { type = 'Combat', target = player })
+                    else
+                        walker:sendEvent('StartAIPackage', { type = 'Travel', destPosition = leg })
+                    end
+                    local reached, falling, previous = false, 0, started
+                    local shot = started
+                    repeat
+                        coroutine.yield()
+                        local now = core.getSimulationTime()
+                        -- path.shots = seconds between stills of the walk
+                        -- (CALM-01 look: how a held walker is drawn).
+                        if protocol.path.shots and now - shot >= protocol.path.shots then
+                            shot = now
+                            ragdoll.captureScreenshot()
+                        end
+                        local state = ragdoll.getState(walker)
+                        if not protocol.path.vanilla and not (state and state.powered) then
+                            letGo = true
+                        end
+                        if state and state.controller and state.controller.mode == 'falling' then
+                            falling = falling + (now - previous)
+                        end
+                        previous = now
+                        local gap = walker.position - (leg == 'player' and player.position or leg)
+                        reached = util.vector2(gap.x, gap.y):length() < 96
+                    until reached or core.getSimulationTime() - started > protocol.path[4]
+                    print(string.format('PATH01_LEG i=%d reached=%s t=%.2f let_go=%s falling=%.2f at=%s', i,
+                        tostring(reached), core.getSimulationTime() - started, tostring(letGo), falling,
+                        tostring(walker.position)))
+                    testing.expect(reached, string.format('%s: leg %d not reached in %d s', name, i, protocol.path[4]))
+                end
+                testing.expect(not letGo, name .. ': the stuck fallback let the walker go (a rescue, not its own legs)')
+            end
+            -- protocol.watch = { record id, seconds } (CALM-01): the cell's own
+            -- NPC, where the game put it, watched standing with its body on:
+            -- any time down fails the case. CALM01_WATCH logs it.
+            if protocol.watch then
+                local watched
+                waitFor('watched NPC in the cell', function()
+                    for _, actor in ipairs(world.activeActors) do
+                        if actor.recordId == protocol.watch[1] and actor ~= player then watched = actor end
+                    end
+                    return watched ~= nil
+                end, 10)
+                ragdoll.setPowered(watched, true)
+                local started, previous, falling, unpowered = core.getSimulationTime(), core.getSimulationTime(), 0, 0
+                repeat
+                    coroutine.yield()
+                    local now = core.getSimulationTime()
+                    local state = ragdoll.getState(watched)
+                    if not (state and state.powered) then
+                        unpowered = unpowered + (now - previous)
+                    elseif state.controller and state.controller.mode ~= 'standing' and state.controller.mode ~= 'bracing' then
+                        falling = falling + (now - previous)
+                    end
+                    previous = now
+                until now - started > protocol.watch[2]
+                print(string.format('CALM01_WATCH actor=%s seconds=%d down=%.2f unpowered=%.2f at=%s', protocol.watch[1],
+                    protocol.watch[2], falling, unpowered, tostring(watched.position)))
+                testing.expect(falling < 0.5, string.format('%s: the watched NPC was down %.1f s', name, falling))
+                testing.expect(unpowered < 0.5, string.format('%s: the watched NPC lost its body %.1f s', name, unpowered))
+            end
             local settle = core.getSimulationTime() + 1
             repeat coroutine.yield() until core.getSimulationTime() >= settle
             diagnostic.begin()
@@ -233,6 +340,7 @@ for modeIndex, mode in ipairs(modes) do
             })
             local started, previousStep, previousTime = core.getSimulationTime(), nil, nil
             local firstFailure, replayStarted, segmentsStarted = nil, false, 0
+            local escortArrived = false
             local replaySeed = protocol.replaySeed or (20261400 + modeIndex * 100 + protocolIndex)
             local function observe(segment)
                 local state = ragdoll.getState(player)
@@ -257,6 +365,12 @@ for modeIndex, mode in ipairs(modes) do
                     -- of settling context, then leave later commands unexecuted.
                     player:sendEvent('play01Travel', { segment = 'failure stop' })
                 end
+                -- The escort's arrival: first within 30 u of its destination's height.
+                if protocol.escort and not escortArrived and opponent and opponent:isValid()
+                    and type(protocol.escort[3]) ~= 'string' and opponent.position.z > protocol.escort[3].z - 30 then
+                    escortArrived = true
+                    print(string.format('PLAY01_ESCORT_ARRIVED t=%.2f at=%s', now - started, tostring(opponent.position)))
+                end
                 local opponentState = opponent and opponent:isValid() and ragdoll.getState(opponent)
                 local opponentSummary
                 if opponentState and opponentState.bodies then
@@ -280,6 +394,7 @@ for modeIndex, mode in ipairs(modes) do
                     segment = segment, input = input, physics_step = step,
                     skipped_steps = step and previousStep and math.max(0, step - previousStep - 1) or 0,
                     player_position = player.position, gameplay_yaw = player.rotation:getYaw(),
+                    fatigue = types.Actor.stats.dynamic.fatigue(player).current,
                     rig_present = state ~= nil, state = diagnostic.state(state),
                 })
                 previousStep, previousTime = step, now

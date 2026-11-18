@@ -8,8 +8,9 @@ param(
     [ValidateSet('', 'duel', 'player', 'dungeon')][string] $Only = '',
     # With -Only dungeon: the dungeon (cell name) whose door the player starts at.
     [string] $Dungeon = 'Addamasartus',
-    # With -Only dungeon: strong (the hub's maxed character), level2 or level10.
-    [ValidateSet('strong', 'level2', 'level10')][string] $Character = 'strong',
+    # With -Only dungeon: strong (the hub's maxed character), level2, level10 or
+    # veteran (level 30, full ebony).
+    [ValidateSet('strong', 'level2', 'level10', 'veteran')][string] $Character = 'strong',
     # With -Only dungeon: print the NPCs of these dungeons ("A;B;C") at the start.
     [string] $Survey = '',
     # Fight length. 0 = default: 40 / the character's own health in the full tour; in the
@@ -17,6 +18,10 @@ param(
     # 40 health ended those duels in two hits.
     [ValidateRange(0, 100000)][int] $OpponentHealth = 0,
     [ValidateRange(0, 100000)][int] $PlayerHealth = 0,
+    # With -Only duel: stage this built duel first (manual_hub_duel.lua parse), e.g.
+    # "opponent=skaal_guard,weapon=claymore,material=ebony,you=high,foe=own,shield=both,armor=none,health=1".
+    # F8 changes it in game.
+    [string] $Duel = '',
     [switch] $PrepareOnly,
     # Where the manual range stands: the flat test floor (default) or a flat spot in
     # Balmora (varied terrain around it: slopes, stairs, the river bridges).
@@ -100,6 +105,7 @@ if ($Only -eq 'duel') {
 if ($OpponentHealth -gt 0) { $taskCheck += ", opponentHealth = $OpponentHealth" }
 if ($PlayerHealth -gt 0) { $taskCheck += ", playerHealth = $PlayerHealth" }
 if ($Area -ne 'floor') { $taskCheck += ", area = '$Area'" }
+if ($Duel) { $taskCheck += ", duel = '$($Duel.Replace("'", '').Replace('\', ''))'" }
 if ($Only -eq 'dungeon') {
     if ($PlayerHealth -eq 0) { $PlayerHealth = 250; $taskCheck += ", playerHealth = 250" }
     $taskCheck += ", dungeon = '$($Dungeon.Replace("'", ''))'"
@@ -113,9 +119,6 @@ $taskCommit = (& git -c "safe.directory=$taskGitPath" -C $taskSource rev-parse H
 if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the manual-hub source.' }
 $taskDirty = @(& git -c "safe.directory=$taskGitPath" -C $taskSource status --porcelain)
 $taskFiles = @(Get-ChildItem -LiteralPath $taskData -File)
-# The launcher's own choice wins (user 10-08: Run-Game-MotionBricks.cmd turns the
-# whole-part red tint off); unset - the frozen alphas - keeps it on as before.
-if (-not $env:OPENMW_RAGDOLL_LIMB_DAMAGE_TINT) { $env:OPENMW_RAGDOLL_LIMB_DAMAGE_TINT = '1' }
 $taskFiles += @(Get-ChildItem -LiteralPath (Join-Path $taskSource 'scripts/data/ragdoll_manual') -File -Recurse)
 $taskHashes = @{}
 foreach ($taskFile in $taskFiles) {

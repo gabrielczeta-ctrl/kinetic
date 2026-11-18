@@ -2,6 +2,8 @@
 #include <ragdollcore/tuning.hpp>
 
 #include <ragdollcore/gaitcontroller.hpp>
+#include <ragdollcore/stepplanner.hpp>
+#include <ragdollcore/unitmodel.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -64,10 +66,8 @@ namespace RagdollCore
         RagdollCore::tuningList("OPENMW_RAGDOLL_FOOTFALL_LEAN", s.mLean);
         s.mCushion[1] = std::max(s.mCushion[1], 0.02f);
         s.mCushion[2] = std::clamp(s.mCushion[2], 0.0f, 0.9f);
-        s.mLateralTime = envSetting("OPENMW_RAGDOLL_FOOTFALL_LATERAL_TIME", s.mLateralTime);
         s.mBackTime = envSetting("OPENMW_RAGDOLL_FOOTFALL_BACK_TIME", s.mBackTime);
         s.mLandTaper = std::clamp(envSetting("OPENMW_RAGDOLL_FOOTFALL_LAND_TAPER", s.mLandTaper), 0.0f, 0.9f);
-        s.mClipSync = envSetting("OPENMW_RAGDOLL_FOOTFALL_CLIP_SYNC", s.mClipSync);
         s.mMoveWidth = envSetting("OPENMW_RAGDOLL_FOOTFALL_MOVE_WIDTH", s.mMoveWidth);
         s.mClipWidthMoving = envSetting("OPENMW_RAGDOLL_FOOTFALL_CLIP_WIDTH", 1.0f) > 0.0f;
         s.mLeadScale = envSetting("OPENMW_RAGDOLL_FOOTFALL_LEAD_SCALE", 1.0f) > 0.0f;
@@ -80,6 +80,14 @@ namespace RagdollCore
         s.mPathMatch = envSetting("OPENMW_RAGDOLL_FOOTFALL_PATH_MATCH", s.mPathMatch);
         s.mRunPathMatch = envSetting("OPENMW_RAGDOLL_FOOTFALL_RUN_PATH_MATCH", s.mRunPathMatch);
         s.mOverrunRun = envSetting("OPENMW_RAGDOLL_FOOTFALL_OVERRUN_RUN", s.mOverrunRun);
+        RagdollCore::tuningList("OPENMW_RAGDOLL_FOOTFALL_DRAG_LIFT", s.mDragLift);
+        s.mAirHold = std::max(0.0f, envSetting("OPENMW_RAGDOLL_FOOTFALL_AIR_HOLD", s.mAirHold));
+        RagdollCore::tuningList("OPENMW_RAGDOLL_K2_STRIDE_TURN", s.mTurnCut);
+        RagdollCore::tuningList("OPENMW_RAGDOLL_K2_TURN_STEP", s.mTurnStep);
+        RagdollCore::tuningList("OPENMW_RAGDOLL_K2_STRIDE_LEAD_FIRST", s.mLeadFirst);
+        RagdollCore::tuningList("OPENMW_RAGDOLL_K2_STRIDE_SIDE_RISE", s.mSideRise);
+        RagdollCore::tuningList("OPENMW_RAGDOLL_K2_DESCENT", s.mDescent);
+        RagdollCore::tuningList("OPENMW_RAGDOLL_K2_SIDE_STAIRS", s.mSideStairs);
         s.mFirstStep = envSetting("OPENMW_RAGDOLL_FOOTFALL_FIRST_STEP", s.mFirstStep);
         s.mRunSwingDamping = envSetting("OPENMW_RAGDOLL_FOOTFALL_RUN_SWING_DAMPING", s.mRunSwingDamping);
         s.mRunSwingStiffness = envSetting("OPENMW_RAGDOLL_FOOTFALL_RUN_SWING_STIFFNESS", s.mRunSwingStiffness);
@@ -109,6 +117,7 @@ namespace RagdollCore
         s.mWidthBlend = envSetting("OPENMW_RAGDOLL_FOOTFALL_WIDTH_BLEND", 1.0f) > 0.0f;
         s.mStopLead = envSetting("OPENMW_RAGDOLL_FOOTFALL_STOP_LEAD", s.mStopLead);
         s.mHipGap = envSetting("OPENMW_RAGDOLL_FOOTFALL_HIP_GAP", s.mHipGap);
+        s.mHipGapTurn = envSetting("OPENMW_RAGDOLL_FOOTFALL_HIP_GAP_TURN", s.mHipGapTurn);
         return s;
     }
 
@@ -166,9 +175,13 @@ namespace RagdollCore
         mWalking = false;
         mSinceLanding = 0.0f;
         mLiftDue = { false, false };
+        mSideStairNext = 2;
+        mSideStairsHold = 0.0f;
         mPreviousPelvis.reset();
         mSurplus = JPH::Vec3::sZero();
         mPreviousCommand.reset();
+        mLaggedCommand.reset();
+        mTurnStepLeft = 0.0f;
         mTurnAcceleration = JPH::Vec3::sZero();
         mExtendIntegral = 0.0f;
         mCrouchLength = -1.0f;
@@ -316,6 +329,27 @@ namespace RagdollCore
         const float restHeight = mRestHeight.value_or(6.5f);
         const float halfWidth = mHalfWidth.value_or(10.0f) * gait[2];
 
+        // mTurnStep: a direction change opens the window.
+        bool turnStep = false;
+        if (settings.mTurnStep[0] > 0.0f)
+        {
+            const JPH::Vec3 lagged = mLaggedCommand.value_or(command);
+            const float laggedSpeed = lagged.Length();
+            const bool fromRest = laggedSpeed < 15.0f;
+            const bool turned = !fromRest && lagged.Dot(command) < 0.866f * laggedSpeed * speed;
+            const bool changed = speed > 30.0f && speed < 300.0f && (fromRest || turned);
+            if (changed && mTurnStepLeft <= 0.0f && trace)
+            {
+                std::ostringstream line;
+                line << std::fixed << std::setprecision(1) << "RAGDOLL_FOOTFALL_TURN_STEP change from_rest=" << fromRest
+                     << " speed=" << speed << " was=" << laggedSpeed;
+                trace(line.str());
+            }
+            mTurnStepLeft = changed ? std::max(0.0f, settings.mTurnStep[1]) : std::max(0.0f, mTurnStepLeft - dt);
+            mLaggedCommand = lagged + (command - lagged) * (1.0f - std::exp(-dt / 0.1f));
+            turnStep = mTurnStepLeft > 0.0f && speed < 300.0f;
+        }
+
         const bool procedural = loadPolicy && settings.mLoadProceduralStride.has_value();
         const float strideScale = procedural ? *settings.mLoadProceduralStride : 1.0f;
         float stepLength = std::clamp(12.0f + gait[0] * speed * strideScale, 20.0f, std::max(20.0f, gait[3]));
@@ -397,57 +431,6 @@ namespace RagdollCore
             period = mix(period, 0.5f * cycle);
             duty = mix(duty, referenceDuty);
             stepLength = std::max(20.0f, speed * period);
-        }
-
-        // The clip's stride: cadence and phase from the clip's feet.
-        mClipStrideTime += dt;
-        mClipStrideCorrection = 0.0f;
-        {
-            const float clipSync = settings.mClipSync;
-            const JPH::Vec3 along = speed > 1e-3f ? command / speed : forward;
-            const float d = (clipOffset[0] - clipOffset[1]).Dot(along);
-            if (clipSync <= 0.0f || speed <= 15.0f)
-            {
-                mClipStrideHalf.reset();
-                mClipStrideLast.reset();
-                mClipStrideRising.reset();
-                mClipStridePhaseError = 0.0f;
-            }
-            else
-            {
-                if (mClipStridePrevious)
-                {
-                    const bool rising = d > *mClipStridePrevious;
-                    if (mClipStrideRising && rising != *mClipStrideRising
-                        && (!mClipStrideLast || std::abs(*mClipStridePrevious - mClipStrideExtremum) > 6.0f))
-                    {
-                        const float expected = *mClipStrideRising ? 0.5f : 0.0f;
-                        if (mClipStrideLast)
-                        {
-                            const float half = mClipStrideTime - *mClipStrideLast;
-                            if (half > 0.18f && half < 0.9f)
-                                mClipStrideHalf = mClipStrideHalf ? *mClipStrideHalf + (half - *mClipStrideHalf) * 0.5f : half;
-                        }
-                        mClipStrideLast = mClipStrideTime;
-                        mClipStrideExtremum = *mClipStridePrevious;
-                        float error = expected - mClock;
-                        error -= std::round(error);
-                        mClipStridePhaseError = error * clipSync;
-                    }
-                    if (!mClipStrideRising || rising != *mClipStrideRising)
-                        mClipStrideRising = rising;
-                }
-                if (mClipStrideHalf)
-                {
-                    const float scale = *mClipStrideHalf / std::max(period, 0.1f);
-                    period = *mClipStrideHalf;
-                    referenceSwing *= scale;
-                    stepLength = std::max(20.0f, speed * period);
-                    mClipStrideCorrection = std::clamp(mClipStridePhaseError, -0.25f, 0.25f);
-                    mClipStridePhaseError *= std::exp(-dt / 0.25f);
-                }
-            }
-            mClipStridePrevious = d;
         }
 
         const float moveWidth = settings.mMoveWidth;
@@ -629,10 +612,77 @@ namespace RagdollCore
             if (settings.mHipGap <= 0.0f || !hipLineKnown)
                 return target;
             const float sign = side == 0 ? 1.0f : -1.0f;
-            const float gap = settings.mHipGap * footWidth;
+            float turnShare = 1.0f;
+            if (settings.mHipGapTurn > 0.0f)
+            {
+                const float aligned = std::clamp(std::abs(hipLeft.Dot(left)), 0.0f, 1.0f);
+                const float full = 1.0f - std::cos(settings.mHipGapTurn * sPi / 180.0f);
+                turnShare = std::clamp((1.0f - aligned) / std::max(full, 1e-4f), 0.0f, 1.0f);
+            }
+            const float gap = settings.mHipGap * footWidth * turnShare;
             const float across = sign * JPH::Vec3(target - otherAt).Dot(hipLeft);
             if (across < gap)
                 target += JPH::RVec3(hipLeft * (sign * (gap - across)));
+            return target;
+        };
+        // K2_STRIDE_SIDE_RISE: a sideways step climbs or descends a tread at a
+        // time (the gait's landings and the balance helper's).
+        const auto sideRise = [&](JPH::RVec3 target, std::size_t side) {
+            const auto& other = mFeet[1 - side];
+            const JPH::RVec3 otherAt = other.mSwinging ? other.mTarget : other.mPin;
+            const float sign = side == 0 ? 1.0f : -1.0f;
+            if (settings.mSideRise[0] > 0.0f && speed > 15.0f
+                && std::abs(command.Dot(left)) / speed >= settings.mSideRise[1])
+            {
+                // The other foot's ground from its pin or landing, set from the
+                // ground with the rest height: a probe there misses once the
+                // capsule has climbed 40 u past it (11-07: the cap skipped).
+                // Against its own take-off too, at most two rises: two swings
+                // capped on each other's landings climbed a tread each (11-07).
+                const std::optional<double> stance = otherAt.GetZ() - restHeight;
+                const double own = mFeet[side].mPin.GetZ() - restHeight;
+                const JPH::Vec3 along = command / speed;
+                const float toward = JPH::Vec3(otherAt - target).Dot(along) >= 0.0f ? 1.0f : -1.0f;
+                const JPH::Vec3 step = along * (4.0f * toward);
+                const float halfFoot = 11.0f * std::abs(forward.Dot(along)) + 5.0f * std::abs(left.Dot(along));
+                const auto apart = [&](const JPH::RVec3& at) {
+                    return sign * JPH::Vec3(at - otherAt).Dot(left) >= 1.2f * footWidth - 0.01f;
+                };
+                const JPH::RVec3 aimed = target;
+                bool moved = false;
+                // At most back to the other foot.
+                const int most = std::min(64, static_cast<int>(std::abs(JPH::Vec3(otherAt - target).Dot(along)) / 4.0f) + 1);
+                for (int k = 0; stance && k < most; ++k)
+                {
+                    // No ground found: further than the probe sees, back too.
+                    const auto here = groundNear(target, physFeet[side]);
+                    if (here && std::abs(*here - *stance) <= settings.mSideRise[0]
+                        && std::abs(*here - own) <= 2.0f * settings.mSideRise[0])
+                        break;
+                    const JPH::RVec3 next = target + JPH::RVec3(step);
+                    if (!apart(next))
+                        break;
+                    target = next;
+                    moved = true;
+                }
+                if (moved)
+                {
+                    // The found spot is just past the tread's edge: the whole
+                    // foot onto it.
+                    const JPH::RVec3 next = target + JPH::RVec3(step * (halfFoot / 4.0f));
+                    if (apart(next))
+                        target = next;
+                    mFeet[side].mTreadZ.reset();
+                    if (trace)
+                    {
+                        std::ostringstream line;
+                        line << std::fixed << std::setprecision(1) << "RAGDOLL_FOOTFALL_SIDE_RISE side=" << side
+                             << " from=" << aimed.GetX() << "," << aimed.GetY() << " to=" << target.GetX() << ","
+                             << target.GetY() << " stance_z=" << *stance;
+                        trace(line.str());
+                    }
+                }
+            }
             return target;
         };
         const auto landingTarget = [&](std::size_t side, float remaining) {
@@ -692,6 +742,7 @@ namespace RagdollCore
             const JPH::RVec3 otherAt = other.mSwinging ? other.mTarget : other.mPin;
             const float sign = side == 0 ? 1.0f : -1.0f;
             const float across = sign * JPH::Vec3(target - otherAt).Dot(left);
+            mGuardHeld[side] = std::max(0.0f, 1.2f * footWidth - across);
             if (across < 1.2f * footWidth)
                 target += JPH::RVec3(left * (sign * (1.2f * footWidth - across)));
             // Strafing, the tread shift runs along `left`: it must not undo
@@ -714,6 +765,7 @@ namespace RagdollCore
                 if (out > most)
                     target -= JPH::RVec3(left * (sign * (out - most)));
             }
+            target = sideRise(target, side);
             const auto ground = groundNear(target, physFeet[side]);
             target.SetZ((ground ? *ground : actorZ) + restHeight);
             return target;
@@ -776,14 +828,27 @@ namespace RagdollCore
             const float along = path[0][0] + (kick < 0.0f ? kick * gain : kick);
             return travelDir * along; // the reference's sideways swing spread the legs
         };
-        const auto startSwing = [&](std::size_t side, float duration) {
+        // `gaitStep`: the gait clock's own step (mTurnStep acts on those only;
+        // a helper's, a capture or a stairs step keeps its lift and time).
+        const auto startSwing = [&](std::size_t side, float duration, bool gaitStep = false) {
             Foot& foot = mFeet[side];
+            const bool turn = gaitStep && turnStep;
+            if (turn)
+                duration = std::max(duration, settings.mTurnStep[2]);
             foot.mSwinging = true;
             output.mSwingStarted[side] = true;
             foot.mPin = physFeet[side];
             foot.mPhase = 0.0f;
             foot.mDuration = duration;
             foot.mLift = liftHeight;
+            foot.mLiftFloor = foot.mLiftFloorGoal = turn ? settings.mTurnStep[0] : 0.0f;
+            if (turn && trace)
+            {
+                std::ostringstream line;
+                line << std::fixed << std::setprecision(2) << "RAGDOLL_FOOTFALL_TURN_STEP start side=" << side
+                     << " time=" << duration << " lift=" << foot.mLiftFloor << " gait_lift=" << liftHeight;
+                trace(line.str());
+            }
             foot.mLiftCurve.reset();
             foot.mProgressCurve.reset();
             if (reference && referenceWeight > 0.0f && mWalking)
@@ -857,6 +922,20 @@ namespace RagdollCore
             Foot& foot = mFeet[side];
             if (!foot.mSwinging)
                 continue;
+            // mTurnStep: a walking swing still in its first half takes the arc.
+            if (turnStep && mWalking && moving && foot.mLiftFloorGoal <= 0.0f && foot.mPhase < 0.5f && !foot.mTargetHeld)
+            {
+                foot.mLiftFloorGoal = settings.mTurnStep[0];
+                if (trace)
+                {
+                    std::ostringstream line;
+                    line << std::fixed << std::setprecision(2) << "RAGDOLL_FOOTFALL_TURN_STEP flight side=" << side
+                         << " phase=" << foot.mPhase << " time=" << foot.mDuration;
+                    trace(line.str());
+                }
+            }
+            if (foot.mLiftFloor < foot.mLiftFloorGoal)
+                foot.mLiftFloor = std::min(foot.mLiftFloorGoal, foot.mLiftFloor + foot.mLiftFloorGoal * dt / 0.08f);
             foot.mPhase += dt / foot.mDuration;
             const float finish = planarFinishOf(foot);
             const float retargetUntil = finish < 1.0f ? std::min(0.75f, std::clamp(finish, 0.4f, 1.0f) - 0.15f) : 0.75f;
@@ -865,7 +944,25 @@ namespace RagdollCore
                 const float remaining = (1.0f - foot.mPhase) * foot.mDuration;
                 const JPH::RVec3 aimed = moving ? landingTarget(side, remaining) : landingTarget(side, 0.0f);
                 const bool otherTread = std::abs(aimed.GetZ() - foot.mLockedZ) > 4.0;
-                if (foot.mStair && otherTread && foot.mPhase >= settings.mStair[0])
+                // K2_STRIDE_SIDE_RISE's lock: a sideways swing keeps its tread.
+                // (Sideways by the swing's own way, pin to landing: the
+                // command can drop to nothing mid-swing.)
+                const JPH::Vec3 swingWay = horizontal(JPH::Vec3(foot.mTarget - foot.mPin));
+                const bool sideLock = settings.mSideRise[0] > 0.0f && settings.mSideRise[2] > 0.0f
+                    && swingWay.Length() > 4.0f
+                    && std::abs(swingWay.Dot(left)) >= settings.mSideRise[1] * swingWay.Length()
+                    && foot.mPhase >= settings.mSideRise[2] && std::abs(aimed.GetZ() - foot.mTarget.GetZ()) > 4.0;
+                if (sideLock)
+                {
+                    if (trace)
+                    {
+                        std::ostringstream line;
+                        line << std::fixed << std::setprecision(2) << "RAGDOLL_FOOTFALL_SIDE_LOCK side=" << side
+                             << " from_z=" << foot.mTarget.GetZ() << " to_z=" << aimed.GetZ() << " phase=" << foot.mPhase;
+                        trace(line.str());
+                    }
+                }
+                else if (foot.mStair && otherTread && foot.mPhase >= settings.mStair[0])
                 {
                     // Locked: the landing keeps its tread (a re-aim on it is fine).
                     if (trace)
@@ -879,6 +976,34 @@ namespace RagdollCore
                 else
                 {
                     foot.mTarget = aimed;
+                    // Stride's turn: held back across the other foot, land soon.
+                    const JPH::Vec3 swingDir = horizontal(JPH::Vec3(foot.mTarget - foot.mPin));
+                    const bool turned = speed > 1e-3f && swingDir.Length() > 1.0f
+                        && swingDir.Normalized().Dot(command / speed) < 0.7f;
+                    if (settings.mTurnCut[0] > 0.0f && moving && turned && mGuardHeld[side] > settings.mTurnCut[0]
+                        && remaining > settings.mTurnCut[1])
+                    {
+                        const float elapsed = foot.mPhase * foot.mDuration;
+                        float cut = elapsed + std::max(0.02f, settings.mTurnCut[1]);
+                        // mTurnStep: the swing keeps the time to make its lift.
+                        const bool kept = turnStep && cut < std::min(foot.mDuration, settings.mTurnStep[2]);
+                        if (kept)
+                            cut = std::min(foot.mDuration, settings.mTurnStep[2]);
+                        const bool shorter = cut < foot.mDuration - 1e-4f;
+                        if (shorter)
+                        {
+                            foot.mDuration = cut;
+                            foot.mPhase = elapsed / foot.mDuration;
+                        }
+                        if (trace && shorter)
+                        {
+                            std::ostringstream line;
+                            line << std::fixed << std::setprecision(2) << "RAGDOLL_FOOTFALL_TURN_CUT side=" << side
+                                 << " held=" << mGuardHeld[side] << " phase=" << foot.mPhase << " kept=" << kept
+                                 << " time=" << foot.mDuration;
+                            trace(line.str());
+                        }
+                    }
                     if (slopeOn && horizontal(JPH::Vec3(aimed - foot.mTargetNormalAt)).Length() > 4.0f)
                     {
                         foot.mTargetNormal = normalAt(aimed);
@@ -903,12 +1028,14 @@ namespace RagdollCore
             const float gap = horizontal(JPH::Vec3(foot.mTarget - physFeet[side])).Length();
             const bool contactLand = settings.mContactLand[0] > 0.0f && input.mFootContact.has_value();
             bool landNow = foot.mPhase >= 1.0f;
-            float extra = 0.2f;
+            float extra = settings.mAirHold;
             if (contactLand)
             {
                 const bool touching = (*input.mFootContact)[side];
                 const bool closing = mSwingGap[side] >= 0.0f && gap < mSwingGap[side] - 0.05f;
-                if (touching && !closing && foot.mPhase >= settings.mContactLand[0])
+                const float travel = horizontal(JPH::Vec3(foot.mTarget - foot.mPin)).Length();
+                const bool farEnough = gap <= (1.0f - std::clamp(settings.mContactLand[2], 0.0f, 1.0f)) * travel;
+                if (touching && !closing && foot.mPhase >= settings.mContactLand[0] && farEnough)
                     landNow = true;
                 extra = std::max(0.0f, settings.mContactLand[1]);
                 // Past the end, only a foot still in the air waits.
@@ -1002,7 +1129,7 @@ namespace RagdollCore
         for (std::size_t side = 0; side < 2; ++side)
             if (helperCommand.mLanding[side] && mFeet[side].mSwinging)
             {
-                JPH::RVec3 target = onTread(*helperCommand.mLanding[side], side);
+                JPH::RVec3 target = sideRise(onTread(*helperCommand.mLanding[side], side), side);
                 const auto ground = groundAt(target, actorZ);
                 target.SetZ((ground ? *ground : actorZ) + restHeight);
                 mFeet[side].mTarget = target;
@@ -1018,6 +1145,83 @@ namespace RagdollCore
             mLiftDue = { false, false };
             mDoubleSupport = 0.0f;
         }
+
+        // K2_SIDE_STAIRS: side-stepping stairs takes its own steps.
+        bool sideStairs = false;
+        std::size_t sideLead = 0;
+        JPH::Vec3 sideTravel = JPH::Vec3::sZero();
+        if (settings.mSideStairs[0] > 0.0f && !helperCommand.mHoldClock && speed > 15.0f && !input.mStopping
+            && std::abs(command.Dot(left)) >= 0.5f * speed)
+        {
+            const float across = command.Dot(left);
+            sideLead = across > 0.0f ? 0 : 1;
+            sideTravel = left * (across > 0.0f ? 1.0f : -1.0f);
+            const Foot& leadFoot = mFeet[sideLead];
+            const JPH::RVec3 from = leadFoot.mSwinging ? leadFoot.mTarget : leadFoot.mPin;
+            const auto base = groundNear(from, physFeet[sideLead]);
+            bool stairs = !mFeet[0].mSwinging && !mFeet[1].mSwinging
+                && std::abs(mFeet[0].mPin.GetZ() - mFeet[1].mPin.GetZ()) > 6.0;
+            for (int k = 1; base && !stairs && k <= 12; ++k)
+                if (const auto g = groundNear(from + JPH::RVec3(sideTravel * (4.0f * k)), physFeet[sideLead]);
+                    g && std::abs(*g - *base) > 6.0 && std::abs(*g - *base) < 34.0)
+                    stairs = true;
+            mSideStairsHold = stairs ? 0.5f : std::max(0.0f, mSideStairsHold - dt);
+            sideStairs = mSideStairsHold > 0.0f;
+        }
+        else
+            mSideStairsHold = 0.0f;
+        if (!sideStairs)
+            mSideStairNext = 2;
+        // The leading foot's landing: past the first edge along the travel,
+        // as deep into that tread as leaves room for the trailing foot behind
+        // it (short of the next edge).
+        const auto sideStairLanding = [&](std::size_t side) {
+            const Foot& foot = mFeet[side];
+            const Foot& other = mFeet[1 - side];
+            const float halfFoot = 5.0f;
+            const float gap = 1.2f * footWidth + 2.0f;
+            JPH::RVec3 target;
+            if (side == sideLead)
+            {
+                const JPH::RVec3 from = foot.mPin;
+                const auto base = groundNear(from, physFeet[side]);
+                std::optional<float> edge, nextEdge;
+                std::optional<double> level = base;
+                for (int k = 1; level && k <= 20; ++k)
+                {
+                    const auto g = groundNear(from + JPH::RVec3(sideTravel * (4.0f * k)), physFeet[side]);
+                    if (!g)
+                        break;
+                    if (std::abs(*g - *level) > 4.0)
+                    {
+                        (edge ? nextEdge : edge) = 4.0f * k - 2.0f;
+                        if (nextEdge)
+                            break;
+                        level = g;
+                    }
+                }
+                float along = 28.0f;
+                if (edge)
+                {
+                    along = *edge + 2.0f * halfFoot + gap + 2.0f;
+                    if (nextEdge)
+                        along = std::min(along, *nextEdge - halfFoot - 2.0f);
+                    along = std::max(along, *edge + halfFoot + 2.0f);
+                }
+                // Not ahead of the trailing foot by more than a leg can spread.
+                target = from + JPH::RVec3(sideTravel * along);
+            }
+            else
+            {
+                // Beside the leading foot, a gap behind it, at its own spot
+                // across the travel.
+                const float apart = JPH::Vec3(other.mPin - foot.mPin).Dot(sideTravel);
+                target = foot.mPin + JPH::RVec3(sideTravel * std::max(0.0f, apart - gap - 2.0f * halfFoot));
+            }
+            const auto ground = groundNear(target, physFeet[side]);
+            target.SetZ((ground ? *ground : actorZ) + restHeight);
+            return target;
+        };
 
         // Start the next steps from the gait clock.
         if (!helperCommand.mHoldClock)
@@ -1134,8 +1338,43 @@ namespace RagdollCore
                         }
                     }
                 }
+                // K2_SIDE_STAIRS: the feet take turns, each once the other is down.
+                if (sideStairs && !mFeet[0].mSwinging && !mFeet[1].mSwinging
+                    && mSinceLanding >= settings.mSideStairs[2])
+                {
+                    const std::size_t next = mSideStairNext >= 2 ? sideLead : mSideStairNext;
+                    startSwing(next, std::max(0.1f, settings.mSideStairs[1]));
+                    ++mStepsSinceStart;
+                    Foot& foot = mFeet[next];
+                    foot.mTarget = sideStairLanding(next);
+                    foot.mTargetHeld = true;
+                    foot.mTargetNormal = normalAt(foot.mTarget);
+                    foot.mTargetNormalAt = foot.mTarget;
+                    foot.mPathCurve.reset();
+                    mSideStairNext = 1 - next;
+                    mLiftDue = { false, false };
+                    if (trace)
+                    {
+                        std::ostringstream line;
+                        line << std::fixed << std::setprecision(1) << "RAGDOLL_FOOTFALL_SIDE_STAIRS side=" << next
+                             << " lead=" << sideLead << " pin=" << foot.mPin.GetX() << "," << foot.mPin.GetY() << ","
+                             << foot.mPin.GetZ() << " target=" << foot.mTarget.GetX() << "," << foot.mTarget.GetY()
+                             << "," << foot.mTarget.GetZ();
+                        trace(line.str());
+                    }
+                }
                 const float previous = mClock;
-                mClock += std::max(0.0f, dt / cycle + mClipStrideCorrection * dt / 0.25f);
+                mClock += std::max(0.0f, dt / cycle);
+                output.mGaitCycle = cycle;
+                output.mGaitClock = std::fmod(mClock, 1.0f);
+                output.mGaitDuty = duty;
+                // Stride's event timing (MOVE-01 4.3): at a walk (stance over
+                // half the cycle), after the first step, a foot lifts once the
+                // other has been down the gait's nominal double support, not
+                // when the clock crosses its lift point (the user's play,
+                // 11-08: "really good"). The clock follows the lifts.
+                const bool events = duty >= 0.5f && mStepsSinceStart > 0 && !sideStairs;
+                const float eventWait = std::max(0.02f, period - swingDuration);
                 // WALK-02: the foot whose turn it is lifts before the other's
                 // overrun step (a body carried sideways overran the left leg
                 // landing after landing and the right foot never stepped).
@@ -1149,30 +1388,70 @@ namespace RagdollCore
                     if (due(1) && !due(0))
                         order = { 1, 0 };
                 }
+                for (std::size_t side = 0; side < 2; ++side)
+                    mDragTime[side] = settings.mDragLift[0] > 0.0f && input.mFootSlip && !mFeet[side].mSwinging
+                            && (*input.mFootSlip)[side] > settings.mDragLift[0]
+                        ? mDragTime[side] + dt
+                        : 0.0f;
                 for (const std::size_t side : order)
                 {
+                    if (sideStairs)
+                        break;
                     const float liftAt = side == 0 ? 1.0f : 0.5f;
                     const bool crossed = previous < liftAt && mClock >= liftAt;
                     const Foot& other = mFeet[1 - side];
                     const bool otherDown = !other.mSwinging || duty < 0.5f;
-                    if (crossed && !mFeet[side].mSwinging)
+                    if (events)
+                        mLiftDue[side] = !mFeet[side].mSwinging && !other.mSwinging && side != mLastLanded
+                            && mSinceLanding >= eventWait;
+                    else if (crossed && !mFeet[side].mSwinging)
                         mLiftDue[side] = true;
                     const bool trail = !mFeet[side].mSwinging && otherDown && !mLiftDue[side] && !hipOverrun(side)
                         && stairTrail(side);
-                    if (!mFeet[side].mSwinging && otherDown && (mLiftDue[side] || hipOverrun(side) || trail))
+                    const bool drag = settings.mDragLift[0] > 0.0f && mDragTime[side] >= settings.mDragLift[1]
+                        && !other.mSwinging && mSinceLanding >= 0.1f;
+                    if (!mFeet[side].mSwinging && otherDown && (mLiftDue[side] || hipOverrun(side) || trail || drag))
                     {
                         if (trace)
                         {
                             std::ostringstream line;
                             line << std::fixed << std::setprecision(3) << "RAGDOLL_FOOTFALL_LIFT side=" << side
                                  << " due=" << mLiftDue[side] << " crossed=" << crossed << " overrun=" << hipOverrun(side)
-                                 << " trail=" << trail
+                                 << " trail=" << trail << " drag=" << drag
                                  << " clock=" << mClock << " cycle=" << cycle << " speed=" << speed;
                             trace(line.str());
                         }
-                        startSwing(side, swingDuration * (mStepsSinceStart == 0 ? settings.mFirstStep : 1.0f));
+                        // Stride's lead foot: sideways, the foot on the side of
+                        // travel steps first.
+                        std::size_t lifting = side;
+                        if (settings.mLeadFirst[0] > 0.0f && speed > 15.0f && !other.mSwinging)
+                        {
+                            const float across = command.Dot(left) / speed;
+                            // The body moving that way too: not in a reversal,
+                            // where the command turns before the momentum does.
+                            const float moving = horizontal(pelvisVelocity).Dot(left) / speed;
+                            if (std::abs(across) > settings.mLeadFirst[0] && moving * across > 0.0f
+                                && std::abs(moving) > 0.5f * settings.mLeadFirst[0])
+                            {
+                                const std::size_t lead = across > 0.0f ? 0 : 1;
+                                const JPH::Vec3 travel = left * (across > 0.0f ? 1.0f : -1.0f);
+                                const float leadOut
+                                    = JPH::Vec3(mFeet[lead].mPin - mFeet[1 - lead].mPin).Dot(travel);
+                                if (side != lead && leadOut < settings.mLeadFirst[1])
+                                {
+                                    lifting = lead;
+                                    if (trace)
+                                        trace("RAGDOLL_FOOTFALL_LEAD_FIRST side=" + std::to_string(lead));
+                                }
+                            }
+                        }
+                        startSwing(lifting, swingDuration * (mStepsSinceStart == 0 ? settings.mFirstStep : 1.0f), true);
                         ++mStepsSinceStart;
                         mLiftDue[side] = false;
+                        if (events)
+                            mClock = lifting == 0 ? 0.0f : 0.5f;
+                        if (lifting != side)
+                            break;
                     }
                 }
                 if (mClock >= 1.0f)
@@ -1206,10 +1485,35 @@ namespace RagdollCore
                     // still under 10 u/s for a second. Right after a stop on a
                     // slope the body sags and must step at once (the Balmora hill
                     // stop fell in 10 of 13 runs with them, 0 of 6 without).
-                    mStillTime = horizontal(pelvisVelocity).Length() < 10.0f ? mStillTime + dt : 0.0f;
+                    // An attack's planted shift (mPlantedShift) is not the body
+                    // leaving its stance: these rules read the body without it.
+                    const JPH::RVec3 standPelvis = physPelvis - JPH::RVec3(horizontal(input.mPlantedShift));
+                    const JPH::Vec3 standVelocity = horizontal(pelvisVelocity - input.mPlantedShiftVelocity);
+                    mStillTime = standVelocity.Length() < 10.0f ? mStillTime + dt : 0.0f;
                     const bool calm = settings.mStandTurn[0] > 0.0f && mStillTime > 1.0f;
+                    // Stride's standing rule (MOVE-01 4.2; the user's play, 11-08):
+                    // at rest, no tidy-up step while the capture point stays
+                    // within 2 u of the feet, unless the heading has turned.
+                    bool balanced = false;
+                    if (calm)
+                    {
+                        StrideStandInput stand;
+                        stand.mState.mCenterOfMass = { static_cast<float>(standPelvis.GetX()),
+                            static_cast<float>(standPelvis.GetY()) };
+                        stand.mState.mVelocity = { standVelocity.GetX(), standVelocity.GetY() };
+                        stand.mState.mHeight = std::max(20.0f,
+                            static_cast<float>(physPelvis.GetZ() - std::min(mFeet[0].mPin.GetZ(), mFeet[1].mPin.GetZ())));
+                        stand.mState.mGravity = UnitModel::GravityUnitsPerSecondSquared;
+                        stand.mLeftFoot = { static_cast<float>(mFeet[0].mPin.GetX()),
+                            static_cast<float>(mFeet[0].mPin.GetY()) };
+                        stand.mRightFoot = { static_cast<float>(mFeet[1].mPin.GetX()),
+                            static_cast<float>(mFeet[1].mPin.GetY()) };
+                        stand.mMargin = 2.0f;
+                        const std::optional<bool> needs = strideNeedsStep(stand);
+                        balanced = needs && !*needs;
+                    }
                     const auto& anchor = settings.mAnchorSettle;
-                    if (!next && anchor[0] > 0.0f && mDoubleSupport > 0.15f && !helperCommand.mNoAnchorSettle)
+                    if (!next && anchor[0] > 0.0f && mDoubleSupport > 0.15f && !helperCommand.mNoAnchorSettle && !balanced)
                     {
                         JPH::Vec3 offset
                             = horizontal(JPH::Vec3(frame.worldPosition(drive[pelvis].mTranslation) - physPelvis));
@@ -1247,6 +1551,7 @@ namespace RagdollCore
                     // to the body's past the tolerance (mStandTurn).
                     const auto& standTurn = settings.mStandTurn;
                     JPH::Vec3 stanceForward = forward;
+                    bool headingTurned = false;
                     if (!calm)
                         mStanceForward = forward;
                     else
@@ -1255,17 +1560,20 @@ namespace RagdollCore
                             mStanceForward = forward;
                         const float turned = std::acos(std::clamp(mStanceForward->Dot(forward), -1.0f, 1.0f));
                         if (turned > standTurn[0] * 3.14159265f / 180.0f)
+                        {
                             mStanceForward = forward;
+                            headingTurned = true;
+                        }
                         stanceForward = *mStanceForward;
                     }
                     bool spotError = false;
-                    if (!next && mDoubleSupport > 0.15f)
+                    if (!next && mDoubleSupport > 0.15f && (!balanced || headingTurned))
                     {
                         float worst = 0.0f;
                         for (std::size_t side = 0; side < 2; ++side)
                         {
                             const float error = horizontal(
-                                JPH::Vec3(mFeet[side].mPin - spotFacing(side, physPelvis, stanceForward))).Length();
+                                JPH::Vec3(mFeet[side].mPin - spotFacing(side, standPelvis, stanceForward))).Length();
                             if (error > 12.0f && error > worst)
                             {
                                 worst = error;
@@ -1376,6 +1684,20 @@ namespace RagdollCore
                 mSneakCrouch = 0.0f;
             if (std::isfinite(input.mExtraCrouch))
                 wanted += std::clamp(input.mExtraCrouch, 0.0f, 40.0f);
+            // K2_DESCENT: down to the foothold ahead.
+            if (settings.mDescent[0] > 0.0f && moving)
+            {
+                float below = 0.0f;
+                for (std::size_t side = 0; side < 2; ++side)
+                {
+                    const Foot& foot = mFeet[side];
+                    const JPH::RVec3 at = foot.mSwinging ? foot.mTarget : foot.mPin;
+                    if (horizontal(JPH::Vec3(at - physPelvis)).Dot(travelDir) <= 4.0f)
+                        continue;
+                    below = std::max(below, static_cast<float>(actorZ + restHeight - at.GetZ()));
+                }
+                wanted += std::clamp((below - settings.mDescent[2]) * settings.mDescent[1], 0.0f, settings.mDescent[0]);
+            }
             mPelvisDrop += (wanted - mPelvisDrop) * std::clamp(dt * 8.0f, 0.0f, 1.0f);
             mCushionDrop = moving ? settings.mCushion[0] * cushionEnvelope(mSinceLanding) : 0.0f;
         }
@@ -1489,6 +1811,7 @@ namespace RagdollCore
                     ? sampleCurve(*foot.mProgressCurve, planar)
                     : planar * planar * planar * (10.0f + planar * (-15.0f + 6.0f * planar));
                 float lift = foot.mLiftCurve ? sampleCurve(*foot.mLiftCurve, t) : foot.mLift * std::sin(sPi * t);
+                float liftPhase = t;
                 goal = foot.mPin + (foot.mTarget - foot.mPin) * ease;
                 if (foot.mPathCurve)
                 {
@@ -1512,7 +1835,10 @@ namespace RagdollCore
                         lift = curve[i] + (curve[i + 1] - curve[i]) * (x - static_cast<float>(i));
                     }
                     lift = std::max(lift, settings.mClearance * std::sin(sPi * u));
+                    liftPhase = u;
                 }
+                if (foot.mLiftFloor > 0.0f)
+                    lift = std::max(lift, foot.mLiftFloor * std::sin(sPi * liftPhase));
                 const auto ground = groundNear(goal, foot.mPin);
                 double groundZ = ground ? *ground : actorZ;
                 // Step up (user bookmark 9, 2026-09-30: "running up stairs too
@@ -1603,6 +1929,7 @@ namespace RagdollCore
             }
             else
                 mPreviousGoal[side] = foot.mSwinging ? std::optional<JPH::RVec3>(goal) : std::nullopt;
+            mTraceGoal[side] = goal;
             const JPH::Vec3 goalModel = frame.modelPosition(goal);
             if (!std::isfinite(goalModel.GetX()) || !std::isfinite(goalModel.GetY()) || !std::isfinite(goalModel.GetZ()))
                 continue;
@@ -1799,10 +2126,14 @@ namespace RagdollCore
                      << " phase=" << foot.mPhase << " foot=" << physFeet[side].GetX() << "," << physFeet[side].GetY() << ","
                      << physFeet[side].GetZ() << " pin=" << foot.mPin.GetX() << "," << foot.mPin.GetY() << ","
                      << foot.mPin.GetZ() << " target=" << foot.mTarget.GetX() << "," << foot.mTarget.GetY() << ","
-                     << foot.mTarget.GetZ() << " pelvis=" << physPelvis.GetX()
+                     << foot.mTarget.GetZ() << " goal=" << mTraceGoal[side].GetX() << ","
+                     << mTraceGoal[side].GetY() << "," << mTraceGoal[side].GetZ() << " pelvis=" << physPelvis.GetX()
                      << "," << physPelvis.GetY() << " speed=" << speed << " period=" << period << std::setprecision(2)
                      << " ref=" << referenceWeight << " duty=" << duty << " swingT=" << foot.mDuration
-                     << " drop=" << mPelvisDrop << " lead=" << mDebug[0] << " vcorr=" << mDebug[1] << " width=" << mDebug[2];
+                     << " drop=" << mPelvisDrop << " lead=" << mDebug[0] << " vcorr=" << mDebug[1] << " width=" << mDebug[2]
+                     << " yaw=" << input.mYaw << std::setprecision(3) << " clock=" << mClock
+                     << std::setprecision(4) << " cmd="
+                     << input.mCommandVelocity.GetX() << "," << input.mCommandVelocity.GetY();
                 trace(line.str());
             }
         if (settings.mObserveMotorFootGoal)

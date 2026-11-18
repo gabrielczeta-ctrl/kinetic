@@ -4,7 +4,8 @@
 // The live tuning registry. Every ragdoll switch (OPENMW_RAGDOLL_*,
 // OPENMW_KINETIC_*) is read through tuningText(): an in-game override first,
 // then the process environment (the launcher's `set` lines and the settings
-// files, which are copied into the environment at start).
+// files, which are copied into the environment at start), then, for a switch
+// in the KINETIC-2 registry (switchregistry.hpp), its registered default.
 //
 // Values parsed from switches are cached in Tuned<T> objects instead of plain
 // `static const` locals. A Tuned records which switch names its evaluation
@@ -30,7 +31,7 @@
 namespace RagdollCore
 {
     // The value in effect: an override (an empty override reads as unset),
-    // else the environment, else null. The pointer stays valid for the whole
+    // else the environment, else the registered default, else null. The pointer stays valid for the whole
     // run (override snapshots are never freed).
     const char* tuningText(const char* name);
     inline const char* tuningText(const std::string& name)

@@ -58,6 +58,21 @@ namespace RagdollCore
         // and BuildOptions::mUniformScale. Interior/duplicate points are valid;
         // the set must span a finite three-dimensional volume.
         std::vector<JPH::Vec3> mPoints;
+        // A convex hull's mass properties as a solid box over its local
+        // bounds (the mass, the centre of mass kept): the hull keeps its exact
+        // collision, the body turns like its box. A weapon hull's own inertia
+        // is lower and tilted off the long axis (glass claymore 744, 758 and a
+        // cross term -36 against the box's 1083, 1130, 0), and the arm's
+        // holding springs are sized from it: the claymores' backhand ran 16-26
+        // deg/step against 27-28 with it (K2_WEAPON_BOX_INERTIA).
+        bool mBoundsInertia = false;
+        // With mBoundsInertia: the inertia about the longest side at least
+        // this share of the mean across it. A thin blade's box barely resists
+        // a roll (steel dai-katana 3 against 1054 across) and rang in the
+        // solver, never settling: it swung at 30-50% of the iron claymore's
+        // speed with the same command; the iron claymore's own share, 0.036,
+        // gives 92-98% (K2_WEAPON_BOX_INERTIA's second value).
+        float mRollInertiaFloor = 0.0f;
     };
 
     struct MaterialProfile

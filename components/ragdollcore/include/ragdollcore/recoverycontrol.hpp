@@ -53,6 +53,12 @@ namespace RagdollCore
         float mDamping = 8.0f; // 1/s, toward the request velocity
         float mFrictionShare = 0.2f; // cap: this share of body weight (inside the friction cone)
         float mMovingSpeed = 15.0f; // request faster than this: track its velocity, no position term
+        // MOVE-01 W4: with the feet's measured loads (StanceForceInput::
+        // mFootLoad), each planted foot takes the force in proportion to its
+        // load, and the whole is capped at this share of what friction holds
+        // (mFriction x the planted feet's load); 0 = the even split and the
+        // weight cap only.
+        float mGripMargin = 0.0f;
     };
 
     struct StanceForceInput
@@ -61,6 +67,10 @@ namespace RagdollCore
         BalanceVec2 mVelocity; // center of mass velocity
         BalanceVec2 mRequestVelocity; // the movement request (zero standing)
         std::array<std::optional<BalanceVec2>, 2> mPlantedFeet; // left, right; empty when not planted
+        // Each foot's measured normal force (force units; negative =
+        // unknown) and the contacts' combined friction, for mGripMargin.
+        std::array<float, 2> mFootLoad{ -1.0f, -1.0f };
+        float mFriction = 0.0f;
         // Weight shift (WASD while bracing): standing, the target is the
         // middle of the planted feet moved by this (world x, y).
         BalanceVec2 mCenterShift;

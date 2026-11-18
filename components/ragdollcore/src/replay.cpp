@@ -259,6 +259,10 @@ namespace RagdollCore
                 hash.addUnsigned(static_cast<std::uint64_t>(body.mShape.mPoints.size()));
                 for (const JPH::Vec3& point : body.mShape.mPoints)
                     hash.addVector(point);
+                if (body.mShape.mBoundsInertia)
+                    hash.addUnsigned(std::uint64_t{ 1 });
+                if (body.mShape.mRollInertiaFloor > 0.0f)
+                    hash.addFloat(body.mShape.mRollInertiaFloor);
             }
             hash.addFloat(body.mMassFraction);
             hash.addVector(body.mCenterOfMass);

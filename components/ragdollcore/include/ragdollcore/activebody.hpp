@@ -21,6 +21,7 @@
 #include <Jolt/Math/Vec3.h>
 // clang-format on
 
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -94,6 +95,8 @@ namespace RagdollCore
         // Loads "key = value" lines (# comments); unknown keys are reported.
         // Returns the problems found, empty when the file parsed cleanly.
         std::vector<std::string> load(const std::string& path);
+        // The same from a stream (the engine's data files); `name` labels the problems.
+        std::vector<std::string> load(std::istream& in, const std::string& name);
         // Applies one "key = value" line; false for an unknown key or bad value.
         bool set(const std::string& key, float value);
     };
@@ -128,6 +131,11 @@ namespace RagdollCore
         float mAirborneTime = 0.0f; // seconds since a foot was last grounded
         // Multiplier on the vertical caps (a jump launch needs more than 3 g).
         float mUpCapScale = 1.0f;
+        // The whole-body drive (K2_ROOT_FIELD, roottarget.hpp): this share of
+        // the horizontal correction acts on every part but a grounded foot,
+        // by mass (a field, like gravity: no part pulls another), instead of
+        // on the upper parts that tow the legs through the hips. 0 = off.
+        float mFieldShare = 0.0f;
         std::vector<ActiveBodyPart> mParts;
     };
 

@@ -258,6 +258,42 @@ namespace RagdollCore
     bool shouldUseAnimationAssistedActuation(LocomotionRoute route, ActiveControllerMode mode,
         bool driveJointMotors, bool locomotionInterrupted);
 
+    // Whether the animation route (the one that runs Footfall) can take this
+    // step: the upright controller has an output, or the root holds the body
+    // up anyway (built mid-stride or just up, it has no supported height yet).
+    bool animationRouteHasControl(bool uprightReady, bool rootHeld);
+
+    // K2_BALANCE_RISK: how close the body is to going over, 0 steady to 1
+    // going, from hudBalance's tip and the controller's mode.
+    float balanceRisk(float tip, ActiveControllerMode mode);
+
+    // K2_BALANCE_SIGIL: the balance sigil's picture of the stance, in the
+    // actor's frame (x right, y forward, u) from the middle of the feet:
+    // each foot, the centre of mass over the ground, the capture point (where
+    // a step would have to go to stop), each foot's share of the weight
+    // (0..1; a foot off the ground carries none, two feet share it by where
+    // the centre of mass sits between them) and the tipping edge (u, the
+    // weight cue's: half the stance + 45).
+    struct BalanceSigil
+    {
+        bool mKnown = false;
+        float mLeftRight = 0.0f, mLeftForward = 0.0f;
+        float mRightRight = 0.0f, mRightForward = 0.0f;
+        float mComRight = 0.0f, mComForward = 0.0f;
+        float mTipRight = 0.0f, mTipForward = 0.0f;
+        float mLeftLoad = 0.0f, mRightLoad = 0.0f;
+        float mEdge = 0.0f;
+    };
+    // leftFoot, rightFoot and centreOfMass are world points; capture is the
+    // capture point's flat world offset from the feet's middle; forward the
+    // actor's flat facing.
+    BalanceSigil balanceSigil(JPH::RVec3Arg leftFoot, JPH::RVec3Arg rightFoot, JPH::RVec3Arg centreOfMass,
+        JPH::Vec3Arg capture, JPH::Vec3Arg forward, bool leftSupported, bool rightSupported);
+
+    // K2_HEAD_DAMP: the head's world target, `damp` of the way from following
+    // the chest (0) to the pose's own world orientation (1).
+    JPH::Quat dampedHeadTarget(JPH::QuatArg headPose, JPH::QuatArg torsoPose, JPH::QuatArg torsoNow, float damp);
+
     struct StanceContactPositionInput
     {
         JPH::RVec3 mAnchorPosition = JPH::RVec3::sZero();
@@ -334,6 +370,13 @@ namespace RagdollCore
         // longitudinal up axis, this distinguishes supine from prone.
         float mTorsoFacingUpDot = 0.0f;
         float mPelvisHeight = 0.0f;
+        // K2_UPRIGHT_NOT_FALLEN: the pelvis above the lower foot (units; < 0
+        // not given). An upright pelvis this far over its feet is not lying,
+        // whatever height the ground estimate gives it: contacts above the
+        // feet (a weapon, another fighter) raised the "ground" to the hips and
+        // a slowing, upright fighter was called Fallen (user bookmarks 11-16:
+        // "why did I fall there"; 15 such in one 7 minute session).
+        float mPelvisAboveFeet = -1.0f;
         JPH::Vec3 mCenterOfMassVelocity = JPH::Vec3::sZero();
         JPH::Vec3 mTargetHorizontalVelocity = JPH::Vec3::sZero();
         bool mRecoveryRequested = false;

@@ -3739,6 +3739,104 @@ registerRagdollTest('CORPSE-01 death clip does not drag the corpse', function()
     end
 end)
 
+-- CORPSE-03 (11-17, user: at the hand-off the ragdolls "are not doing a
+-- continuous motion", "it almost looks like it rotates 180 upon change"):
+-- CORPSE-01's deaths with the victims facing north, east, south and west
+-- (CORPSE-01's all face north, where a corpse frame that does not turn with
+-- the actor is right by chance). The engine's rows carry the result:
+-- RAGDOLL_DEATH_SWAP (the drawn root bone's move and turn over the swap's
+-- frame, body_off = the farthest a bone is drawn from its body on it) and
+-- RAGDOLL_DEATH_DRAWN body_off (the same over the first 4 s dead). With
+-- OPENMW_RAGDOLL_K2_CORPSE_FRAME=0 body_off grows with the facing (a body
+-- facing south is drawn turned half round); =1 it stays a few units.
+registerRagdollTest('CORPSE-03 a turned body goes limp where it is drawn', function()
+    local player = world.players[1]
+    for i = 1, 4 do
+        local yaw = (i - 1) * math.pi / 2
+        local victim = world.createObject(types.NPC.record(player).id)
+        victim:teleport(player.cell, testActorOrigin, { onGround = true, rotation = util.transform.rotateZ(yaw) })
+        coroutine.yield()
+        ragdoll.setPowered(victim, true)
+        waitFor('CORPSE-03 powered before death', function()
+            local state = ragdoll.getState(victim)
+            return state and state.powered and state.controller and state.controller.mode == 'standing'
+        end, 10)
+        ragdoll.triggerDeath(victim, {
+            hitPoint = victim.position + util.vector3(0, 0, 100),
+            direction = util.vector3(1, 0, 0.2),
+            damage = 25,
+        })
+        waitFor('CORPSE-03 corpse', function()
+            local state = ragdoll.getState(victim)
+            return state and not state.powered and types.Actor.isDead(victim)
+        end)
+        local until_ = core.getSimulationTime() + 4.5
+        waitFor('CORPSE-03 4.5 s dead', function() return core.getSimulationTime() >= until_ end, 10)
+        local state = ragdoll.getState(victim)
+        testing.expect(state ~= nil, 'CORPSE-03 corpse lost its ragdoll')
+        print(string.format('CORPSE-03 victim=%d yaw_deg=%.0f', i, math.deg(yaw)))
+        victim:remove()
+        coroutine.yield()
+    end
+end)
+
+-- CORPSE-02 (11-03 play: every corpse rebuilt on a cell load or saved game
+-- started standing, pelvis 76 units up, and fell again; then, laid flat, it
+-- landed ~68 units behind its spot on every load): a powered NPC is killed,
+-- left until its death clip is done, then sent to another cell and brought
+-- back to where it lies, three times. Prints each rebuilt corpse's root
+-- height over the floor and how far its root lies from where it lay before
+-- the first trip (OPENMW_RAGDOLL_CORPSE_LOAD_POSE=1: under 30 high, within
+-- 5 units).
+registerRagdollTest('CORPSE-02 corpse reloads lying', function()
+    local player = world.players[1]
+    local victim = world.createObject(types.NPC.record(player).id)
+    victim:teleport(player.cell, testActorOrigin, { onGround = true })
+    coroutine.yield()
+    ragdoll.setPowered(victim, true)
+    waitFor('CORPSE-02 powered before death', function()
+        local state = ragdoll.getState(victim)
+        return state and state.powered and state.controller and state.controller.mode == 'standing'
+    end, 10)
+    local floor = victim.position.z
+    ragdoll.triggerDeath(victim, { hitPoint = victim.position + util.vector3(0, 0, 100),
+        direction = util.vector3(1, 0, 0.2), damage = 25 })
+    waitFor('CORPSE-02 corpse', function()
+        local state = ragdoll.getState(victim)
+        return state and not state.powered and types.Actor.isDead(victim)
+    end)
+    local until_ = core.getSimulationTime() + 6
+    waitFor('CORPSE-02 6 s dead', function() return core.getSimulationTime() >= until_ end, 10)
+    local spot = ragdoll.getState(victim).bodies[1].position
+    for trip = 1, 3 do
+        local place = victim.position
+        victim:teleport('Balmora, Guild of Mages', util.vector3(0, 0, 0))
+        waitFor('CORPSE-02 ragdoll gone with the cell', function() return ragdoll.getState(victim) == nil end)
+        victim:teleport(player.cell, place)
+        local reloaded = waitFor('CORPSE-02 ragdoll rebuilt', function() return ragdoll.getState(victim) end)
+        local height = reloaded.bodies[1].position.z - floor
+        local lowest = height
+        local until2 = core.getSimulationTime() + 2
+        local root = reloaded.bodies[1].position
+        waitFor('CORPSE-02 2 s after the rebuild', function()
+            local state = ragdoll.getState(victim)
+            if state then
+                lowest = math.min(lowest, state.bodies[1].position.z - floor)
+                root = state.bodies[1].position
+            end
+            return core.getSimulationTime() >= until2
+        end, 5)
+        local off = math.sqrt((root.x - spot.x) ^ 2 + (root.y - spot.y) ^ 2)
+        print(string.format('CORPSE-02 trip=%d rebuilt_root_over_floor=%.1f lowest_2s=%.1f fell=%.1f from_spot_xy=%.1f',
+            trip, height, lowest, height - lowest, off))
+        testing.expect(height < 30, string.format('CORPSE-02 trip %d: corpse rebuilt standing (%.1f over the floor)',
+            trip, height))
+        testing.expect(off < 5, string.format('CORPSE-02 trip %d: corpse %.1f units from its spot', trip, off))
+    end
+    victim:remove()
+    coroutine.yield()
+end)
+
 registerRagdollTest('powered living ragdoll disables motors after a fall', function()
     local demo = interfaces.RagdollDev
     testing.expect(demo ~= nil, 'manual ragdoll development interface is not loaded')

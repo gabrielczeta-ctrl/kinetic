@@ -81,6 +81,9 @@ namespace RagdollCore
         {
             result.mOutcome = BodyContactOutcome::Stop;
             result.mDamageScale = flat ? 0.5f : 1.0f; // the flat bruises
+            // A square edge the armour stops bites into it and holds.
+            if (!flat && input.mKind == BlowKind::Edge && hardness > 0.0f)
+                result.mHoldTime = std::max(0.0f, finiteOr(s.mEdgeStick, 0.0f));
             return result;
         }
         const float over = result.mEnergy - result.mCutEnergy;
@@ -143,5 +146,93 @@ namespace RagdollCore
         }
         result.mOutcome = ClashOutcome::Bounce;
         return result;
+    }
+
+    ImpactHold pressImpact(BodyContactOutcome outcome, float hardness, float holdTime, ImpactHold before,
+        const BlowPressSettings& s)
+    {
+        if (!s.mOn)
+            return before;
+        switch (outcome)
+        {
+            case BodyContactOutcome::Glance:
+            case BodyContactOutcome::Cleave:
+                return {};
+            case BodyContactOutcome::Bite:
+                return {}; // presses on: the edge is in, the body is driven
+            case BodyContactOutcome::Stop:
+                // An edge stuck in armour sticks; a hard slot rebounds;
+                // flesh (or leather) takes the blow as a shove.
+                if (holdTime > 0.0f)
+                    return { holdTime, 0.0f };
+                if (finiteOr(hardness, 0.0f) >= s.mHardFrom)
+                    return before;
+                return {};
+        }
+        return before;
+    }
+
+    PushKick pushKick(const PushKickInput& in, const PushKickSettings& s)
+    {
+        const float foot = std::clamp(finiteOr(in.mFootSpeed, 0.0f) / 350.0f, 0.5f, 1.25f);
+        const float strengthRaw = std::max(0.0f, finiteOr(in.mStrength, 50.0f)) / 50.0f;
+        const float guard = in.mGuarded ? 0.8f : 1.0f;
+        PushKick out;
+        const float base = std::max(0.0f, finiteOr(in.mBaseSpeed, 240.0f));
+        const float leg = std::max(0.0f, finiteOr(in.mLegMass, 14.0f));
+        if (!s.mOn)
+        {
+            out.mSpeed = base * std::clamp(strengthRaw, 0.6f, 1.4f) * foot * guard;
+            out.mMass = leg;
+            return out;
+        }
+        const float strength = std::clamp(strengthRaw, 0.6f, std::max(0.6f, finiteOr(s.mStrengthCap, 4.0f)));
+        const float skill = std::clamp(finiteOr(in.mHandToHand, 0.0f) / 100.0f, 0.0f, 1.5f);
+        out.mSpeed = (base * strength * foot + std::max(0.0f, finiteOr(in.mKickerAlong, 0.0f))) * guard;
+        out.mMass = leg
+            + std::max(0.0f, finiteOr(in.mKickerMass, 75.0f))
+                * std::clamp(finiteOr(s.mBodyBase, 0.0f) + finiteOr(s.mBodySkill, 0.0f) * skill, 0.0f, 0.8f);
+        const float carryShare = std::max(0.0f, finiteOr(s.mCarry, 0.0f));
+        const float carryCap = std::max(0.0f, finiteOr(s.mCarryCap, 0.0f));
+        if (carryShare > 0.0f && carryCap > 0.0f)
+        {
+            const float victim = std::max(20.0f, finiteOr(in.mVictimMass, 75.0f));
+            out.mCarry = std::min(carryCap, carryShare * out.mSpeed * out.mMass / victim);
+            out.mRecoil = std::clamp(finiteOr(s.mRecoil, 0.0f), 0.0f, 1.0f) * out.mCarry * victim
+                / std::max(20.0f, finiteOr(in.mKickerMass, 75.0f));
+            const float fell = finiteOr(s.mFell, 0.0f);
+            out.mFells = fell > 0.0f && !in.mGuarded && out.mCarry >= fell;
+        }
+        return out;
+    }
+
+    float bodyCarryShare(AnatomicalRegion region)
+    {
+        switch (region)
+        {
+            case AnatomicalRegion::LeftFoot:
+            case AnatomicalRegion::RightFoot:
+                return 0.2f;
+            case AnatomicalRegion::LeftCalf:
+            case AnatomicalRegion::RightCalf:
+                return 0.4f;
+            case AnatomicalRegion::LeftThigh:
+            case AnatomicalRegion::RightThigh:
+                return 0.75f;
+            default:
+                return 1.0f;
+        }
+    }
+
+    float pressCarriedMass(float weaponMass, float bodyMass, float bodyAlong, float approach,
+        const BlowPressSettings& s)
+    {
+        const float weapon = std::max(0.0f, finiteOr(weaponMass, 0.0f));
+        if (!s.mOn || !(s.mBodyShare > 0.0f))
+            return weapon;
+        const float closing = std::max(1.0f, finiteOr(approach, 0.0f));
+        const float riding = std::clamp(finiteOr(bodyAlong, 0.0f) / closing, 0.0f, 1.0f);
+        const float mass = weapon + s.mBodyShare * std::max(0.0f, finiteOr(bodyMass, 0.0f)) * riding;
+        return std::min(std::max(weapon, finiteOr(s.mMassCap, weapon)), mass);
     }
 }

@@ -85,6 +85,15 @@ namespace MWMechanics
             world->getPhysicsSystem().requestRagdollAiRiposte(actor);
     }
 
+    void requestRagdollAiFightThrough(const MWWorld::Ptr& actor)
+    {
+        if (actor.isEmpty() || !actor.getClass().isActor())
+            return;
+        auto* world = dynamic_cast<MWWorld::World*>(static_cast<MWBase::World*>(MWBase::Environment::get().getWorld()));
+        if (world != nullptr)
+            world->getPhysicsSystem().requestRagdollAiFightThrough(actor);
+    }
+
     void requestRagdollAiGuard(const MWWorld::Ptr& actor, float seconds)
     {
         if (actor.isEmpty() || !actor.getClass().isActor())
@@ -1181,7 +1190,14 @@ namespace MWMechanics
             const float loss = fFatigueBlockBase + encumbrance * fFatigueBlockMult
                 + weapon.getClass().getWeight(weapon) * fWeaponFatigueBlockMult;
             MWMechanics::DynamicStat<float> fatigue = victimStats.getFatigue();
-            fatigue.setCurrent(fatigue.getCurrent() - loss, true);
+            // K2_BLOCK_NO_KNOCKOUT (registry): a parry can exhaust its blocker
+            // but never knocks it out (user 11-07: "I've fallen from getting
+            // parried from a dagger"); vanilla's shield block let it go below 0.
+            static const auto blockFloor_tuned = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_BLOCK_NO_KNOCKOUT");
+                return text && std::atoi(text) != 0;
+            });
+            fatigue.setCurrent(fatigue.getCurrent() - loss, !blockFloor_tuned.get());
             victimStats.setFatigue(fatigue);
         }
         if ((result.mBlocked && !(blockedShare > 0.0f)) || (victim == getPlayer() && world->getGodModeState()))
@@ -1210,7 +1226,7 @@ namespace MWMechanics
     std::optional<PhysicalWeaponDamageResult> applyPhysicalHandStrike(const MWWorld::Ptr& attacker,
         const MWWorld::Ptr& victim, const osg::Vec3f& hitPosition, float approachSpeed, float damageScale,
         RagdollCore::PhysicalDefenseOutcome defenseOutcome, float regionScale, std::uint64_t physicalHitId,
-        PhysicalBlowShare share)
+        PhysicalBlowShare share, float strengthFloor)
     {
         if (attacker.isEmpty() || victim.isEmpty() || attacker == victim || !attacker.getClass().isActor()
             || !victim.getClass().isActor() || !hitPosition.valid() || !std::isfinite(approachSpeed)
@@ -1227,7 +1243,10 @@ namespace MWMechanics
             = RagdollCore::swingQualityProfile(0.0f, fullSwingReferenceSpeed());
         if (approachSpeed < swing.mMinimumSpeed)
             return std::nullopt;
-        const float quality = curvedQuality(RagdollCore::swingQuality(approachSpeed, swing));
+        // K2_FIST_CHARGE: a charged punch's charge is the strength too (the
+        // held button is Morrowind's own attack strength).
+        const float quality = std::max(curvedQuality(RagdollCore::swingQuality(approachSpeed, swing)),
+            std::isfinite(strengthFloor) ? std::clamp(strengthFloor, 0.0f, 1.0f) : 0.0f);
         const float bonus = RagdollCore::fullSwingBonus(approachSpeed, swing);
         float damage = 0.0f;
         bool healthdmg = false;

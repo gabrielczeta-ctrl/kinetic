@@ -1,4 +1,4 @@
-KINETIC TECH-DEMO RELEASE 0.1 - physical combat for Morrowind
+KINETIC TECH-DEMO RELEASE 0.2 - physical combat for Morrowind
 =============================================================
 
 Bodies and weapons are physical: you swing the weapon with the mouse, blows
@@ -25,12 +25,24 @@ Start
 
 Controls
 - Left click: attack (a full physical swing). Hold the left button and move
-  the mouse: steer the weapon; a fast stroke is a committed swing.
-- Middle button: thrust.
-- Right button: guard. Two quick right clicks: shove (more clicks, more push).
+  the mouse: the swing winds up from the way you moved and steers the
+  weapon; a fast stroke is a committed swing. While the button is held the
+  mouse never turns the view. Keep holding and drag away again to chain the
+  next cut at once (chop, hack, slash).
+- Moving into a cut winds it up faster and puts your weight behind it: a
+  running or jumping blow pushes harder and cuts deeper.
+- Spear and staff: hold the button and the point comes forward, the mouse
+  moving it; a click thrusts on the spot; drag for the haft's sweeps and
+  chops. A staff handles like a spear, with its own damage and blunt blows.
+- Right button: hold = guard (the block steers to meet the blade), tap =
+  parry (a short flick picks its side), double click = shove.
 - Combos: a cut that winds up where the last one ended comes faster and
-  cheaper; a click right after a parry you won is a quick riposte; bare fists
-  go jab, cross, jab.
+  cheaper; a click right after a parry you won is a quick riposte. Daggers
+  thrust almost as fast as you can click.
+- Bare fists: left button = right fist, right button = left fist. Click to
+  jab at the crosshair (low for the body); hold, wind up and stroke the
+  mouse fast the other way for a hook, uppercut, overhand or cross. Both
+  buttons guard; bare-handed, a palm knocks an incoming weapon aside.
 - The brass diamond at the centre is your aim; its bar refills when you can
   attack again.
 - Your weapon skill, Strength, Agility and fatigue decide how steady the blade
@@ -51,10 +63,17 @@ Options
   options page wins over that file; an environment variable wins over both.
 
 Known limits
+- Weapon handling is about 90% complete.
+- Bare fists need more work.
+- Rolls are not ready: their animations are unfinished.
+- Movement can still go wrong now and then, most of all walking up or down
+  stairs diagonally.
 - Skeletons, dremora, golden saints and liches get the KINETIC body and
   fight like NPCs (new, experimental); other creatures are still animated.
 - Swimming falls back to vanilla; it becomes physical again on land.
-- Fists: clicks throw Morrowind's punches with either hand; a mouse drag
-  steers the right fist only.
+- New in 0.2 and still being tuned: bare fists (the newest part), stab and
+  pin, the staff handled as a spear, no lockout after clashes, blades that
+  press into bodies instead of bouncing. Each has a switch in
+  ragdoll\ragdoll.cfg (see the release notes).
 
 Licences: LICENSE.txt (GPL-3.0), THIRD-PARTY-NOTICES.txt. Source: SOURCE.txt.

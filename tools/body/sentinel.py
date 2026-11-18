@@ -198,9 +198,13 @@ def run_stage(out, suite, patterns, envs):
            '--engine-source', head + '-dirty', '--output', str(out), '--suite', suite,
            '--test-filter', ' || '.join(patterns), '--parallel', '4', '--suite-timeout', '900',
            '--diagnostic-budget-mib', '1200']
-    # RAGDOLL_TEST_RENDER_FPS: 30, 60 (default) or 120 rendered frames a second.
+    # RAGDOLL_TEST_RENDER_FPS: 30, 45, 50, 60 (default) or 120 rendered frames a second.
     if os.environ.get('RAGDOLL_TEST_RENDER_FPS'):
         cmd += ['--render-fps', os.environ['RAGDOLL_TEST_RENDER_FPS']]
+    # RAGDOLL_TEST_RECORD=1: record the player's ticks and body poses into
+    # <out>/manual-recording like a played session (play_metrics.py reads them).
+    if os.environ.get('RAGDOLL_TEST_RECORD') == '1':
+        cmd += ['--manual-recording']
     for e in env:
         cmd += ['--env', e]
     prov = ledger.provenance(env, engine)  # before the run can see later edits
@@ -395,8 +399,10 @@ CHECKS = {'walk': walk_checks, 'balance': balance_checks, 'combat': combat_check
 
 
 def play_envs():
-    """The play launcher's switches (its "set OPENMW_..." lines, minus file paths)."""
-    play = []
+    """The game's switches: the engine's built-in play defaults (on; the
+    player stays unpowered, as the scripts power it) plus the play launcher's
+    remaining "set OPENMW_..." lines (traces), minus file paths."""
+    play = ['OPENMW_RAGDOLL_PLAY_DEFAULTS=1', 'OPENMW_RAGDOLL_POWER_PLAYER=0']
     for line in (ROOT / 'Run-Game-MotionBricks.cmd').read_text(errors='replace').splitlines():
         m = re.match(r'^set "?(OPENMW_[A-Z0-9_]+)=([^"]*)"?\s*$', line.strip())
         if m and '%~dp0' not in m.group(2):

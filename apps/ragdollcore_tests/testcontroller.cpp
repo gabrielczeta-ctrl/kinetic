@@ -1,5 +1,7 @@
+#include <ragdollcore/contact.hpp>
 #include <ragdollcore/controller.hpp>
 #include <ragdollcore/gaitcontroller.hpp>
+#include <ragdollcore/roottarget.hpp>
 #include <ragdollcore/unitmodel.hpp>
 
 #include <gtest/gtest.h>
@@ -562,6 +564,93 @@ namespace
         EXPECT_FLOAT_EQ(blended->mContactForces[1].mForce.GetZ(), 4.0f);
     }
 
+    TEST(RagdollCoreUprightControllerTest, heldBodyTakesTheAnimationRoute)
+    {
+        EXPECT_TRUE(RagdollCore::animationRouteHasControl(true, false));
+        EXPECT_TRUE(RagdollCore::animationRouteHasControl(false, true));
+        EXPECT_FALSE(RagdollCore::animationRouteHasControl(false, false));
+    }
+
+    TEST(RagdollCoreUprightControllerTest, balanceRiskFollowsTheTipAndTheMode)
+    {
+        using RagdollCore::ActiveControllerMode;
+        EXPECT_FLOAT_EQ(RagdollCore::balanceRisk(0.25f, ActiveControllerMode::Standing), 0.0f);
+        EXPECT_FLOAT_EQ(RagdollCore::balanceRisk(0.9f, ActiveControllerMode::Standing), 1.0f);
+        EXPECT_GE(RagdollCore::balanceRisk(0.0f, ActiveControllerMode::Stumbling), 0.75f);
+        EXPECT_FLOAT_EQ(RagdollCore::balanceRisk(0.0f, ActiveControllerMode::Falling), 1.0f);
+    }
+
+    TEST(RagdollCoreUprightControllerTest, balanceSigilPlacesTheStanceInTheActorsFrame)
+    {
+        // Facing world +X: the actor's right is world -Y. Feet 20 u apart,
+        // the weight a quarter of the way from the middle to the right foot.
+        const JPH::RVec3 left(100.0, 10.0, 0.0), right(100.0, -10.0, 0.0);
+        const auto sigil = RagdollCore::balanceSigil(left, right, JPH::RVec3(104.0, -5.0, 60.0),
+            JPH::Vec3(12.0f, -30.0f, 0.0f), JPH::Vec3(1.0f, 0.0f, 0.0f), true, true);
+        ASSERT_TRUE(sigil.mKnown);
+        EXPECT_NEAR(sigil.mLeftRight, -10.0f, 1e-3f);
+        EXPECT_NEAR(sigil.mRightRight, 10.0f, 1e-3f);
+        EXPECT_NEAR(sigil.mComRight, 5.0f, 1e-3f);
+        EXPECT_NEAR(sigil.mComForward, 4.0f, 1e-3f);
+        EXPECT_NEAR(sigil.mTipRight, 30.0f, 1e-3f);
+        EXPECT_NEAR(sigil.mTipForward, 12.0f, 1e-3f);
+        EXPECT_NEAR(sigil.mRightLoad, 0.75f, 1e-3f);
+        EXPECT_NEAR(sigil.mLeftLoad, 0.25f, 1e-3f);
+        EXPECT_NEAR(sigil.mEdge, 55.0f, 1e-3f);
+
+        // A lifted foot carries nothing; no foot down, nothing is carried.
+        const auto oneFoot = RagdollCore::balanceSigil(left, right, JPH::RVec3(104.0, -5.0, 60.0),
+            JPH::Vec3::sZero(), JPH::Vec3(1.0f, 0.0f, 0.0f), false, true);
+        EXPECT_FLOAT_EQ(oneFoot.mLeftLoad, 0.0f);
+        EXPECT_FLOAT_EQ(oneFoot.mRightLoad, 1.0f);
+        const auto air = RagdollCore::balanceSigil(left, right, JPH::RVec3(104.0, -5.0, 60.0),
+            JPH::Vec3::sZero(), JPH::Vec3(1.0f, 0.0f, 0.0f), false, false);
+        EXPECT_FLOAT_EQ(air.mLeftLoad + air.mRightLoad, 0.0f);
+        // No facing: nothing to draw.
+        EXPECT_FALSE(RagdollCore::balanceSigil(left, right, left, JPH::Vec3::sZero(), JPH::Vec3::sZero(), true, true).mKnown);
+    }
+
+    TEST(RagdollCoreUprightControllerTest, dampedHeadTargetBlendsFollowingAndWorld)
+    {
+        const JPH::Quat head = JPH::Quat::sRotation(JPH::Vec3::sAxisZ(), 0.3f);
+        const JPH::Quat torsoPose = JPH::Quat::sIdentity();
+        const JPH::Quat torsoNow = JPH::Quat::sRotation(JPH::Vec3::sAxisX(), 0.4f);
+        const JPH::Quat following = (torsoNow * torsoPose.Conjugated() * head).Normalized();
+        EXPECT_TRUE(RagdollCore::dampedHeadTarget(head, torsoPose, torsoNow, 0.0f).IsClose(following, 1e-5f));
+        EXPECT_TRUE(RagdollCore::dampedHeadTarget(head, torsoPose, torsoNow, 1.0f).IsClose(head, 1e-5f));
+        const JPH::Quat half = RagdollCore::dampedHeadTarget(head, torsoPose, torsoNow, 0.5f);
+        EXPECT_NEAR(half.GetRotationAngle(JPH::Vec3::sAxisX()), 0.5f * following.GetRotationAngle(JPH::Vec3::sAxisX()), 0.1f);
+    }
+
+    TEST(RagdollCoreRootTargetTest, armStepPullsALateClipOntoTheLegs)
+    {
+        const float cycle = 0.8f, duty = 0.3f, dt = 1.0f / 60.0f;
+        const auto run = [&](float late) {
+            RagdollCore::ArmStepState state;
+            float clock = 0.0f, loop = 0.0f;
+            for (int i = 0; i < 240; ++i)
+            {
+                clock = std::fmod(clock + dt / cycle, 1.0f);
+                const float ahead = std::cos(2.0f * 3.14159265f * (clock - (1.0f - duty) - late));
+                loop = RagdollCore::stepArmStep(state, ahead, cycle, clock, duty, 0.5f, dt);
+            }
+            EXPECT_GT(state.mEvents, 4u);
+            return loop;
+        };
+        EXPECT_NEAR(run(0.0f), cycle, 0.03f);
+        EXPECT_LT(run(0.1f), cycle); // late: a shorter loop
+        EXPECT_GT(run(-0.1f), cycle);
+        RagdollCore::ArmStepState idle;
+        EXPECT_FLOAT_EQ(RagdollCore::stepArmStep(idle, 1.0f, 0.0f, 0.0f, 0.3f, 0.5f, dt), 0.0f);
+    }
+
+    TEST(RagdollCoreRootTargetTest, anNpcRampsFromAStop)
+    {
+        EXPECT_FLOAT_EQ(RagdollCore::npcStartSpeed(100.0f, 200.0f, false, 700.0f, 0.1f), 0.0f);
+        EXPECT_FLOAT_EQ(RagdollCore::npcStartSpeed(0.0f, 200.0f, true, 700.0f, 0.1f), 70.0f);
+        EXPECT_FLOAT_EQ(RagdollCore::npcStartSpeed(190.0f, 200.0f, true, 700.0f, 0.1f), 200.0f);
+    }
+
     TEST(RagdollCoreUprightControllerTest, animationAssistReleasesForHitsAndFalls)
     {
         using RagdollCore::ActiveControllerMode;
@@ -1085,6 +1174,31 @@ namespace
             EXPECT_EQ(controller.getOutput().mMode, before.mMode);
             EXPECT_FLOAT_EQ(controller.getOutput().mTimeInMode, before.mTimeInMode);
         }
+    }
+
+    // K2_UPRIGHT_NOT_FALLEN: a "ground" read at the hips does not make an
+    // upright body on its feet a fallen one.
+    TEST(RagdollCoreControllerTest, anUprightBodyOverItsFeetIsNotFallen)
+    {
+        RagdollCore::ActiveControllerProfile profile;
+        profile.mLocomotionRoute = RagdollCore::LocomotionRoute::KinematicRoot;
+        profile.mMinimumStateDuration = 0;
+        const auto modeWith = [&](float aboveFeet, float upDot) {
+            RagdollCore::ActiveRagdollController controller;
+            RagdollCore::ActiveControllerInput input;
+            input.mSupport = supported(10);
+            input.mPelvisHeight = 10; // the ground estimate put the floor at the hips
+            input.mPelvisUpDot = upDot;
+            input.mPelvisAboveFeet = aboveFeet;
+            RagdollCore::ActiveControllerOutput output;
+            EXPECT_TRUE(controller.step(input, 1.0f / 60.0f, profile, output));
+            return output.mMode;
+        };
+        const float bracingUp = (profile.mStandingMinimumUpDot + profile.mBracingMinimumUpDot) / 2;
+        EXPECT_EQ(modeWith(-1.0f, bracingUp), RagdollCore::ActiveControllerMode::Fallen); // not given: as before
+        EXPECT_NE(modeWith(60.0f, bracingUp), RagdollCore::ActiveControllerMode::Fallen);
+        EXPECT_EQ(modeWith(12.0f, bracingUp), RagdollCore::ActiveControllerMode::Fallen); // sitting on the floor
+        EXPECT_EQ(modeWith(60.0f, profile.mBracingMinimumUpDot - 0.2f), RagdollCore::ActiveControllerMode::Fallen);
     }
 
     TEST(RagdollCoreControllerTest, ownedRootVerticalReferenceDoesNotReplaceRawSettlingSpeed)
@@ -1807,6 +1921,33 @@ namespace
         controller.reset(ActiveControllerMode::BlendBack);
         ASSERT_TRUE(controller.step(input, 0.1f, profile, output));
         EXPECT_EQ(output.mMode, ActiveControllerMode::BlendBack);
+    }
+
+    // K2_HELD_NOT_GROUND: a blade pressed on a blade has a floor's normal. As
+    // ground it lifts the ground's centre over the pelvis (pelvis 76 u up,
+    // the contacts 105-116 u up, 11-16 play), which the Fallen test reads as
+    // a pelvis on the floor.
+    TEST(RagdollCoreSupportTest, heldItemContactsAreNotGround)
+    {
+        EXPECT_TRUE(RagdollCore::countsAsGroundContact(false, false, true));
+        EXPECT_FALSE(RagdollCore::countsAsGroundContact(true, false, true));
+        EXPECT_FALSE(RagdollCore::countsAsGroundContact(false, true, true));
+        EXPECT_TRUE(RagdollCore::countsAsGroundContact(true, true, false));
+
+        const float pelvis = 76.0f;
+        // Body 3 is the weapon; the feet (1, 2) carry no load this step.
+        std::vector<RagdollCore::GroundContact> contacts{ { 3, JPH::RVec3(20, 30, 105) }, { 3, JPH::RVec3(24, 30, 116) } };
+        const auto withBlade = RagdollCore::estimateFootSupport(JPH::RVec3(0, 0, 80), contacts, { 1, 2 }, {});
+        ASSERT_TRUE(withBlade);
+        EXPECT_TRUE(withBlade->hasGroundContact());
+        EXPECT_GT(static_cast<float>(withBlade->mGroundCenter.GetZ()), pelvis);
+
+        std::erase_if(contacts, [](const RagdollCore::GroundContact& contact) {
+            return !RagdollCore::countsAsGroundContact(contact.mBodyIndex == 3, false, true);
+        });
+        const auto without = RagdollCore::estimateFootSupport(JPH::RVec3(0, 0, 80), contacts, { 1, 2 }, {});
+        ASSERT_TRUE(without);
+        EXPECT_FALSE(without->hasGroundContact());
     }
 
 }

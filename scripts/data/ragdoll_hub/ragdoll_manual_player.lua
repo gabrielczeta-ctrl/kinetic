@@ -65,28 +65,111 @@ local function dispatch(action, index)
     close()
     core.sendGlobalEvent('manualHubAction', { action = action, index = index })
 end
-local function open()
-    if menu then close(); return end
-    if I.UI.getMode() ~= nil then return end
-    local buttons = {
-        { template = I.MWUI.templates.textHeader, props = { text = 'Manual test circuit' } },
+-- The duel builder (duel hub only): each row cycles its setting on click,
+-- "<" steps back; Start duel stages it (manual_hub.lua, case "Duel").
+local duel = require('manual_hub_duel')
+local hubConfig = require('manual_hub_config')
+local selection = duel.defaults()
+if hubConfig.duel then selection = duel.parse(hubConfig.duel) end
+local showPresets = hubConfig.only ~= 'duel'
+local open
+local function cycle(value, count, step, first)
+    first = first or 1
+    return (value - first + step) % (count - first + 1) + first
+end
+local function cycleKey(list, key, step)
+    for i, k in ipairs(list) do
+        if k == key then return list[cycle(i, #list, step)] end
+    end
+    return list[1]
+end
+local function refresh()
+    if menu then menu:destroy(); menu = nil end
+    open(true)
+end
+local function duelRows()
+    local s = selection
+    local function settings()
+        local foe = duel.opponents[s.opponent]
+        local foeWeapon = s.foeWeapon == 0 and 'same as yours' or duel.weapons[s.foeWeapon].label
+        return {
+            { 'Opponent: ' .. foe.label, function(step) s.opponent = cycle(s.opponent, #duel.opponents, step) end },
+            { 'Opponent skill: ' .. (s.foeTier == 'own' and 'own (the game record)' or duel.tiers[s.foeTier].label),
+              function(step) s.foeTier = cycleKey(duel.foeTiers, s.foeTier, step) end },
+            { 'Your skill: ' .. duel.tiers[s.playerTier].label,
+              function(step) s.playerTier = cycleKey(duel.playerTiers, s.playerTier, step) end },
+            { 'Weapon: ' .. duel.weapons[s.weapon].label, function(step) s.weapon = cycle(s.weapon, #duel.weapons, step) end },
+            { 'Opponent weapon: ' .. foeWeapon,
+              function(step) s.foeWeapon = cycle(s.foeWeapon, #duel.weapons, step, 0) end },
+            { 'Material: ' .. duel.materials[s.material],
+              function(step) s.material = cycle(s.material, #duel.materials, step) end },
+            { 'Shield: ' .. duel.shields[s.shield].label .. ' (not with two-handers)',
+              function(step) s.shield = cycle(s.shield, #duel.shields, step) end },
+            { 'Armor: ' .. duel.armors[s.armor].label, function(step) s.armor = cycle(s.armor, #duel.armors, step) end },
+            { 'Health: ' .. duel.healths[s.health].label,
+              function(step) s.health = cycle(s.health, #duel.healths, step) end },
+        }, foe.about
+    end
+    local rows, about = settings()
+    local content = {
+        { template = I.MWUI.templates.textHeader, props = { text = 'Duel: pick your opponent and the weapons' } },
         { template = I.MWUI.templates.textParagraph, props = { size = util.vector2(570, 0),
-            text = 'One cell, repeating observations. Pausing stops automatic advance; you can keep playing. '
-                .. 'These are development checks, not passed tests. Quick-click uses the native attack; hold then drag aims the physical weapon. Enchantments remain deferred.' } },
+            text = 'Click a line to change it, < to step back. Both sides get the weapon in the chosen material '
+                .. '(steel where that material has none). A skill tier puts its best weapon skill on the weapon in hand. '
+                .. 'Below max your hit roll is on, as for the dungeon characters.\n'
+                .. about } },
     }
-    for _, entry in ipairs({ { 'Next (F6)', 'next' }, { 'Repeat / reset (F7)', 'repeat' },
-        { 'Pause / resume advance (F9)', 'pause' }, { 'Scenario action (F10)', 'action' } }) do
+    for _, row in ipairs(rows) do
+        local change = row[2]
+        content[#content + 1] = { type = ui.TYPE.Flex, props = { horizontal = true }, content = ui.content {
+            newButton { text = '<', minimumSize = util.vector2(30, 22),
+                callback = function() change(-1); refresh() end },
+            newButton { text = row[1], minimumSize = util.vector2(540, 22),
+                callback = function() change(1); refresh() end },
+        } }
+    end
+    content[#content + 1] = newButton { text = 'START DUEL (then F10 to fight)', minimumSize = util.vector2(570, 26),
+        callback = function()
+            close()
+            core.sendGlobalEvent('manualHubAction', { action = 'duel', duel = selection })
+        end }
+    return content, rows
+end
+open = function(rebuild)
+    if menu and not rebuild then close(); return end
+    if not rebuild and I.UI.getMode() ~= nil then return end
+    local buttons, controls
+    if hubConfig.only == 'duel' then
+        buttons = duelRows()
+        controls = { { 'Restage this duel (F7)', 'repeat' }, { 'Start the fight (F10)', 'action' } }
+    else
+        buttons = {
+            { template = I.MWUI.templates.textHeader, props = { text = 'Manual test circuit' } },
+            { template = I.MWUI.templates.textParagraph, props = { size = util.vector2(570, 0),
+                text = 'One cell, repeating observations. Pausing stops automatic advance; you can keep playing. '
+                    .. 'These are development checks, not passed tests. Quick-click uses the native attack; hold then drag aims the physical weapon. Enchantments remain deferred.' } },
+        }
+        controls = { { 'Next (F6)', 'next' }, { 'Repeat / reset (F7)', 'repeat' },
+            { 'Pause / resume advance (F9)', 'pause' }, { 'Scenario action (F10)', 'action' } }
+    end
+    for _, entry in ipairs(controls) do
         local action = entry[2]
         buttons[#buttons + 1] = newButton { text = entry[1], minimumSize = util.vector2(570, 22),
             callback = function() dispatch(action) end }
     end
-    for index, c in ipairs(cases) do
-        local selected = index
-        buttons[#buttons + 1] = newButton { text = string.format('%02d  %s', index, c.title),
-            minimumSize = util.vector2(570, 22), callback = function() dispatch('jump', selected) end }
+    if hubConfig.only == 'duel' then
+        buttons[#buttons + 1] = newButton { text = showPresets and 'Hide the preset duels' or 'Show the preset duels',
+            minimumSize = util.vector2(570, 22), callback = function() showPresets = not showPresets; refresh() end }
+    end
+    if showPresets then
+        for index, c in ipairs(cases) do
+            local selected = index
+            buttons[#buttons + 1] = newButton { text = string.format('%02d  %s', index, c.title),
+                minimumSize = util.vector2(570, 22), callback = function() dispatch('jump', selected) end }
+        end
     end
     buttons[#buttons + 1] = newButton { text = 'Close (F8)', minimumSize = util.vector2(570, 22), callback = close }
-    I.UI.addMode('Interface', { windows = {} })
+    if not rebuild then I.UI.addMode('Interface', { windows = {} }) end
     menu = ui.create { layer = 'Windows', template = I.MWUI.templates.boxSolid,
         props = { position = util.vector2(math.max(10, (ui.screenSize().x - 600) / 2), 10) },
         content = ui.content { { template = I.MWUI.templates.padding,
@@ -254,8 +337,30 @@ script.eventHandlers.manualHubAim = function(data)
     reticle.feed(data)
 end
 local baseFrame = script.engineHandlers.onFrame
+-- Self-check of a launcher duel (-Duel with -CheckCircuits): build the duel
+-- menu once, step every setting forward and back, and close it.
+local menuChecked, menuCheckAt = hubConfig.only ~= 'duel' or not hubConfig.checkCircuits, nil
 script.engineHandlers.onFrame = function(dt)
     if baseFrame then baseFrame(dt) end
+    if not menuChecked then
+        menuCheckAt = menuCheckAt or core.getRealTime() + 4
+        if core.getRealTime() >= menuCheckAt and I.UI.getMode() == nil then
+            menuChecked = true
+            local saved = {}
+            for k, v in pairs(selection) do saved[k] = v end
+            open()
+            for _, step in ipairs({ 1, -1 }) do
+                for _ = 1, 12 do
+                    local _, rows = duelRows()
+                    for _, row in ipairs(rows) do row[2](step) end
+                    refresh()
+                end
+            end
+            for k, v in pairs(saved) do selection[k] = v end
+            close()
+            print('PLAY05_HUB DUEL menu built: ' .. duel.describe(selection))
+        end
+    end
     if not aim.ring then
         aim.ring = aimElement('textures/ragdoll_aim_ring.png', 36, util.color.rgb(1, 1, 1))
         aim.dot = aimElement('textures/ragdoll_aim_dot.png', 12, util.color.rgb(1, 0.55, 0.15))

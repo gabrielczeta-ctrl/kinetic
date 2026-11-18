@@ -12,7 +12,9 @@ set(RAGDOLLCORE_SOURCES
     src/blow.cpp
     src/bodylease.cpp
     src/contactoutcome.cpp
+    src/lodge.cpp
     src/reactioncontroller.cpp
+    src/armstrain.cpp
     src/builder.cpp
     src/combatstate.cpp
     src/contact.cpp
@@ -39,14 +41,44 @@ set(RAGDOLLCORE_SOURCES
     src/scenario.cpp
     src/situation.cpp
     src/staggerplan.cpp
+    src/armsim.cpp
+    src/cutwheel.cpp
+    src/haftfit.cpp
+    src/fistcontrol.cpp
+    src/fiststeer.cpp
+    src/palmparry.cpp
+    src/npcshove.cpp
+    src/handdrive.cpp
+    src/npcpopulation.cpp
+    src/pathcount.cpp
+    src/pipeline.cpp
+    src/droproll.cpp
+    src/fallprotectpose.cpp
+    src/lifecycle.cpp
+    src/calmhold.cpp
+    src/roothold.cpp
+    src/rootstrength.cpp
+    src/roottarget.cpp
+    src/uprightholder.cpp
+    src/playdefaults.cpp
     src/steparbiter.cpp
+    src/stride.cpp
+    src/stepplanner.cpp
+    src/runtimeprofile.cpp
+    src/stridesim.cpp
+    src/strideswing.cpp
     src/swingtrajectory.cpp
+    src/switchregistry.cpp
     src/tuning.cpp
     src/supportgrip.cpp
     src/strikecooldown.cpp
     src/weaponcontact.cpp
     src/weaponalignment.cpp
     src/weaponswing.cpp
+    src/wheelaim.cpp
+    src/wheeloutput.cpp
+    src/wheelplanner.cpp
+    src/woundheal.cpp
 )
 
 set(RAGDOLLCORE_HEADERS
@@ -66,7 +98,9 @@ set(RAGDOLLCORE_HEADERS
     include/ragdollcore/blow.hpp
     include/ragdollcore/bodylease.hpp
     include/ragdollcore/contactoutcome.hpp
+    include/ragdollcore/lodge.hpp
     include/ragdollcore/reactioncontroller.hpp
+    include/ragdollcore/armstrain.hpp
     include/ragdollcore/builder.hpp
     include/ragdollcore/combatstate.hpp
     include/ragdollcore/contact.hpp
@@ -97,15 +131,44 @@ set(RAGDOLLCORE_HEADERS
     include/ragdollcore/scenario.hpp
     include/ragdollcore/situation.hpp
     include/ragdollcore/staggerplan.hpp
+    include/ragdollcore/armsim.hpp
+    include/ragdollcore/cutwheel.hpp
+    include/ragdollcore/fistcontrol.hpp
+    include/ragdollcore/fiststeer.hpp
+    include/ragdollcore/palmparry.hpp
+    include/ragdollcore/npcshove.hpp
+    include/ragdollcore/handdrive.hpp
+    include/ragdollcore/npcpopulation.hpp
+    include/ragdollcore/pathcount.hpp
+    include/ragdollcore/pipeline.hpp
+    include/ragdollcore/droproll.hpp
+    include/ragdollcore/fallprotectpose.hpp
+    include/ragdollcore/lifecycle.hpp
+    include/ragdollcore/calmhold.hpp
+    include/ragdollcore/roothold.hpp
+    include/ragdollcore/rootstrength.hpp
+    include/ragdollcore/roottarget.hpp
+    include/ragdollcore/uprightholder.hpp
+    include/ragdollcore/playdefaults.hpp
     include/ragdollcore/steparbiter.hpp
+    include/ragdollcore/stride.hpp
+    include/ragdollcore/stepplanner.hpp
+    include/ragdollcore/runtimeprofile.hpp
+    include/ragdollcore/stridesim.hpp
+    include/ragdollcore/strideswing.hpp
     include/ragdollcore/swingtrajectory.hpp
+    include/ragdollcore/switchregistry.hpp
     include/ragdollcore/supportgrip.hpp
     include/ragdollcore/strikecooldown.hpp
     include/ragdollcore/unitmodel.hpp
     include/ragdollcore/weaponcontact.hpp
     include/ragdollcore/weaponalignment.hpp
     include/ragdollcore/wound.hpp
+    include/ragdollcore/woundheal.hpp
     include/ragdollcore/weaponswing.hpp
+    include/ragdollcore/wheelaim.hpp
+    include/ragdollcore/wheeloutput.hpp
+    include/ragdollcore/wheelplanner.hpp
 )
 
 # Keep the controller boundary enforceable even when a developer accidentally

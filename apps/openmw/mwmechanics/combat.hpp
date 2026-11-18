@@ -68,6 +68,9 @@ namespace MWMechanics
     void requestRagdollAiGuard(const MWWorld::Ptr& actor, float seconds);
     // AI-02 item 5: the AI answers its won parry now (the wheel winds up short).
     void requestRagdollAiRiposte(const MWWorld::Ptr& actor);
+    // K2_AI_STAGGER_CUT: the AI swings through a stagger; for 0.5 s the
+    // reaction's hold on its weapon arm does not stop a new attack.
+    void requestRagdollAiFightThrough(const MWWorld::Ptr& actor);
 
     bool applyOnStrikeEnchantment(const MWWorld::Ptr& attacker, const MWWorld::Ptr& victim, const MWWorld::Ptr& object,
         const osg::Vec3f& hitPosition, const bool fromProjectile = false);
@@ -197,7 +200,7 @@ namespace MWMechanics
     std::optional<PhysicalWeaponDamageResult> applyPhysicalHandStrike(const MWWorld::Ptr& attacker,
         const MWWorld::Ptr& victim, const osg::Vec3f& hitPosition, float approachSpeed, float damageScale,
         RagdollCore::PhysicalDefenseOutcome defenseOutcome, float regionScale = 1.0f,
-        std::uint64_t physicalHitId = 0, PhysicalBlowShare share = {});
+        std::uint64_t physicalHitId = 0, PhysicalBlowShare share = {}, float strengthFloor = 0.0f);
 
     // Pure relationship query used before a physical contact is promoted to
     // combat. Unlike friendlyHit, this does not increment forgiveness state,

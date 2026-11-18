@@ -72,6 +72,32 @@ namespace
         EXPECT_NEAR(computeActiveBodyWrench(settings, input).mNetForce.GetZ(), 50.0f * 686.0f, 1.0f);
     }
 
+    TEST(RagdollCoreActiveBody, theFieldPullsEveryPartButAGroundedFootByMass)
+    {
+        ActiveBodySettings settings;
+        settings.mGroundRouting = 0.0f;
+        settings.mGroundRoutingHorizontal = 0.0f;
+        ActiveBodyInput input = standingBody();
+        input.mParts[3].mGrounded = false; // the swing foot
+        input.mTargetPosition = JPH::Vec3(2.0f, 0.0f, 0.0f);
+        const ActiveBodyOutput hips = computeActiveBodyWrench(settings, input);
+        input.mFieldShare = 1.0f;
+        const ActiveBodyOutput field = computeActiveBodyWrench(settings, input);
+        ASSERT_TRUE(hips.mValid && field.mValid);
+        // Off: the upper parts carry it all, the swing foot is towed.
+        EXPECT_NEAR(hips.mForces[3].GetX(), 0.0f, 1e-3f);
+        // On: the same net pull, each free part by its mass; the planted foot
+        // gets none.
+        EXPECT_NEAR(field.mNetForce.GetX(), hips.mNetForce.GetX(), 1e-2f * std::abs(hips.mNetForce.GetX()));
+        const float perMass = field.mForces[0].GetX() / 10.0f;
+        EXPECT_GT(perMass, 0.0f);
+        EXPECT_NEAR(field.mForces[1].GetX() / 40.0f, perMass, 1e-3f * perMass);
+        EXPECT_NEAR(field.mForces[3].GetX() / 12.5f, perMass, 1e-3f * perMass);
+        EXPECT_NEAR(field.mForces[2].GetX(), 0.0f, 1e-3f);
+        // The weight is still the upper parts'.
+        EXPECT_NEAR(field.mNetForce.GetZ(), hips.mNetForce.GetZ(), 1.0f);
+    }
+
     TEST(RagdollCoreActiveBody, horizontalPullIsCappedInG)
     {
         ActiveBodySettings settings;

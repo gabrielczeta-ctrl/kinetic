@@ -19,10 +19,12 @@ local function update()
     local hsc = ps.hsc
     if hsc then
         hud = { stage = hsc.stage, x = hsc.stanceX, y = hsc.stanceY, angle = hsc.angle, line = hsc.line,
-            trajectory = hsc.trajectory }
+            trajectory = hsc.trajectory, mark = hsc.mark, markHit = hsc.markHit, markGap = hsc.markGap }
     end
     player:sendEvent('kineticHudAim', { hud = hud, guard = ps.guardActive, guardZone = ps.guardZone,
-        balance = { x = ps.balanceRight or 0, y = ps.balanceForward or 0, tip = ps.balanceTip or 0 },
+        balance = { x = ps.balanceRight or 0, y = ps.balanceForward or 0, tip = ps.balanceTip or 0,
+            shiftX = ps.weightRight or 0, shiftY = ps.weightForward or 0, edge = ps.weightEdge or 0,
+            risk = ps.balanceRisk or 0, sigil = ps.balanceSigil },
         ready = ps.attackReady or 1 })
 end
 

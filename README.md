@@ -21,11 +21,16 @@ blow lands; Morrowind's formulas decide *how much it matters*.
 Features
 --------
 
-- **Physical bodies for everyone.** Catch steps when pushed, stumbles, drop
-  rolls off ledges, falls that are earned, get-ups that happen in the world.
-- **A weapon you actually hold.** Hold the left button and move the mouse to
-  guard, wind up and cut along your own stroke. Click for a full physical
-  swing at the brass reticle. The middle button thrusts.
+- **Physical bodies for everyone.** Catch steps when pushed, stumbles, falls
+  that are earned, get-ups that happen in the world.
+- **A weapon you actually hold.** Click for a full physical swing at the
+  brass reticle. Hold the left button and move the mouse: the swing winds up
+  from the way you moved and cuts along your own stroke, and the view stays
+  still while you do it. Keep holding and drag away again to chain the next
+  cut at once.
+- **Weight behind the blow.** Moving into a cut winds it up faster; a running
+  or jumping blow carries part of your body's weight, pushes harder and cuts
+  deeper.
 - **Contact decides everything.** The speed and angle at the point of contact
   decide whether a blow bites, glances or stops. Blades cut with the edge,
   stab with the point and bruise with the flat.
@@ -34,19 +39,27 @@ Features
   the next cut.
 - **Combos.** A cut that winds up where the last one ended flows on faster
   and for less fatigue; a click right after a parry you won is a quick
-  riposte; bare fists go jab, cross, jab.
-- **Guard, parry, shove.** The right button guards (tap to parry). Two quick
-  right clicks shove. You can attack straight out of a held guard.
+  riposte.
+- **Guard, parry, shove.** The right button does all the defending: hold to
+  guard (the block steers to meet the blade), tap to parry, two quick clicks
+  to shove. You can attack straight out of a held guard.
+- **Bare fists on two buttons.** The left button is the right fist, the
+  right button the left. Click to jab; hold, wind up and stroke the mouse
+  back for a hook, uppercut, overhand or cross. An open palm knocks an
+  incoming weapon aside.
 - **Reactions with weight.** A flinch, a stagger with catch steps or a
   knockdown, decided by where the blow landed, how hard it was, and whether
   the body could still find its feet.
 - **Wounds where they landed.** Cuts and punctures leave marks and blood; a
-  wounded limb works worse.
+  wounded limb works worse. Wounds close as your health comes back, and
+  repairing your armour takes the scratches and dents off it.
 - **NPCs fight by the same rules.** They use the same bodies and weapons. They
-  read your guard, keep their distance, feint and pace their attacks.
+  attack in combos, block where your cut is coming from, keep their distance
+  and brake instead of charging through you.
 - **Every melee weapon type.** One-handers, two-handers with both hands on
-  the grip, spears with a lunging thrust, staffs, daggers and fists. Shields
-  have their own physical body.
+  the grip, daggers and fists. Spears and staffs come point-forward when you
+  hold the button, thrust on a click with your feet planted, and sweep and
+  chop with the haft. Shields have their own physical body.
 - **Smooth at any frame rate.** Physics steps at 60 Hz and the bodies are drawn
   smoothly between steps at 120 fps or uncapped.
 
@@ -64,16 +77,38 @@ loading your other mods (`mods.cfg`) and the known limits.
 | Input | Action |
 |---|---|
 | Left click | Attack: a full physical swing at the reticle |
-| Hold left + move | Steer the weapon; a fast stroke is a committed swing |
-| Middle button | Thrust |
-| Right button | Guard (tap to parry) |
+| Hold left + move | Wind up and steer the weapon; a fast stroke is a committed swing; drag again to chain |
+| Hold left with a spear or staff | Point forward; click to thrust, drag to sweep or chop |
+| Right button | Hold to guard, tap to parry |
 | Two quick right clicks | Shove |
+| Bare fists | Left button = right fist, right button = left fist |
 
-This is a tech demo (TECH-DEMO RELEASE 0.1): the bodies and the combat work,
-and plenty is still rough. Skeletons, dremora, golden saints and liches get
-the KINETIC body (new, experimental); other creatures are still animated,
-swimming is vanilla, and a mouse drag steers the right fist only. Mods that
-change melee combat (attack, block, combat AI) will conflict with KINETIC.
+This is a tech demo (TECH-DEMO RELEASE 0.2): the bodies and the combat work,
+and plenty is still rough.
+
+Known limits
+------------
+
+- Weapon handling is about 90% complete.
+- Bare fists need more work; stab and pin and the staff handled as a spear
+  are new and still being tuned.
+- Rolls are not ready: their animations are unfinished.
+- Movement can still go wrong now and then, most of all walking up or down
+  stairs diagonally.
+- Skeletons, dremora, golden saints and liches get the KINETIC body
+  (experimental); other creatures are still animated, and swimming is
+  vanilla.
+- Mods that change melee combat (attack, block, combat AI) will conflict
+  with KINETIC.
+
+Looking ahead, and an invitation
+--------------------------------
+
+We are looking for a way to support dismemberment, and for ways to bring
+more of the game under the same physics: the other creatures, rolls, better
+fists. If you make mods, animations, models or engine code and want to
+work on any of it together, you are welcome: open an issue here or write
+on the mod's page.
 
 How it works
 ------------
@@ -89,8 +124,8 @@ How it works
 - A **contact system** that prices every blow with Morrowind's damage, hit
   roll, armour and knockdown formulas.
 
-Every change is checked by scripted test cases (walking, balance, movement,
-combat, duels) before it reaches a play build.
+The physics core has its own unit tests, and scripted in-game cases cover
+walking, balance, movement, combat and duels.
 
 KINETIC is a modified OpenMW: upstream master 262d1ba0d6 (2026-08-31) with the
 Jolt physics merge request (!3919, head 953ff1c32b). It is not an official

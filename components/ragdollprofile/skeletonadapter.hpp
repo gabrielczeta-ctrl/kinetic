@@ -47,6 +47,11 @@ namespace RagdollProfile
         // false before publishing or changing any node if validation fails.
         bool applyPose(std::span<const RagdollCore::Transform> pose);
 
+        // The animation's share of the drawn pose, 0 (the published pose) to
+        // 1 (the animation as evaluated; the published pose is kept but not
+        // written). K2_CALM_DRAW: a held NPC is drawn as its animation.
+        void setAnimationShare(float share);
+
         // Captures evaluated model-space transforms in profile body order,
         // including configured leg target normalization. Does not change the
         // skeleton or install a callback.

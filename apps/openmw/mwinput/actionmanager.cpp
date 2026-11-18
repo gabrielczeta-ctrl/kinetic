@@ -96,6 +96,11 @@ namespace MWInput
                 if (!windowManager->isGuiMode() && inputManager->getControlSwitch("playercontrols"))
                     MWBase::Environment::get().getWorld()->dodgeActorRagdoll();
                 break;
+            case A_PhysicalKick:
+                // The kick (OPENMW_RAGDOLL_KICK; off or unpowered: nothing happens).
+                if (!windowManager->isGuiMode() && inputManager->getControlSwitch("playercontrols"))
+                    MWBase::Environment::get().getWorld()->kickActorRagdoll();
+                break;
             case A_QuickKey1:
                 quickKey(1);
                 break;

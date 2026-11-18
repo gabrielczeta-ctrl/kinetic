@@ -64,6 +64,8 @@ namespace MWInput
         // Right-click guard (OPENMW_RAGDOLL_RMB_GUARD=1): held, and how long; a
         // short tap keeps the guard up a moment (a timed parry).
         bool mRmbGuardHeld = false;
+        // The button holding it: the right one, or the middle one (K2_MIDDLE_PARRY).
+        Uint8 mGuardButton = 0;
         float mRmbGuardHeldTime = 0.0f;
         float mRmbGuardTapLeft = 0.0f;
         // SHOVE-01: a second right press this soon after the last is a shove.
@@ -74,6 +76,20 @@ namespace MWInput
         // GUARD-03: an attack press while the guard is up lowers it until the
         // guard input is let go (OPENMW_RAGDOLL_GUARD_TO_ATTACK).
         bool mGuardYielded = false;
+        // FIST-06 (K2_FIST_STEER): the right button held as the left fist;
+        // the guard both buttons raised (either one let go lowers it; let go
+        // within 0.2 s it was a tap: the shove).
+        bool mFistLeftHeld = false;
+        bool mFistGuard = false;
+        // K2_PALM_TAP: the window mRmbGuardTapLeft counts down from (the
+        // weapons' 0.35 s, or the fists' own), and how long since both
+        // buttons were last pressed with bare fists (again this soon: the shove).
+        float mGuardTapWindow = 0.35f;
+        float mFistGuardSincePress = 10.0f;
+        // The fists' tapped guard is in its window (its carry, update()); the
+        // button of an ended fist guard that is still down (0 none).
+        bool mFistTapParry = false;
+        Uint8 mFistGuardLinger = 0;
         bool mRagdollThrustClaimed = false;
         RagdollTapDrag mRagdollTapDrag;
         std::optional<MWWorld::Ptr> mRagdollTapDragWeapon;

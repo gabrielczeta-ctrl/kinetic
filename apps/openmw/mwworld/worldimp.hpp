@@ -474,11 +474,14 @@ namespace MWWorld
         bool driveActorRagdollSwing(float aimRight, float aimUp, bool held, bool thrust = false) override;
         bool setActorRagdollGuard(bool held) override;
         bool shoveActorRagdoll() override;
+        bool kickActorRagdoll() override;
         bool cycleActorRagdollGrip() override;
         bool dodgeActorRagdoll() override;
         bool requestActorRagdollDodge(const MWWorld::ConstPtr& actor, const osg::Vec3f& direction) override;
         bool driveActorRagdollGuardZone(float aimRight, float aimUp, bool reset) override;
+        bool driveActorRagdollLeftFist(float aimRight, float aimUp, bool held, bool cancel) override;
         bool isPlayerRagdollWeaponAttached() const override;
+        bool isPlayerRagdollPalmBusy() const override;
         bool hasActorRagdollWeaponAttached(const MWWorld::ConstPtr& actor) const override;
         bool usesPlayerRagdollAttackAnimation() const override;
         bool queuePlayerRagdollAttackInput(bool held) override;
@@ -528,6 +531,7 @@ namespace MWWorld
 
         bool getLOS(const MWWorld::ConstPtr& actor, const MWWorld::ConstPtr& targetActor) override;
         bool isPoweredRagdoll(const MWWorld::ConstPtr& actor) const override;
+        float poweredMoveScale(const MWWorld::ConstPtr& actor) const override;
         ///< get Line of Sight (morrowind stupid implementation)
 
         float getDistToNearestRayHit(

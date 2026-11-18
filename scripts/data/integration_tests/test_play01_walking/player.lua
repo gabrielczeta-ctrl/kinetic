@@ -101,6 +101,12 @@ testing.registerLocalTestStep('PLAY-01 prepare ordinary controls with sheathed b
     prepareOrdinaryControls('iron battle axe', true)
 end)
 
+testing.registerLocalTestStep('PLAY-01 prepare ordinary controls with sheathed steel claymore', function()
+    testing.expect(types.Actor.inventory(self):find('steel claymore') ~= nil,
+        'PLAY-01 player has no steel claymore')
+    prepareOrdinaryControls('steel claymore', true)
+end)
+
 -- TORCH-01 (user 10-31: "the left hand holding the torch shakes ... like it
 -- has parkinsons" sheathed; drawn it "puts the torch very close to the chest").
 testing.registerLocalTestStep('PLAY-01 prepare ordinary controls with torch', function()
@@ -136,6 +142,20 @@ testing.localEventHandlers.play01Acrobatics = function(value)
     ownAcrobatics = ownAcrobatics or acrobatics.base
     acrobatics.base = value or ownAcrobatics
     print(string.format('PLAY01_ACROBATICS base=%d', acrobatics.base))
+end
+-- Stride's sprint (KINETIC-2 phase 2): Speed and Athletics for the case
+-- (100 runs ~690 u/s, the level-50 guard's charge); false restores the
+-- character's own. Also prints Agility (the swing spring's stat).
+local ownSpeed, ownAthletics
+testing.localEventHandlers.play01Sprint = function(value)
+    local speed = types.Actor.stats.attributes.speed(self)
+    local athletics = types.NPC.stats.skills.athletics(self)
+    ownSpeed = ownSpeed or speed.base
+    ownAthletics = ownAthletics or athletics.base
+    speed.base = value or ownSpeed
+    athletics.base = value or ownAthletics
+    print(string.format('PLAY01_SPRINT speed=%d athletics=%d agility=%d', speed.base, athletics.base,
+        types.Actor.stats.attributes.agility(self).base))
 end
 testing.localEventHandlers.play01Fatigue = function(value)
     local fatigue = types.Actor.stats.dynamic.fatigue(self)

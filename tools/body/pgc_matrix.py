@@ -125,7 +125,8 @@ GROUPS = [
 
 
 def launcher_envs():
-    play = []
+    # The game's switches, as sentinel.play_envs.
+    play = ['OPENMW_RAGDOLL_PLAY_DEFAULTS=1', 'OPENMW_RAGDOLL_POWER_PLAYER=0']
     for line in (ROOT / 'Run-Game-MotionBricks.cmd').read_text(errors='replace').splitlines():
         m = re.match(r'^set "?(OPENMW_[A-Z0-9_]+)=([^"]*)"?\s*$', line.strip())
         if m and '%~dp0' not in m.group(2):

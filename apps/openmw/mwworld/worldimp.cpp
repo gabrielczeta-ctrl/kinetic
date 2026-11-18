@@ -2631,6 +2631,11 @@ namespace MWWorld
         return !actor.isEmpty() && mPhysics->isPoweredRagdoll(actor);
     }
 
+    float World::poweredMoveScale(const MWWorld::ConstPtr& actor) const
+    {
+        return actor.isEmpty() ? 1.f : mPhysics->poweredMoveScale(actor);
+    }
+
     bool World::getLOS(const MWWorld::ConstPtr& actor, const MWWorld::ConstPtr& targetActor)
     {
         if (!targetActor.getRefData().isEnabled() || !actor.getRefData().isEnabled())
@@ -2955,6 +2960,20 @@ namespace MWWorld
 #endif
     }
 
+    bool World::kickActorRagdoll()
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (!mPlayer)
+            return false;
+        const MWWorld::Ptr player = getPlayerPtr();
+        if (player.isEmpty() || !MWBase::Environment::get().getInputManager()->getControlSwitch("playercontrols"))
+            return false;
+        return mPhysics->kickPassiveRagdoll(player);
+#else
+        return false;
+#endif
+    }
+
     bool World::dodgeActorRagdoll()
     {
 #ifdef OPENMW_RAGDOLL_DEV_API
@@ -3002,6 +3021,26 @@ namespace MWWorld
             return false;
         // The wheel's mouse counts: 256 per look unit.
         return mPhysics->drivePassiveRagdollGuardZone(player, aimRight * 256.0f, aimUp * 256.0f, reset);
+#else
+        return false;
+#endif
+    }
+
+    bool World::driveActorRagdollLeftFist(float aimRight, float aimUp, bool held, bool cancel)
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        if (!mPlayer)
+            return false;
+        const MWWorld::Ptr player = getPlayerPtr();
+        if (player.isEmpty())
+            return false;
+        if (held && !cancel
+            && (!MWBase::Environment::get().getInputManager()->getControlSwitch("playercontrols")
+                || player.getClass().getCreatureStats(player).isParalyzed()
+                || player.getClass().getCreatureStats(player).getDrawState() != MWMechanics::DrawState::Weapon))
+            return false;
+        // The wheel's mouse counts: 256 per look unit.
+        return mPhysics->drivePassiveRagdollLeftFist(player, aimRight * 256.0f, aimUp * 256.0f, held, cancel);
 #else
         return false;
 #endif
@@ -3201,6 +3240,15 @@ namespace MWWorld
 #endif
     }
 
+    bool World::isPlayerRagdollPalmBusy() const
+    {
+#ifdef OPENMW_RAGDOLL_DEV_API
+        return mPlayer && mPhysics->isPassiveRagdollPalmBusy(getPlayerConstPtr());
+#else
+        return false;
+#endif
+    }
+
     bool World::hasActorRagdollWeaponAttached(const MWWorld::ConstPtr& actor) const
     {
 #ifdef OPENMW_RAGDOLL_DEV_API
@@ -3237,8 +3285,11 @@ namespace MWWorld
             || actor.getClass().getCreatureStats(actor).isDead())
             return false;
         MWRender::Animation* animation = mRendering->getAnimation(actor);
-        return animation != nullptr && animation->getSkeleton() != nullptr
-            && mPhysics->addPoweredRagdoll(actor, *animation->getSkeleton());
+        if (animation == nullptr || animation->getSkeleton() == nullptr
+            || !mPhysics->addPoweredRagdoll(actor, *animation->getSkeleton()))
+            return false;
+        mPhysics->pinPoweredRagdoll(actor);
+        return true;
     }
 
     bool World::requestActorPoweredRagdollRecovery(const MWWorld::Ptr& actor)

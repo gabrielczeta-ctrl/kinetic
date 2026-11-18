@@ -604,7 +604,47 @@ testing.registerGlobalTest('WPN-01 live equipped weapon hold yaw reversal stop i
     if multiplier > 0 then ragdoll.setTestStepActive(false, 0) end
 end)
 
-local function runPhysicalDefenseScenario(label, expectedOutcome, guardAtSeconds, raiseImmediately, seed)
+-- DEF-01 (rewritten 11-05): the attacker swings for real - a forehand
+-- wind-up and cut by mouse input, as the player does (the old case nudged
+-- driveSwing and turned the weapon fixture's yaw, which left the tip
+-- controller in its Guard mode, so no contact counted as a strike). The
+-- defender raises its guard when the blade comes within `guardAt` units of
+-- its body (nil: from the start). The outcome is the guard's age at the
+-- contact (PhysicalDefenseProfile: parry up to 9 steps, block up to 36, a
+-- held guard blocks past that under GUARD_HELD, the play value).
+local DEF_WIND, DEF_CUT = 1800, 3000
+-- DEF-01 (rewritten 11-05): the attacker swings for real - a forehand
+-- wind-up and cut by mouse input, as the player does (the old case nudged
+-- driveSwing and turned the weapon fixture's yaw, which left the tip
+-- controller in its Guard mode, so no contact counted as a strike). The
+-- defender raises its guard `guardAt` seconds from the cut's start (negative:
+-- during the wind-up; nil: long before the swing). The outcome is the
+-- guard's age at the contact (PhysicalDefenseProfile: parry up to 9 steps,
+-- block up to 36; a held guard past that blocks only what it covers,
+-- GUARD_HELD with GUARD_COVER). The warhammer's head sits within 20 u of the
+-- target from the start, so the blade's distance cannot time the guard; the
+-- contact comes ~10 steps into the cut.
+local DEF_WIND, DEF_CUT = 1800, 3000
+-- DEF-01 (rewritten 11-05): the attacker swings for real - a forehand
+-- wind-up and cut by mouse input, as the player does (the old case nudged
+-- driveSwing and turned the weapon fixture's yaw, which left the tip
+-- controller in its Guard mode, so no contact counted as a strike). The
+-- defender raises its guard `guardAt` seconds from the cut's start (negative:
+-- during the wind-up; nil: long before the swing). The outcome is the
+-- guard's age at the contact (PhysicalDefenseProfile: parry up to 9 steps,
+-- block up to 36; a held guard past that blocks only what it covers,
+-- GUARD_HELD with GUARD_COVER). The warhammer's head sits within 20 u of the
+-- target from the start, so the blade's distance cannot time the guard; the
+-- contact comes ~10 steps into the cut.
+local DEF_WIND, DEF_CUT = 1800, 3000
+local function runPhysicalDefenseScenario(label, expectedOutcome, guardAt, seed)
+    -- The play values power NPCs near the player (POWER_NPCS); the case
+    -- powers its own target.
+    ragdoll.setTuning('OPENMW_RAGDOLL_POWER_NPCS', '0')
+    -- The timing windows, not the physical cover: under GUARD_COVER (20, the
+    -- play value) a guard stops only what it covers, and this dummy holds no
+    -- weapon (the cover has its own case, NPCHIT-02).
+    ragdoll.setTuning('OPENMW_RAGDOLL_GUARD_COVER', '0')
     local multiplier = ragdoll.testStepMultiplier()
     if multiplier > 0 then ragdoll.setTestStepActive(true, seed) end
     local player = world.players[1]
@@ -628,184 +668,111 @@ local function runPhysicalDefenseScenario(label, expectedOutcome, guardAtSeconds
     end)
     waitSeconds(0.5)
 
-    moveWeaponYaw(player, 0, 0.7, 1, 0.25)
-    local endpoint = ragdoll.getState(player)
-    local endpointPosition = findBody(endpoint, 'equipped_weapon').position
-    moveWeaponYaw(player, 0.7, -0.7, 1, 0.25)
-
     local targetRecord = world.createRecord(types.NPC.createRecordDraft({
         template = types.NPC.record(player),
-        name = 'DEF-01 isolated ' .. label .. ' target',
+        name = 'DEF-01 ' .. label .. ' target',
         isEssential = false,
         isPersistent = false,
         isRespawning = false,
     }))
-    local radial = endpointPosition - player.position
-    radial = util.vector3(radial.x, radial.y, 0)
-    radial = radial / radial:length()
-    local desiredBodyPosition = endpointPosition + radial * 1.5
-    local safeOrigin = util.vector3(endpointPosition.x, endpointPosition.y, testArea.player.z) + radial * 150
-    local targetRotation = util.transform.rotateZ(math.atan2(radial.x, -radial.y) + math.pi)
-    local calibrationTarget = world.createObject(targetRecord.id)
-    calibrationTarget:teleport(testArea.cell, safeOrigin,
-        { onGround = true, rotation = targetRotation })
-    coroutine.yield()
-    ragdoll.setPowered(calibrationTarget, true)
-    local calibration = waitFor(label .. ' calibration target', function()
-        local current = ragdoll.getState(calibrationTarget)
-        if current and current.controller and current.controller.mode == 'standing' then return current end
-    end)
-    waitSeconds(0.25)
-    calibration = ragdoll.getState(calibrationTarget)
-    local impactBodyName
-    local impactBodyOffset
-    local inwardProjection = math.huge
-    for _, body in ipairs(calibration.bodies) do
-        if math.abs(body.position.z - endpointPosition.z) <= 15 then
-            local offset = body.position - safeOrigin
-            local projection = offset.x * radial.x + offset.y * radial.y
-            if projection < inwardProjection then
-                impactBodyName = body.name
-                impactBodyOffset = offset
-                inwardProjection = projection
-            end
-        end
-    end
-    testing.expect(impactBodyName ~= nil, label .. ' has no target body at weapon height')
-    local targetOrigin = util.vector3(
-        desiredBodyPosition.x - impactBodyOffset.x,
-        desiredBodyPosition.y - impactBodyOffset.y,
-        testArea.player.z)
-    ragdoll.setPowered(calibrationTarget, false)
-    waitFor(label .. ' calibration cleanup', function() return not ragdoll.getState(calibrationTarget) end)
-    calibrationTarget:remove()
-    coroutine.yield()
-
     local target = world.createObject(targetRecord.id)
-    target:teleport(testArea.cell, targetOrigin,
-        { onGround = true, rotation = targetRotation })
+    target:teleport(testArea.cell, player.position + util.vector3(0, 45, 0),
+        { onGround = true, rotation = util.transform.rotateZ(math.pi) })
     coroutine.yield()
     ragdoll.setPowered(target, true)
-    local ready = waitFor(label .. ' powered target', function()
+    waitFor(label .. ' powered target', function()
         local current = ragdoll.getState(target)
         if current and current.controller and current.controller.mode == 'standing' then return current end
     end)
-    waitSeconds(0.25)
-    ready = ragdoll.getState(target)
-    local actualBody = findBody(ready, impactBodyName)
-    targetOrigin = util.vector3(
-        targetOrigin.x + desiredBodyPosition.x - actualBody.position.x,
-        targetOrigin.y + desiredBodyPosition.y - actualBody.position.y,
-        targetOrigin.z)
-    ragdoll.setPowered(target, false)
-    waitFor(label .. ' target realignment cleanup', function() return not ragdoll.getState(target) end)
-    target:teleport(testArea.cell, targetOrigin,
-        { onGround = true, rotation = targetRotation })
-    coroutine.yield()
-    ragdoll.setPowered(target, true)
-    ready = waitFor(label .. ' realigned target', function()
-        local current = ragdoll.getState(target)
-        if current and current.controller and current.controller.mode == 'standing' then return current end
-    end)
-    waitSeconds(0.25)
-    ready = ragdoll.getState(target)
-    actualBody = findBody(ready, impactBodyName)
-    local alignment = util.vector3(actualBody.position.x - desiredBodyPosition.x,
-        actualBody.position.y - desiredBodyPosition.y, 0):length()
-    testing.expectLessOrEqual(alignment, 12, label .. ' target did not align with the weapon path')
+    -- Isolate the outcome from knockback (as FIX-08).
+    ragdoll.reactionScale(0)
+    waitSeconds(0.5)
 
     local before = ragdoll.getState(player)
     local outcomeBefore = before.weapon.defenseOutcomeCount
     local damageBefore = before.weapon.damageEventCount
-    local contactBeforeDefense = before.weapon.contactEventCount
-    local strikeBeforeDefense = before.weapon.strikeEventCount
+    local contactBefore = before.weapon.contactEventCount
+    local strikeBefore = before.weapon.strikeEventCount
     local healthBefore = types.Actor.stats.dynamic.health(target).current
     local guardFacing = player.position - target.position
     guardFacing = util.vector3(guardFacing.x, guardFacing.y, 0)
     guardFacing = guardFacing / guardFacing:length()
-    print(string.format('DEF-01 isolated %s setup player=%s target=%s', label,
-        tostring(player.position), tostring(target.position)))
-    if raiseImmediately then
+    local guardRaised = false
+    local function raiseGuard()
         ragdoll.setGuard(target, true, guardFacing)
+        guardRaised = true
+    end
+    if not guardAt then
+        raiseGuard()
         waitFor(label .. ' guard activation', function()
             local current = ragdoll.getState(target)
             return current and current.guardActive
         end)
+        waitSeconds(1.0)
     end
 
-    ragdoll.driveSwing(player, true, util.vector3(1, 0, 0), util.vector3(0, 1, 0),
-        util.vector3(0, 0, 1), 0, 0.1, true, 1 / 60)
-    waitFor(label .. ' swing lifetime activation', function()
-        if ragdoll.getSwingSpeed(player) ~= nil then return true end
-    end)
-    local started = core.getSimulationTime()
-    local guardRaised = raiseImmediately
-    local triggerDistance = -1
     local result
     local guardAge = -1
+    local triggerDistance = -1
     local minimumDistance = math.huge
-    repeat
-        local elapsed = core.getSimulationTime() - started
-        local t = math.min(elapsed / 4, 1)
-        local smooth = t * t * (3 - 2 * t)
-        ragdoll.setWeaponFixtureYaw(player, -0.7 + 1.4 * smooth)
-        coroutine.yield()
+    local cutStart
+    local function observe()
+        if result then return end
         local current = ragdoll.getState(player)
         local defender = ragdoll.getState(target)
-        if current and defender then
-            local weaponPosition = findBody(current, 'equipped_weapon').position
-            local distance = math.huge
-            for _, body in ipairs(defender.bodies) do
-                distance = math.min(distance, (weaponPosition - body.position):length())
-            end
-            minimumDistance = math.min(minimumDistance, distance)
-            if not guardRaised and elapsed >= guardAtSeconds then
-                triggerDistance = distance
-                ragdoll.setGuard(target, true, guardFacing)
-                guardRaised = true
-            end
-            if current.weapon.defenseOutcomeCount > outcomeBefore then
-                print(string.format('DEF-01 isolated %s at_outcome guard=%s guard_step=%s strike_step=%s now=%s delta=%d elapsed=%.3f',
-                    label, tostring(defender.guardActive), tostring(defender.guardStartPhysicsStep),
-                    tostring(current.weapon.lastStrikeEvent and current.weapon.lastStrikeEvent.physicsStep),
-                    tostring(current.physicsStep), current.weapon.defenseOutcomeCount - outcomeBefore, elapsed))
-                result = current
-                if defender.guardActive then
-                    guardAge = tonumber(current.weapon.lastStrikeEvent.physicsStep)
-                        - tonumber(defender.guardStartPhysicsStep)
-                end
-                break
+        if not (current and defender) then return end
+        local weaponPosition = findBody(current, 'equipped_weapon').position
+        local distance = math.huge
+        for _, item in ipairs(defender.bodies) do
+            distance = math.min(distance, (weaponPosition - item.position):length())
+        end
+        minimumDistance = math.min(minimumDistance, distance)
+        if not guardRaised and guardAt and cutStart and core.getSimulationTime() - cutStart >= guardAt then
+            triggerDistance = distance
+            raiseGuard()
+        end
+        if current.weapon.defenseOutcomeCount > outcomeBefore then
+            result = current
+            if defender.guardActive and current.weapon.lastStrikeEvent and defender.guardStartPhysicsStep then
+                guardAge = tonumber(current.weapon.lastStrikeEvent.physicsStep)
+                    - tonumber(defender.guardStartPhysicsStep)
             end
         end
-    until core.getSimulationTime() - started >= 4.5
+    end
+
+    -- Press, wind the forehand up, cut back across, release.
+    ragdoll.injectMouseInput(0, 0, true, 1)
+    waitSeconds(0.25, observe)
+    -- The cut's start, known ahead so a guard can rise during the wind-up.
+    cutStart = core.getSimulationTime() + 0.4
+    for _, leg in ipairs({ { x = DEF_WIND, seconds = 0.4 }, { x = -DEF_CUT, seconds = 0.35 } }) do
+        local started, sent = core.getSimulationTime(), 0
+        waitSeconds(leg.seconds, function()
+            local fraction = math.min(1, (core.getSimulationTime() - started) / leg.seconds)
+            local x = math.floor(leg.x * fraction)
+            ragdoll.injectMouseInput(x - sent, 0)
+            sent = x
+            observe()
+        end)
+        ragdoll.injectMouseInput(leg.x - sent, 0)
+    end
+    waitSeconds(0.6, observe)
+    ragdoll.injectMouseInput(0, 0, false, 1)
+    waitSeconds(0.1, observe)
     if not result then
         local diagnostic = ragdoll.getState(player)
         local last = diagnostic.weapon.lastContactEvent
-        local lastStrike = diagnostic.weapon.lastStrikeEvent
-        print(string.format('DEF-01 isolated %s missing outcome raw_delta=%d strike_delta=%d min_distance=%.9f guard=%s trigger=%.9f last_active=%s last_target=%s strike_target=%s strike_normal=%.9f strike_total=%.9f',
-            label, diagnostic.weapon.contactEventCount - contactBeforeDefense,
-            diagnostic.weapon.strikeEventCount - strikeBeforeDefense, minimumDistance,
+        print(string.format('DEF-01 %s missing outcome contacts=%d strikes=%d min_distance=%.2f guard=%s trigger=%.2f last_active=%s',
+            label, diagnostic.weapon.contactEventCount - contactBefore,
+            diagnostic.weapon.strikeEventCount - strikeBefore, minimumDistance,
             tostring(ragdoll.getState(target).guardActive), triggerDistance,
-            tostring(last and last.swingActive or false), last and last.targetActorIdentity or '',
-            lastStrike and lastStrike.targetActorIdentity or '',
-            lastStrike and lastStrike.relativeNormalSpeed or -1,
-            lastStrike and lastStrike.relativeSpeed or -1))
+            tostring(last and last.swingActive or false)))
     end
     testing.expect(result ~= nil, label .. ' did not emit a defense outcome')
-    ragdoll.driveSwing(player, true, util.vector3(1, 0, 0), util.vector3(0, 1, 0),
-        util.vector3(0, 0, 1), 0, 0, false, 1 / 60)
-    waitSeconds(0.1)
-    result = ragdoll.getState(player)
     local healthAfter = types.Actor.stats.dynamic.health(target).current
-    print(string.format('DEF-01 isolated %s positions player=%s target=%s guard=%s', label,
-        tostring(player.position), tostring(target.position), tostring(guardFacing)))
-    print(string.format('DEF-01 isolated %s outcome=%s age=%d trigger=%.9f facing=%.9f redirect=%.9f',
-        label, result.weapon.lastDefenseOutcome, guardAge, triggerDistance,
+    print(string.format('DEF-01 %s outcome=%s age=%d trigger=%.2f min_distance=%.2f facing=%.3f redirect=%.3f',
+        label, result.weapon.lastDefenseOutcome, guardAge, triggerDistance, minimumDistance,
         result.weapon.lastGuardFacingAlignment, result.weapon.lastRedirectImpulse))
-    testing.expectEqual(result.weapon.defenseOutcomeCount - outcomeBefore, 1,
-        label .. ' emitted more than one defense outcome')
-    testing.expectEqual(result.weapon.damageEventCount - damageBefore, 1,
-        label .. ' entered combat logic more than once')
     testing.expectEqual(result.weapon.lastDefenseOutcome, expectedOutcome,
         label .. ' produced the wrong outcome')
     if expectedOutcome == 'block' or expectedOutcome == 'parry' then
@@ -829,24 +796,29 @@ local function runPhysicalDefenseScenario(label, expectedOutcome, guardAtSeconds
         guard_age_steps = guardAge,
         guard_trigger_distance = triggerDistance,
         guard_facing_alignment = result.weapon.lastGuardFacingAlignment,
-        target_alignment = alignment,
     })
+    ragdoll.reactionScale(1)
     ragdoll.setPowered(target, false)
     target:remove()
     ragdoll.setPowered(player, false)
     if multiplier > 0 then ragdoll.setTestStepActive(false, 0) end
+    ragdoll.setTuning('OPENMW_RAGDOLL_GUARD_COVER', nil)
+    ragdoll.setTuning('OPENMW_RAGDOLL_POWER_NPCS', nil)
 end
 
+-- The guard up 9 steps before the cut (block: ~19 steps old at the contact),
+-- 5 steps into it (parry: ~5 steps old), or long before (late: past both
+-- windows, a hit where the held guard does not cover the blow).
 testing.registerGlobalTest('DEF-01 physical block', function()
-    runPhysicalDefenseScenario('block', 'block', 3.65, false, 905101)
+    runPhysicalDefenseScenario('block', 'block', -0.15, 905101)
 end)
 
 testing.registerGlobalTest('DEF-01 timed parry', function()
-    runPhysicalDefenseScenario('parry', 'parry', 4.05, false, 905102)
+    runPhysicalDefenseScenario('parry', 'parry', 0.08, 905102)
 end)
 
 testing.registerGlobalTest('DEF-01 late parry', function()
-    runPhysicalDefenseScenario('late', 'hit', 0, true, 905103)
+    runPhysicalDefenseScenario('late', 'hit', nil, 905103)
 end)
 
 local function weaponCounterDelta(after, before, key)

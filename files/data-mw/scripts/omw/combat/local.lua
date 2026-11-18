@@ -50,8 +50,14 @@ local function applyArmor(attack)
     end
 end
 
+-- KINETIC (OPENMW_RAGDOLL_PLAYER_BLOOD): the player bleeds like everyone else.
+local kineticFound, kinetic = pcall(require, 'openmw.kinetic')
+local function kineticPlayerBleeds()
+    return kineticFound and kinetic.playerBleeds ~= nil and kinetic.playerBleeds()
+end
+
 local function spawnBloodEffect(position)
-    if isPlayer and not common.settings:get('spawnBloodEffectsOnPlayer') then
+    if isPlayer and not common.settings:get('spawnBloodEffectsOnPlayer') and not kineticPlayerBleeds() then
         return
     end
 

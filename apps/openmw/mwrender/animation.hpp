@@ -216,6 +216,8 @@ namespace MWRender
         // See setLocomotionSpeedScale. Gameplay-computed movement animation
         // speeds are multiplied by this; default 1 keeps vanilla behaviour.
         float mLocomotionSpeedScale = 1.0f;
+        float mLocomotionLoop = 0.0f; // K2_ARM_STEP
+        float mLocomotionLoopAge = 0.0f;
 
         mutable NodeMap mNodeMap;
         mutable bool mNodeMapCreated;
@@ -421,6 +423,18 @@ namespace MWRender
          */
         void setLocomotionSpeedScale(float scale);
         float getLocomotionSpeedScale() const { return mLocomotionSpeedScale; }
+        // K2_ARM_STEP: the movement clip's loop in seconds (0 = its usual rate),
+        // published by the legs; it lapses if not refreshed.
+        void setLocomotionLoop(float seconds)
+        {
+            mLocomotionLoop = seconds;
+            mLocomotionLoopAge = 0.0f;
+        }
+        float takeLocomotionLoop(float duration)
+        {
+            mLocomotionLoopAge += duration;
+            return mLocomotionLoopAge < 0.25f ? mLocomotionLoop : 0.0f;
+        }
 
         /** Development aid for localized limb damage: tint the body parts of
          *  one anatomical region (RagdollCore::regionName) red, 0 = untouched
@@ -445,6 +459,12 @@ namespace MWRender
             return false;
         }
         virtual std::size_t getWoundFxCount() const { return 0; }
+        /** The wounds this actor carries, as of its last animation update
+         *  (any thread): those on its body (skin and clothing; they follow
+         *  its health, K2_WOUND_HEAL) and the marks on its armour (they
+         *  follow the worn armour's condition).
+         */
+        virtual std::pair<int, int> getWoundCounts() const { return { 0, 0 }; }
         /** The kind the last addWoundFx drew (main thread): 1 bruise, 2 slash,
          *  3 stab, 4 chop on skin; 5 a stain on clothing, 6 a scratch or dent
          *  on armour (OPENMW_RAGDOLL_WOUND_FX=3); 0 none.
@@ -457,8 +477,10 @@ namespace MWRender
         virtual int getLastWoundSurface() const { return -1; }
         /** WOUNDFX-01 FX4 (OPENMW_RAGDOLL_WOUND_FX=4): blood on this actor's
          *  held weapon where it went in. alongFrom..alongTo: the bloodied
-         *  range along the weapon, 0 the grip, 1 the tip (as
-         *  LiveWeaponAttachment's hand-to-contact over tipDistanceFromHand);
+         *  range along the weapon, 0 the grip (the mesh's own origin), 1 the
+         *  tip; tipDirection: grip to tip in the frame of the bone the mesh
+         *  hangs on (zero: the end further from the grip, wrong for a spear
+         *  or staff held near its middle, BLADE-BLOOD-01);
          *  strength 0..1 (flesh: the wound's severity, through cloth less);
          *  bloodType: the victim's (0 red, 1 skeleton dust, 2 Dwemer: none).
          *  Any thread: queued, drawn at the next runAnimation on the main
@@ -470,7 +492,9 @@ namespace MWRender
          *  as the mesh is attached). Only NPCs and the player show it.
          */
         virtual void setWeaponGripTurn(const std::optional<osg::Matrixf>& handFrame) {}
-        virtual bool addWeaponBlood(float alongFrom, float alongTo, float strength, int bloodType = 0)
+        virtual bool addWeaponBlood(
+            float alongFrom, float alongTo, float strength, int bloodType = 0,
+            const osg::Vec3f& tipDirection = osg::Vec3f())
         {
             return false;
         }

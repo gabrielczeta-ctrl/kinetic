@@ -36,6 +36,9 @@ namespace RagdollCore
         float mVelocityTip = 0;
         float mSpeed = 0;
         float mApproach = 0;
+        // The relative velocity along the edge axis (signed, like
+        // mVelocityTip): an edge leading the motion.
+        float mVelocityEdge = 0;
     };
 
     struct BladeSurfaceProfile
@@ -83,6 +86,20 @@ namespace RagdollCore
         WoundClass mClass = WoundClass::None;
         float mStrikeStart = 0.10f; // fraction of grip-to-tip: grip and guard bruise below it
         float mTipStart = 0.85f; // fraction where the point can puncture
+        // K2_EDGE_BITE (bookmark 11-05, "a chopping sharp edge ... should very
+        // briefly get stuck"): a blade's or axe head's contact is a cut when the
+        // motion runs along the edge at least this share of the speed, whatever
+        // the contact normal says (a convex hull's normal across an axe's head
+        // and haft says little about the edge). 0 = the normal alone.
+        float mEdgeLead = 0.0f;
+        // K2_POINT_LEAD: a spear's contact in its tip zone is a puncture when
+        // the motion runs along the shaft toward the point at least this
+        // share of the speed, whatever the contact normal says (a thrust
+        // that sinks in off the body's centre is pushed out sideways: its
+        // normal reads the shaft's side, |normal . shaft| under 0.1 in every
+        // contact of SPEAR-01). The caller sets it while the attack is a
+        // thrust. 0 = the normal must face the point too.
+        float mPointLead = 0.0f;
     };
 
     inline WoundKind classifyWeaponContact(const BladeContact& hit, const WoundProfile& profile)
@@ -94,20 +111,30 @@ namespace RagdollCore
         if (hit.mSpeed < 1.0f || hit.mApproach < -0.5f)
             return WoundKind::None;
         const WoundKind blunt = hit.mApproach >= 1.0f ? WoundKind::Bruise : WoundKind::None;
-        const bool edge = std::abs(hit.mNormalEdge) >= 0.45f
-            && std::abs(hit.mNormalEdge) > std::abs(hit.mNormalFlat) * 1.1f;
+        const bool led = profile.mEdgeLead > 0.0f && hit.mApproach >= 1.0f && std::isfinite(hit.mVelocityEdge)
+            && std::abs(hit.mVelocityEdge) >= profile.mEdgeLead * hit.mSpeed;
+        const bool edge = led
+            || (std::abs(hit.mNormalEdge) >= 0.45f && std::abs(hit.mNormalEdge) > std::abs(hit.mNormalFlat) * 1.1f);
         const bool point = hit.mAlong >= profile.mTipStart && hit.mApproach >= 1.0f && hit.mNormalTip >= 0.55f
             && hit.mVelocityTip >= 0.55f * hit.mSpeed;
         switch (profile.mClass)
         {
             case WoundClass::Blade:
-                return classifyBladeContact(hit, BladeSurfaceProfile{ profile.mStrikeStart, profile.mTipStart });
+            {
+                const WoundKind kind
+                    = classifyBladeContact(hit, BladeSurfaceProfile{ profile.mStrikeStart, profile.mTipStart });
+                return kind == WoundKind::Bruise && led && hit.mAlong > profile.mStrikeStart ? WoundKind::Slash : kind;
+            }
             case WoundClass::Axe:
                 if (hit.mAlong < profile.mStrikeStart)
                     return blunt;
                 return edge ? WoundKind::Slash : blunt;
             case WoundClass::Spear:
-                return point ? WoundKind::Puncture : blunt;
+            {
+                const bool led = profile.mPointLead > 0.0f && hit.mAlong >= profile.mTipStart
+                    && hit.mVelocityTip >= profile.mPointLead * hit.mSpeed;
+                return point || led ? WoundKind::Puncture : blunt;
+            }
             case WoundClass::Blunt:
                 return blunt;
             default:

@@ -33,6 +33,12 @@ and logs/openmw-run.log):
   lift_*         why the player's feet lifted, by speed band (lift_reasons.py:
                  lift_clock_walk = share on the gait clock 15-140 u/s, ...;
                  land_miss_* = median landing miss, units)
+  start_lift_s, start80_s, stop_over, crossed, assist
+                 starts, stops, crossed feet and the root's horizontal share
+                 (walk_metrics below; MOVE-01 S0)
+  lift_player / _npc, goal_lift_*, land_miss_player / _npc, fallback_*
+                 swing clearance per actor group and the NPC stuck fallback
+                 (walk_traces.py)
 --bookmarks also prints the same numbers in the 4 s before each bookmark.
 """
 import glob
@@ -45,6 +51,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lift_reasons  # noqa: E402
+import walk_traces  # noqa: E402
 
 STEP = 1.0 / 60.0
 
@@ -76,6 +83,156 @@ def cv(values):
         return None
     mean = statistics.mean(values)
     return statistics.pstdev(values) / mean if mean > 0 else None
+
+
+def rotate(q, v):
+    """v rotated by the quaternion q = [x, y, z, w]."""
+    x, y, z, w = q
+    tx = 2.0 * (y * v[2] - z * v[1])
+    ty = 2.0 * (z * v[0] - x * v[2])
+    tz = 2.0 * (x * v[1] - y * v[0])
+    return (v[0] + w * tx + y * tz - z * ty, v[1] + w * ty + z * tx - x * tz, v[2] + w * tz + x * ty - y * tx)
+
+
+def body_q(row, name):
+    for b in row.get('bodies') or []:
+        if b['name'] == name:
+            return b.get('physical_q')
+    return None
+
+
+def walk_metrics(rows):
+    """MOVE-01 S0 (11-03): starts, stops, crossed feet and the root's
+    horizontal share, from the player's ticks.
+      start_lift_s   seconds from a move key pressed at rest to the first lift
+      start80_s      to the pelvis moving at 80% of the capsule's speed along it
+      stop_over      how far the pelvis went past where it came to rest after
+                     the keys were released at speed (a step back), units
+      crossed        share of moving frames with the left foot right of the
+                     right one across the pelvis (its sideways axis, learned
+                     from the standing frames)
+      assist         the root's horizontal force over the body's weight while
+                     moving (needs srH= in the tick's body line, 11-03 on)"""
+    ticks = [r for r in rows if r.get('kind') == 'tick']
+    out = {}
+    # The pelvis's sideways axis: the local axis that best matches the
+    # capsule's right while standing.
+    votes = {}
+    for r in ticks:
+        q = body_q(r, 'pelvis')
+        if not q or (r.get('move') or [0, 0, 0])[:2] != [0, 0]:
+            continue
+        yaw = r.get('actor_yaw') or 0.0
+        right = (math.cos(yaw), -math.sin(yaw))
+        for axis in range(3):
+            v = [0.0, 0.0, 0.0]
+            v[axis] = 1.0
+            a = rotate(q, v)
+            votes[axis] = votes.get(axis, 0.0) + a[0] * right[0] + a[1] * right[1]
+    side_axis = None
+    if votes:
+        axis = max(votes, key=lambda k: abs(votes[k]))
+        side_axis = [0.0, 0.0, 0.0]
+        side_axis[axis] = 1.0 if votes[axis] > 0 else -1.0
+    crossed = moving_frames = 0
+    weights, assists = [], []
+    starts, starts80, stops = [], [], []
+    rest = 0
+    start = stop = None
+    history = []  # (tick, pelvis, actor_pos)
+    last_move = [0, 0, 0]
+    last_pin = None
+    for r in ticks:
+        move = r.get('move') or [0, 0, 0]
+        moving = abs(move[0]) + abs(move[1]) > 0
+        pelvis, lf, rf = body(r, 'pelvis'), body(r, 'left_foot'), body(r, 'right_foot')
+        pos = r.get('actor_pos')
+        b = r.get('body') or ''
+        pin = re.search(r'pin=(\d)(\d)', b)
+        pins = (pin.group(1) == '1', pin.group(2) == '1') if pin and r.get('drive') is not None else None
+        if pelvis and pos:
+            history.append((r['tick'], pelvis, pos))
+            history = history[-8:]
+        def velocity(index):
+            if len(history) < 4 or history[-1][0] - history[-4][0] != 3:
+                return None
+            a, c = history[-4][index], history[-1][index]
+            return ((c[0] - a[0]) / (3 * STEP), (c[1] - a[1]) / (3 * STEP))
+        v_body, v_capsule = velocity(1), velocity(2)
+        # Crossed feet while moving.
+        q = body_q(r, 'pelvis')
+        if moving and side_axis and q and lf and rf:
+            s = rotate(q, side_axis)
+            moving_frames += 1
+            if (lf[0] - rf[0]) * s[0] + (lf[1] - rf[1]) * s[1] > 0:
+                crossed += 1
+        # The root's horizontal share.
+        f = re.search(r'srF=([\d.]+)', b)
+        h = re.search(r'srH=([\d.]+)', b)
+        if f and not moving and pins == (True, True) and v_body and math.hypot(*v_body) < 10:
+            weights.append(float(f.group(1)))
+        if h and moving:
+            assists.append(float(h.group(1)))
+        # Starts from rest.
+        if not moving and v_body and math.hypot(*v_body) < 15:
+            rest += 1
+        elif not moving:
+            rest = 0
+        if moving and not any(last_move[:2]) and rest >= 30:
+            yaw = r.get('actor_yaw') or 0.0
+            fwd, right = (math.sin(yaw), math.cos(yaw)), (math.cos(yaw), -math.sin(yaw))
+            want = (move[0] * right[0] + move[1] * fwd[0], move[0] * right[1] + move[1] * fwd[1])
+            n = math.hypot(*want) or 1.0
+            start = {'t0': r['tick'], 'want': (want[0] / n, want[1] / n), 'lift': False, 'capsule': [], 'body': []}
+        if start:
+            elapsed = (r['tick'] - start['t0']) * STEP
+            if not moving or elapsed > 1.5:
+                # Resolved once the start is over: the capsule's speed after
+                # 0.33 s is the target, the first body speed past 80% of it.
+                if elapsed >= 1.0 and len(start['capsule']) >= 10:
+                    target = 0.8 * statistics.median(start['capsule'])
+                    reach = next((t for t, v in start['body'] if v >= target), None)
+                    if target > 30 and reach is not None:
+                        starts80.append(reach)
+                start = None
+            else:
+                if not start['lift'] and last_pin and pins and any(a and not c for a, c in zip(last_pin, pins)):
+                    start['lift'] = True
+                    starts.append(elapsed)
+                if v_capsule and elapsed >= 0.33:
+                    start['capsule'].append(v_capsule[0] * start['want'][0] + v_capsule[1] * start['want'][1])
+                if v_body:
+                    start['body'].append((elapsed, v_body[0] * start['want'][0] + v_body[1] * start['want'][1]))
+        # Stops at speed: the pelvis past its rest point along the travel.
+        if not moving and any(last_move[:2]) and v_capsule and math.hypot(*v_capsule) > 50:
+            n = math.hypot(*v_capsule)
+            stop = {'t0': r['tick'], 'dir': (v_capsule[0] / n, v_capsule[1] / n), 'path': []}
+        if stop:
+            if moving:
+                stop = None
+            elif pelvis:
+                if stop['path'] and math.hypot(pelvis[0] - stop['path'][-1][0], pelvis[1] - stop['path'][-1][1]) > 30:
+                    stop = None  # a teleport or a load
+                else:
+                    stop['path'].append(pelvis)
+                    if r['tick'] - stop['t0'] >= 90:
+                        rest_at = stop['path'][-1]
+                        d = stop['dir']
+                        stops.append(max((p[0] - rest_at[0]) * d[0] + (p[1] - rest_at[1]) * d[1]
+                                         for p in stop['path']))
+                        stop = None
+        last_move = move
+        if pins:
+            last_pin = pins
+    out['start_lift_s'] = statistics.median(starts) if starts else None
+    out['start80_s'] = statistics.median(starts80) if starts80 else None
+    out['starts'] = len(starts)
+    out['stop_over'] = statistics.median(stops) if stops else None
+    out['stops'] = len(stops)
+    out['crossed'] = crossed / moving_frames if moving_frames else None
+    out['assist'] = (statistics.median(assists) / statistics.median(weights)
+                     if assists and weights and statistics.median(weights) > 0 else None)
+    return out
 
 
 def metrics(rows, log_lines=None, minutes=None):
@@ -192,7 +349,9 @@ def metrics(rows, log_lines=None, minutes=None):
             if v0 > 100:
                 keeps.append(v1 / v0)
     out['jump_keep'] = statistics.median(keeps) if keeps else None
+    out.update(walk_metrics(rows))
     if log_lines is not None:
+        out.update(walk_traces.summary(log_lines))
         reaches = sum(1 for l in log_lines if 'RAGDOLL_LANDING_REACH actor="player"' in l)
         out['landing_reach_per_min'] = reaches / minutes if minutes else None
         slides = [float(m.group(1)) for l in log_lines

@@ -27,9 +27,8 @@
 // contracts: the scenario completes, the requested disturbance was applied,
 // and an exact repeat reproduces the telemetry (determinism, plan rule R6).
 //
-// The per-case metrics are printed as one "REFERENCE_MATRIX" key=value line
-// so scripts/ragdoll-matrix/ragdoll_report.py can tabulate baseline and
-// candidate executables on identical cases. Metrics that cannot be measured
+// The per-case metrics are printed as one "REFERENCE_MATRIX" key=value line,
+// so two executables can be compared on identical cases. Metrics that cannot be measured
 // are printed as "unavailable", never as zero.
 namespace
 {

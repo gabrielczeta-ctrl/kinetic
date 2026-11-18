@@ -752,6 +752,32 @@ namespace MWRender
         entry.mApplied = state;
     }
 
+    float WoundFxSet::bleedSeed(float seed)
+    {
+        return std::fmod(seed + 0.5f, 1.0f);
+    }
+
+    bool WoundFxSet::remove(float seed)
+    {
+        const float bleed = bleedSeed(seed);
+        bool removed = false;
+        for (Entry& entry : mEntries)
+        {
+            const std::size_t before = entry.mRecords.size();
+            entry.mRecords.erase(std::remove_if(entry.mRecords.begin(), entry.mRecords.end(),
+                                     [&](const Record& record) {
+                                         return record.mKind != Kind_BladeBlood
+                                             && (record.mSeed == seed || record.mSeed == bleed);
+                                     }),
+                entry.mRecords.end());
+            if (entry.mRecords.size() == before)
+                continue;
+            removed = true;
+            apply(entry);
+        }
+        return removed;
+    }
+
     void WoundFxSet::clear()
     {
         for (Entry& entry : mEntries)

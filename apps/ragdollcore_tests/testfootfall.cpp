@@ -345,6 +345,138 @@ namespace
         EXPECT_GE(snapped.closest, 8.0); // the edges are found to the 4 u sampling
     }
 
+    // K2_STRIDE_SIDE_RISE: strafing right up stairs (along +x, 32 u treads
+    // rising 16 u, the game's test staircase), the steepest climb of a
+    // landing over the other foot's ground while it stands (a trailing foot
+    // may stay further below: it never comes closer than the feet's gap).
+    double steepestSideStep(float rise)
+    {
+        FootfallSettings settings;
+        settings.mTreadSnap = 12.0f;
+        settings.mSideRise = { rise, 0.5f };
+        Rig rig;
+        rig.controller = FootfallController(settings);
+        const auto stairs = [](double x) { return x < 20.0 ? 0.0 : 16.0 * std::floor((x - 20.0) / 32.0 + 1.0); };
+        rig.input.mGround = [stairs](const JPH::RVec3& p, double) -> std::optional<double> { return stairs(p.GetX()); };
+        JPH::Vec3 root = JPH::Vec3::sZero();
+        for (int i = 0; i < 30; ++i)
+            rig.step(JPH::Vec3::sZero(), root);
+        double steepest = 0.0;
+        int landings = 0;
+        std::array<bool, 2> was{ false, false };
+        for (int i = 0; i < 180; ++i)
+        {
+            const auto output = rig.step(JPH::Vec3(90.0f, 0.0f, 0.0f), root);
+            const auto& feet = rig.controller.feet();
+            for (std::size_t side = 0; side < 2; ++side)
+            {
+                if (output.mSwinging[side] && !output.mSwinging[1 - side])
+                    steepest = std::max(steepest,
+                        stairs(feet[side].mTarget.GetX()) - stairs(feet[1 - side].mPin.GetX()));
+                landings += was[side] && !output.mSwinging[side];
+                was[side] = output.mSwinging[side];
+            }
+        }
+        EXPECT_GE(landings, 4);
+        return steepest;
+    }
+
+    // The lock: past `lock` of its phase a sideways swing's landing stays on
+    // its tread (re-aims onto another tread per swing, counted).
+    int lateTreadChanges(float lock)
+    {
+        FootfallSettings settings;
+        settings.mTreadSnap = 12.0f;
+        settings.mSideRise = { 20.0f, 0.5f, lock };
+        Rig rig;
+        rig.controller = FootfallController(settings);
+        rig.input.mGround = [](const JPH::RVec3& p, double) -> std::optional<double> {
+            return p.GetX() < 20.0 ? 0.0 : 16.0 * std::floor((p.GetX() - 20.0) / 32.0 + 1.0);
+        };
+        JPH::Vec3 root = JPH::Vec3::sZero();
+        for (int i = 0; i < 30; ++i)
+            rig.step(JPH::Vec3::sZero(), root);
+        int changes = 0;
+        std::array<double, 2> lastZ{ 0.0, 0.0 };
+        for (int i = 0; i < 240; ++i)
+        {
+            // An uneven pace re-aims the landings (the game's capsule).
+            const float pace = 90.0f + 85.0f * std::sin(static_cast<float>(i) * 0.9f);
+            rig.step(JPH::Vec3(pace, 0.0f, 0.0f), root);
+            const auto& feet = rig.controller.feet();
+            for (std::size_t side = 0; side < 2; ++side)
+            {
+                const auto& foot = feet[side];
+                if (foot.mSwinging && foot.mPhase >= 0.35f && foot.mPhase < 0.75f
+                    && std::abs(foot.mTarget.GetZ() - lastZ[side]) > 4.0)
+                    ++changes;
+                lastZ[side] = foot.mTarget.GetZ();
+            }
+        }
+        return changes;
+    }
+
+    TEST(RagdollCoreFootfall, aSidewaysSwingKeepsItsTread)
+    {
+        const int off = lateTreadChanges(0.0f);
+        const int on = lateTreadChanges(0.3f);
+        std::printf("sideways swings: late tread changes %d unlocked, %d locked%c", off, on, 10);
+        EXPECT_EQ(on, 0);
+    }
+
+    // K2_SIDE_STAIRS: strafing right up the staircase the feet take turns,
+    // the leading foot a tread at a time, the trailing foot onto its tread.
+    TEST(RagdollCoreFootfall, sideSteppingStairsTakesTurnsATreadAtATime)
+    {
+        FootfallSettings settings;
+        settings.mTreadSnap = 12.0f;
+        settings.mSideStairs = { 1.0f, 0.3f, 0.05f };
+        Rig rig;
+        rig.controller = FootfallController(settings);
+        const auto stairs = [](double x) { return x < 20.0 ? 0.0 : 16.0 * std::floor((x - 20.0) / 32.0 + 1.0); };
+        rig.input.mGround = [stairs](const JPH::RVec3& p, double) -> std::optional<double> { return stairs(p.GetX()); };
+        JPH::Vec3 root = JPH::Vec3::sZero();
+        for (int i = 0; i < 30; ++i)
+            rig.step(JPH::Vec3::sZero(), root);
+        std::vector<std::size_t> order;
+        double steepest = 0.0;
+        std::array<bool, 2> was{ false, false };
+        for (int i = 0; i < 240; ++i)
+        {
+            // Paced as the game paces it (K2_STAIR_STRAFE): ~45 u/s.
+            const auto output = rig.step(JPH::Vec3(45.0f, 0.0f, 0.0f), root);
+            const auto& feet = rig.controller.feet();
+            for (std::size_t side = 0; side < 2; ++side)
+            {
+                if (!was[side] && output.mSwinging[side])
+                {
+                    order.push_back(side);
+                    steepest = std::max(steepest,
+                        stairs(feet[side].mTarget.GetX()) - stairs(feet[1 - side].mPin.GetX()));
+                }
+                was[side] = output.mSwinging[side];
+            }
+        }
+        ASSERT_GE(order.size(), 6u);
+        int repeats = 0;
+        for (std::size_t k = 1; k < order.size(); ++k)
+            repeats += order[k] == order[k - 1];
+        std::printf("side-stepping stairs: %zu steps, %d repeats, steepest %.0f u over the other foot%c", order.size(),
+            repeats, steepest, 10);
+        EXPECT_EQ(order.front(), 1u); // strafing right: the right foot leads
+        EXPECT_EQ(repeats, 0);
+        EXPECT_LE(steepest, 16.0);
+    }
+
+    TEST(RagdollCoreFootfall, aSidewaysStepClimbsATreadAtATime)
+    {
+        const double off = steepestSideStep(0.0f);
+        const double on = steepestSideStep(20.0f);
+        std::printf("sideways stairs: steepest landing %.0f u over the other foot off, %.0f on%c", off, on, 10);
+        EXPECT_GT(off, 20.0);
+        EXPECT_LE(on, 20.0);
+    }
+
     // The stair gait (mStair): walking down tall stairs (24 u risers, 40 u
     // treads) along +y, the root riding the ground under it; the capsule
     // (mActorZ) one riser above it, and with `window` the ground probe sees
@@ -589,8 +721,9 @@ namespace
         }
         EXPECT_EQ(captureSteps[0], 0u);
         EXPECT_GE(captureSteps[1], 1u);
-        // The landings go with the drift (off: the 0.12 s x 0.3 sideways lead).
-        EXPECT_GT(across[1], across[0] + 8.0f) << across[0] << " " << across[1];
+        // The landings do not go against the drift (the capture is off in play;
+        // with Stride's event timing the steps in this window are the gait's own).
+        EXPECT_GE(across[1], across[0] - 1e-3f) << across[0] << " " << across[1];
     }
 
     TEST(RagdollCoreFootfall, slopeTiltsThePlantedSoleOntoTheGround)
@@ -628,6 +761,39 @@ namespace
                 EXPECT_NEAR(rig.controller.feet()[0].mPin.GetZ(), 6.5, 0.05);
             }
         }
+    }
+
+    // K2_DESCENT: walking down a slope the pelvis comes down toward the
+    // foothold ahead; on the flat and going up it does not.
+    TEST(RagdollCoreFootfall, aDescentLowersThePelvisToTheFootholdAhead)
+    {
+        const auto deepest = [](float grade, bool on) {
+            FootfallSettings settings;
+            if (on)
+                settings.mDescent = { 30.0f, 0.8f, 4.0f };
+            Rig rig;
+            rig.controller = FootfallController(settings);
+            rig.input.mGround = [grade](const JPH::RVec3& p, double) -> std::optional<double> {
+                return grade * p.GetY();
+            };
+            JPH::Vec3 root = JPH::Vec3::sZero();
+            for (int i = 0; i < 30; ++i)
+                rig.step(JPH::Vec3::sZero(), root);
+            float drop = 0.0f;
+            for (int i = 0; i < 240; ++i)
+            {
+                // The capsule rides the ground: forward at 120 u/s, down (or up) with the slope.
+                rig.input.mActorZ = root.GetZ() + grade * 120.0f * rig.input.mDt;
+                rig.step(JPH::Vec3(0.0f, 120.0f, grade * 120.0f), root);
+                drop = std::max(drop, rig.controller.pelvisDrop());
+            }
+            return drop;
+        };
+        const float down = deepest(-0.5f, true);
+        EXPECT_GT(down, deepest(-0.5f, false) + 8.0f);
+        EXPECT_LE(down, deepest(-0.5f, false) + 30.0f + 1e-3f);
+        EXPECT_NEAR(deepest(0.0f, true), deepest(0.0f, false), 1e-4f);
+        EXPECT_NEAR(deepest(0.5f, true), deepest(0.5f, false), 1e-4f);
     }
 
     TEST(RagdollCoreFootfall, slopeOffWithoutANormalProbe)
@@ -755,6 +921,145 @@ namespace
             }
         }
         EXPECT_TRUE(checked);
+    }
+
+    // mTurnStep: every swing of a run of the rig (when it started, how long it
+    // was given, how high the driven foot rose over its rest height, and
+    // how long it lasted) and the trace.
+    struct SwingSeen
+    {
+        float mAt = 0.0f, mGiven = 0.0f, mPeak = 0.0f, mLasted = 0.0f;
+    };
+    struct TurnRun
+    {
+        std::vector<SwingSeen> mSwings;
+        std::vector<std::pair<float, std::string>> mLines;
+    };
+    // `commandAt(seconds)` is the body's velocity; the rig stands 0.5 s first.
+    template <class Command>
+    TurnRun turnRun(const FootfallSettings& settings, float seconds, Command commandAt)
+    {
+        Rig rig;
+        rig.controller = FootfallController(settings);
+        TurnRun run;
+        float now = 0.0f;
+        rig.input.mTrace = [&](const std::string& line) { run.mLines.emplace_back(now, line); };
+        JPH::Vec3 root = JPH::Vec3::sZero();
+        for (int i = 0; i < 30; ++i)
+            rig.step(JPH::Vec3::sZero(), root);
+        std::array<int, 2> open{ -1, -1 };
+        const int steps = static_cast<int>(seconds / rig.input.mDt);
+        for (int i = 0; i < steps; ++i)
+        {
+            now = static_cast<float>(i) * rig.input.mDt;
+            const auto output = rig.step(commandAt(now), root);
+            for (std::size_t side = 0; side < 2; ++side)
+            {
+                if (output.mSwingStarted[side])
+                {
+                    open[side] = static_cast<int>(run.mSwings.size());
+                    run.mSwings.push_back({ now, rig.controller.feet()[side].mDuration, 0.0f, 0.0f });
+                }
+                if (open[side] < 0)
+                    continue;
+                SwingSeen& swing = run.mSwings[static_cast<std::size_t>(open[side])];
+                if (!output.mSwinging[side])
+                {
+                    swing.mLasted = now - swing.mAt;
+                    open[side] = -1;
+                    continue;
+                }
+                const Body foot = side == 0 ? LeftFoot : RightFoot;
+                swing.mPeak = std::max(swing.mPeak, rig.physics.mBodyTransforms[foot].mTranslation.GetZ() - 6.5f);
+            }
+        }
+        return run;
+    }
+
+    // A duel's keys: forward, left, back, right, a new one every 0.25 s.
+    JPH::Vec3 duelKeys(float seconds)
+    {
+        static const JPH::Vec3 ways[4] = { JPH::Vec3(0.0f, 100.0f, 0.0f), JPH::Vec3(-100.0f, 0.0f, 0.0f),
+            JPH::Vec3(0.0f, -100.0f, 0.0f), JPH::Vec3(100.0f, 0.0f, 0.0f) };
+        return ways[static_cast<int>(seconds / 0.25f) % 4];
+    }
+
+    TEST(RagdollCoreFootfall, aDirectionChangeStepLiftsAndTakesItsTime)
+    {
+        FootfallSettings on;
+        on.mTurnStep = { 14.0f, 0.3f, 0.3f };
+        const TurnRun off = turnRun(FootfallSettings(), 4.0f, duelKeys);
+        const TurnRun stepped = turnRun(on, 4.0f, duelKeys);
+        ASSERT_GE(off.mSwings.size(), 6u);
+        ASSERT_GE(stepped.mSwings.size(), 6u);
+        float offLowest = 1e9f, offShortest = 1e9f;
+        for (const auto& swing : off.mSwings)
+        {
+            if (swing.mLasted <= 0.0f)
+                continue;
+            offLowest = std::min(offLowest, swing.mPeak);
+            offShortest = std::min(offShortest, swing.mGiven);
+        }
+        // Without it the gait's own step is lower and quicker than the turn step's.
+        EXPECT_LT(offLowest, 12.0f);
+        EXPECT_LT(offShortest, 0.29f);
+        for (const auto& swing : stepped.mSwings)
+        {
+            if (swing.mLasted <= 0.0f)
+                continue;
+            EXPECT_GE(swing.mGiven, 0.3f - 1e-4f) << swing.mAt;
+            EXPECT_GE(swing.mPeak, 13.0f) << swing.mAt;
+        }
+    }
+
+    TEST(RagdollCoreFootfall, aSteadyWalkTakesNoTurnStep)
+    {
+        FootfallSettings on;
+        on.mTurnStep = { 14.0f, 0.3f, 0.3f };
+        const auto walk = [](float) { return JPH::Vec3(0.0f, 100.0f, 0.0f); };
+        const TurnRun stepped = turnRun(on, 5.0f, walk);
+        int early = 0, late = 0;
+        for (const auto& [at, line] : stepped.mLines)
+            if (line.rfind("RAGDOLL_FOOTFALL_TURN_STEP", 0) == 0)
+                ++(at < 0.5f ? early : late);
+        // The start from rest is a change; the walk after it is not.
+        EXPECT_GE(early, 1);
+        EXPECT_EQ(late, 0);
+        const TurnRun off = turnRun(FootfallSettings(), 5.0f, walk);
+        ASSERT_GE(stepped.mSwings.size(), 8u);
+        ASSERT_EQ(stepped.mSwings.size(), off.mSwings.size());
+        // From the third second the two walks step alike.
+        for (std::size_t i = 0; i < off.mSwings.size(); ++i)
+            if (off.mSwings[i].mAt > 2.0f && off.mSwings[i].mLasted > 0.0f)
+            {
+                EXPECT_NEAR(stepped.mSwings[i].mGiven, off.mSwings[i].mGiven, 1e-3f) << i;
+                EXPECT_NEAR(stepped.mSwings[i].mPeak, off.mSwings[i].mPeak, 0.5f) << i;
+            }
+    }
+
+    TEST(RagdollCoreFootfall, settingsReadTheTurnStep)
+    {
+        // The library's own default is off; the game's is the registry's.
+        EXPECT_FLOAT_EQ(FootfallSettings().mTurnStep[0], 0.0f);
+#ifdef _WIN32
+        _putenv_s("OPENMW_RAGDOLL_K2_TURN_STEP", "0");
+#else
+        setenv("OPENMW_RAGDOLL_K2_TURN_STEP", "0", 1);
+#endif
+        EXPECT_FLOAT_EQ(FootfallSettings::fromEnvironment().mTurnStep[0], 0.0f);
+#ifdef _WIN32
+        _putenv_s("OPENMW_RAGDOLL_K2_TURN_STEP", "12,0.3,0.35");
+#else
+        setenv("OPENMW_RAGDOLL_K2_TURN_STEP", "12,0.3,0.35", 1);
+#endif
+        const auto settings = FootfallSettings::fromEnvironment();
+        EXPECT_FLOAT_EQ(settings.mTurnStep[0], 12.0f);
+        EXPECT_FLOAT_EQ(settings.mTurnStep[2], 0.35f);
+#ifdef _WIN32
+        _putenv_s("OPENMW_RAGDOLL_K2_TURN_STEP", "");
+#else
+        unsetenv("OPENMW_RAGDOLL_K2_TURN_STEP");
+#endif
     }
 
     TEST(RagdollCoreFootfall, everyLandingIsTracedWithItsMiss)

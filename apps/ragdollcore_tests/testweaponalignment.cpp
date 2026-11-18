@@ -93,3 +93,16 @@ TEST(RagdollCoreWeaponAlignmentTest, opposingEdgesDoNotHalfTurnOnReversalOrLoseR
         previous = *next;
     }
 }
+
+TEST(RagdollCoreWeaponAlignmentTest, aSpearHeldAtItsMiddleKeepsItsHeadForward)
+{
+    // The 11-06 playthrough's proxies: centre along the long axis, half length.
+    EXPECT_EQ(RagdollCore::weaponTipSign(-1.30322f, 68.8168f, 0.2f), 1.0f); // steel spear
+    EXPECT_EQ(RagdollCore::weaponTipSign(-7.21472f, 61.047f, 0.2f), 1.0f); // steel staff of divine judgement
+    EXPECT_EQ(RagdollCore::weaponTipSign(2.33f, 53.11f, 0.2f), 1.0f); // iron spear
+    EXPECT_EQ(RagdollCore::weaponTipSign(33.59f, 57.95f, 0.2f), 1.0f); // iron claymore
+    // A grip well off the centre still decides, either way.
+    EXPECT_EQ(RagdollCore::weaponTipSign(-30.0f, 57.0f, 0.2f), -1.0f);
+    // Share 0: the centre's sign alone (the old rule).
+    EXPECT_EQ(RagdollCore::weaponTipSign(-1.30322f, 68.8168f, 0.0f), -1.0f);
+}

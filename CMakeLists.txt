@@ -674,7 +674,6 @@ endif()
 if (BUILD_COMPONENTS_TESTS)
     add_subdirectory(apps/components_tests)
     add_subdirectory(apps/ragdollcore_tests)
-    add_subdirectory(apps/ragdollcore_walksearch)
 endif()
 
 if (BUILD_BENCHMARKS)

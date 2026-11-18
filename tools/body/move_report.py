@@ -14,6 +14,9 @@ Per case, from the player diagnostics and the log:
   lift_*     why the player's feet lifted per speed band (lift_reasons.py, the
              same numbers play_metrics.py reads in play; needs
              OPENMW_RAGDOLL_FOOTFALL_TRACE=1, on with --play)
+  lift_*, goal_lift_*, land_miss_player/_npc, fallback_*
+             swing clearance per actor group and the NPC stuck fallback
+             (walk_traces.py; NPC swings need FOOTFALL_TRACE=all or npc)
 """
 import glob
 import gzip
@@ -26,6 +29,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lift_reasons  # noqa: E402
+import walk_traces  # noqa: E402
 
 RUN_SEGMENTS = ('c run', 'c run again', 'run')
 
@@ -51,6 +55,8 @@ def case_log_lines(out):
         for line in open(path, encoding='utf-8', errors='replace'):
             if '[ RUN      ] ' in line:
                 test = line.split('[ RUN      ] ', 1)[1].strip()
+            elif 'TEST_START\t' in line:  # the Lua suites' marker
+                test = line.rstrip().split('\t')[-1]
             elif test and 'RAGDOLL_' in line:
                 lines[test].append(line)
     return lines
@@ -124,6 +130,8 @@ def per_case(out):
         m['reaches'] = reaches.get(test, 0)
         lifts = lift_reasons.summary(lines.get(test, []))
         m.update({k: v for k, v in lifts.items() if v is not None and (not k.startswith('lift_n_') or v)})
+        walks = walk_traces.summary(lines.get(test, []))
+        m.update({k: v for k, v in walks.items() if v is not None and (not k.startswith(('swings_', 'fallback_')) or v)})
         result[test] = m
     return result
 

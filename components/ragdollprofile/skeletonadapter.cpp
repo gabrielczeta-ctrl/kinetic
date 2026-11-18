@@ -171,6 +171,28 @@ namespace RagdollProfile
                 return true;
             }
 
+            // The physics pose, or with an animation share (K2_CALM_DRAW) its
+            // blend toward the animation pose just evaluated; the whole
+            // share leaves the animation on the nodes. False = nothing written.
+            bool applyDrawnPose()
+            {
+                const float share = mAnimationShare;
+                if (!(share > 0.0f) || mAnimationPose.size() != mPose.size())
+                    return applyPose(mPose);
+                if (share >= 1.0f)
+                    return false;
+                const float weight = share * share * (3.0f - 2.0f * share);
+                std::vector<RagdollCore::Transform> drawn(mPose.size());
+                for (std::size_t i = 0; i < mPose.size(); ++i)
+                {
+                    drawn[i].mTranslation
+                        = mPose[i].mTranslation + (mAnimationPose[i].mTranslation - mPose[i].mTranslation) * weight;
+                    drawn[i].mRotation = mPose[i].mRotation.SLERP(mAnimationPose[i].mRotation, weight).Normalized();
+                }
+                return applyPose(drawn);
+            }
+
+            float mAnimationShare = 0.0f;
             std::mutex mMutex;
             osg::observer_ptr<SceneUtil::Skeleton> mSkeleton;
             std::vector<BoundNode> mNodes;
@@ -233,7 +255,7 @@ namespace RagdollProfile
                     // walk into a skate. It remains opt-in for sampled targets.
                     if (state->capturePose(animationPose, false))
                         state->mAnimationPose = std::move(animationPose);
-                    if (state->applyPose(state->mPose))
+                    if (state->applyDrawnPose())
                     {
                         RefreshRigBounds refresh(visitor->getTraversalNumber());
                         node->accept(refresh);
@@ -357,7 +379,7 @@ namespace RagdollProfile
         if (mImpl->mState->mAnimationPose.empty())
             mImpl->mState->capturePose(mImpl->mState->mAnimationPose);
         mImpl->mState->mPose.assign(pose.begin(), pose.end());
-        if (!mImpl->mState->applyPose(mImpl->mState->mPose))
+        if (!(mImpl->mState->mAnimationShare >= 1.0f) && !mImpl->mState->applyDrawnPose())
             return false;
         if (!mImpl->mCallback.valid())
         {
@@ -381,6 +403,14 @@ namespace RagdollProfile
             return false;
         std::scoped_lock lock(mImpl->mState->mMutex);
         return mImpl->mState->capturePose(pose, false);
+    }
+
+    void SkeletonPoseBinding::setAnimationShare(float share)
+    {
+        if (mImpl == nullptr)
+            return;
+        std::scoped_lock lock(mImpl->mState->mMutex);
+        mImpl->mState->mAnimationShare = share;
     }
 
     bool SkeletonPoseBinding::captureAnimationPose(std::vector<RagdollCore::Transform>& pose) const

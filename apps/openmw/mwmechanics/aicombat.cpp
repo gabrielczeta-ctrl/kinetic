@@ -246,6 +246,17 @@ namespace MWMechanics
 
         if (actorStats.isParalyzed() || actorStats.getKnockedDown())
             return false;
+        // A powered body clears Morrowind's knockdown (physics decides), so a
+        // body falling, lying or getting up acts as knocked down here: no
+        // attack, spell or move (bookmark 11-05: "npcs can cast spells when
+        // downed"). OPENMW_RAGDOLL_K2_DOWN_STILL (registry) = 0 lets it act.
+        static const auto downStill_tuned = RagdollCore::tuned<bool>([] {
+            const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_DOWN_STILL");
+            return text && std::atoi(text) != 0;
+        });
+        if (downStill_tuned.get())
+            if (const auto body = getRagdollDuelView(actor); body && body->mDown)
+                return false;
 
         if (!storage.isFleeing())
         {
@@ -368,6 +379,7 @@ namespace MWMechanics
                     static const auto& dodgeLearn = dodgeLearn_tuned.get();
                     self.mDodgeBonus = dodgeLearn * selfBody->mHitsTaken;
                     self.mGuardBroken = selfBody->mGuardBroken;
+                    self.mStaggered = selfBody->mStaggered;
                     // AI-02 fighter terms from the stats (read by the AI_* items).
                     {
                         RagdollCore::DuelStatsInput in;
@@ -461,6 +473,20 @@ namespace MWMechanics
                         storage.mDuelTargetLast = targetNow;
                         storage.mDuelTargetLastValid = true;
                         opponent.mClosing = storage.mDuelClosing;
+                        // K2_AI_ARRIVE: its own speed toward the target, the same way.
+                        const bool selfJumped = (selfNow - storage.mDuelSelfLast).length() > 50.0f;
+                        if (wasDuelling && storage.mDuelSelfLastValid && !selfJumped && duration > 0.0f && gap > 0.0f)
+                        {
+                            const float own = std::clamp(
+                                -((selfNow - storage.mDuelSelfLast) / duration) * toSelf, -900.0f, 900.0f);
+                            storage.mDuelSelfClosing
+                                += (own - storage.mDuelSelfClosing) * std::min(1.0f, duration / 0.1f);
+                        }
+                        else
+                            storage.mDuelSelfClosing = 0.0f;
+                        storage.mDuelSelfLast = selfNow;
+                        storage.mDuelSelfLastValid = true;
+                        self.mOwnClosing = storage.mDuelSelfClosing;
                     }
                     const RagdollCore::DuelPhase before = storage.mDuel.mPhase;
                     // OPENMW_RAGDOLL_DUEL_CHASE = retreat speed (units/s) that starts
@@ -522,9 +548,44 @@ namespace MWMechanics
                         if (const char* text = aiKnob("OPENMW_RAGDOLL_AI_RIPOSTE"))
                             std::sscanf(text, "%f,%f,%f,%f", &value.mRiposteWindow, &value.mRiposteChance0,
                                 &value.mRiposteChance100, &value.mRiposteWindShare);
+                        // OPENMW_RAGDOLL_K2_AI_SPACE (registry) = "chase speed u/s, chase
+                        // time s, patience x, margin u": how much room a duelling NPC
+                        // gives (each 0 = as before: 45, 0.25, x1, 14).
+                        {
+                            std::array<float, 4> space{ 0.0f, 0.0f, 0.0f, 0.0f };
+                            RagdollCore::tuningList("OPENMW_RAGDOLL_K2_AI_SPACE", space);
+                            for (float& v : space)
+                                v = std::isfinite(v) ? std::max(v, 0.0f) : 0.0f;
+                            if (space[0] > 0.0f)
+                                value.mRetreatSpeed = std::min(space[0], 1000.0f);
+                            if (space[1] > 0.0f)
+                                value.mRetreatTime = std::min(space[1], 5.0f);
+                            if (space[2] > 0.0f)
+                                value.mPatienceScale *= std::min(space[2], 10.0f);
+                            if (space[3] > 0.0f)
+                                value.mMargin = std::min(space[3], 200.0f);
+                        }
                         return value;
                     });
                     static const auto& tactics = tactics_tuned.get();
+                    // OPENMW_RAGDOLL_K2_AI_ARRIVE (registry) = "deceleration u/s^2,
+                    // strike hold share" (DuelTacticsSettings::mArriveDecel; 0 = off).
+                    static const auto arrive_tuned = RagdollCore::tuned<std::array<float, 2>>([] {
+                        std::array<float, 2> value{ 0.0f, 0.85f };
+                        if (const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_K2_AI_ARRIVE"))
+                            std::sscanf(text, "%f,%f", &value[0], &value[1]);
+                        value[0] = std::isfinite(value[0]) ? std::clamp(value[0], 0.0f, 5000.0f) : 0.0f;
+                        value[1] = std::isfinite(value[1]) ? std::clamp(value[1], 0.0f, 1.2f) : 0.0f;
+                        return value;
+                    });
+                    RagdollCore::DuelTacticsSettings arriving = tactics;
+                    arriving.mArriveDecel = arrive_tuned.get()[0];
+                    arriving.mStrikeHold = arrive_tuned.get()[1];
+                    // K2_AI_PRESS, _STEP_OUT, _BACK_CUT, _STAGGER_CUT (registry,
+                    // DuelPressSettings): attacks that chain, a shorter step-out,
+                    // cuts while backing from a charge and through a stagger.
+                    static const auto press_tuned = RagdollCore::tuned([] { return RagdollCore::duelPressSettings(); });
+                    arriving.mPress = press_tuned.get();
                     // AI-02 item 1a (AI_AIM): its own attack lasts as long as the
                     // wheel's wind-up and cut (and the recover's first 0.2 s), not
                     // only the animation's attack (NPCHIT-01 10-07: that ended first,
@@ -541,7 +602,10 @@ namespace MWMechanics
                     }
                     storage.mDuelSinceDown = selfBody->mDown ? 0.0f : storage.mDuelSinceDown + duration;
                     self.mSinceDown = storage.mDuelSinceDown;
-                    const auto out = RagdollCore::stepDuelTactics(storage.mDuel, self, opponent, duration, tactics);
+                    auto out = RagdollCore::stepDuelTactics(storage.mDuel, self, opponent, duration, arriving);
+                    // K2_AI_BEARINGS: not at a run while it gets its bearings.
+                    static const auto bearings_tuned = RagdollCore::tuned([] { return RagdollCore::duelBearingsPace(); });
+                    RagdollCore::limitToBearings(out, selfBody->mGettingBearings, bearings_tuned.get());
                     storage.stopCombatMove();
                     storage.mShouldApproach = false;
                     storage.mMovement.mPosition[0] = out.mStrafe;
@@ -580,8 +644,11 @@ namespace MWMechanics
                         requestRagdollAiGuard(actor, 0.3f);
                     // AI-02 item 5: the vanilla 0.1-1.0 s attack cooldown
                     // (updateAttack) would eat the riposte window.
-                    if (out.mReason == "riposte")
+                    if (out.mReason == "riposte" || out.mAttackNow)
                         storage.mAttackCooldown = 0.0f;
+                    // K2_AI_STAGGER_CUT: the reaction lets its weapon arm go.
+                    if (out.mFightThrough)
+                        requestRagdollAiFightThrough(actor);
                     // ... and only a decided riposte winds up short (review 10-08:
                     // every attack in the window did, also after a "no").
                     if (out.mRiposte)
@@ -595,7 +662,12 @@ namespace MWMechanics
                     static const auto& trace = trace_tuned.get();
                     // Dodges are logged too (they keep the phase).
                     const bool dodging = out.mReason == "side-step" || out.mReason == "give ground";
-                    if (trace && (out.mPhase != before || !wasDuelling || (dodging && !storage.mDuelDodgeLogged)))
+                    // ... and each immediate attack (press, back cut, stagger cut), once.
+                    const bool attackNowNew = out.mAttackNow && out.mReason != storage.mDuelNowLogged;
+                    storage.mDuelNowLogged = out.mAttackNow ? out.mReason : std::string_view();
+                    if (trace
+                        && (out.mPhase != before || !wasDuelling || (dodging && !storage.mDuelDodgeLogged)
+                            || attackNowNew))
                         Log(Debug::Info) << "RAGDOLL_DUEL actor=" << actor.getCellRef().getRefId()
                                          << " phase=" << RagdollCore::duelPhaseName(out.mPhase)
                                          << " reason=" << out.mReason << " distance=" << static_cast<int>(distance)
@@ -620,6 +692,10 @@ namespace MWMechanics
                                              << " what=pace fatigue=" << self.mFatigue
                                              << " patience=" << storage.mDuel.mPatience
                                              << " foe=" << opponent.mFatigue;
+                        if (!out.mStaggerRead.empty())
+                            Log(Debug::Info) << "RAGDOLL_AI2 actor=" << actor.getCellRef().getRefId()
+                                             << " what=stagger-cut chosen=" << out.mStaggerRead
+                                             << " distance=" << static_cast<int>(distance);
                         if (!out.mRiposteRead.empty())
                             Log(Debug::Info) << "RAGDOLL_AI2 actor=" << actor.getCellRef().getRefId()
                                              << " what=riposte chosen=" << out.mRiposteRead

@@ -968,6 +968,70 @@ namespace RagdollCore
                 || mode == ActiveControllerMode::Stumbling);
     }
 
+    bool animationRouteHasControl(bool uprightReady, bool rootHeld)
+    {
+        return uprightReady || rootHeld;
+    }
+
+    float balanceRisk(float tip, ActiveControllerMode mode)
+    {
+        if (mode == ActiveControllerMode::Falling || mode == ActiveControllerMode::Fallen)
+            return 1.0f;
+        // A quarter of the way to the edge is ordinary walking.
+        const float fromTip = std::clamp((tip - 0.45f) / 0.45f, 0.0f, 1.0f);
+        return mode == ActiveControllerMode::Stumbling ? std::max(fromTip, 0.75f) : fromTip;
+    }
+
+    BalanceSigil balanceSigil(JPH::RVec3Arg leftFoot, JPH::RVec3Arg rightFoot, JPH::RVec3Arg centreOfMass,
+        JPH::Vec3Arg capture, JPH::Vec3Arg forward, bool leftSupported, bool rightSupported)
+    {
+        BalanceSigil result;
+        JPH::Vec3 ahead(forward.GetX(), forward.GetY(), 0.0f);
+        if (!(ahead.LengthSq() > 1e-6f))
+            return result;
+        ahead = ahead.Normalized();
+        const JPH::Vec3 rightward = ahead.Cross(JPH::Vec3::sAxisZ());
+        const JPH::RVec3 mid = (leftFoot + rightFoot) * 0.5;
+        const auto flat = [&](JPH::RVec3Arg point) {
+            const JPH::Vec3 off(point - mid);
+            return JPH::Vec3(off.GetX(), off.GetY(), 0.0f);
+        };
+        const JPH::Vec3 left = flat(leftFoot), right = flat(rightFoot), com = flat(centreOfMass);
+        const JPH::Vec3 tip(capture.GetX(), capture.GetY(), 0.0f);
+        result.mKnown = true;
+        result.mLeftRight = left.Dot(rightward);
+        result.mLeftForward = left.Dot(ahead);
+        result.mRightRight = right.Dot(rightward);
+        result.mRightForward = right.Dot(ahead);
+        result.mComRight = com.Dot(rightward);
+        result.mComForward = com.Dot(ahead);
+        result.mTipRight = tip.Dot(rightward);
+        result.mTipForward = tip.Dot(ahead);
+        const JPH::Vec3 across = right - left;
+        const float span = across.Length();
+        result.mEdge = 0.5f * span + 45.0f;
+        if (leftSupported && rightSupported)
+        {
+            // Feet on one spot share the weight evenly.
+            const float share
+                = span > 1.0f ? std::clamp(0.5f + com.Dot(across) / (span * span), 0.0f, 1.0f) : 0.5f;
+            result.mRightLoad = share;
+            result.mLeftLoad = 1.0f - share;
+        }
+        else
+        {
+            result.mLeftLoad = leftSupported ? 1.0f : 0.0f;
+            result.mRightLoad = rightSupported ? 1.0f : 0.0f;
+        }
+        return result;
+    }
+
+    JPH::Quat dampedHeadTarget(JPH::QuatArg headPose, JPH::QuatArg torsoPose, JPH::QuatArg torsoNow, float damp)
+    {
+        const JPH::Quat following = (torsoNow * torsoPose.Conjugated() * headPose).Normalized();
+        return following.SLERP(headPose, std::clamp(damp, 0.0f, 1.0f)).Normalized();
+    }
+
     std::optional<StanceContactPositionOutput> calculateStanceContactPositionTarget(
         const StanceContactPositionInput& input)
     {
@@ -1172,8 +1236,13 @@ namespace RagdollCore
             mRecoveryStandingTime += duration;
         else
             mRecoveryStandingTime = 0.0f;
+        // K2_UPRIGHT_NOT_FALLEN: an upright pelvis well over its feet is on
+        // its feet.
+        const bool onItsFeet = std::isfinite(input.mPelvisAboveFeet)
+            && input.mPelvisAboveFeet > profile.mFallenMaximumPelvisHeight
+            && input.mPelvisUpDot >= profile.mBracingMinimumUpDot;
         const bool settled = grounded && centerOfMassSpeed <= profile.mSettledMaximumSpeed
-            && input.mPelvisHeight <= profile.mFallenMaximumPelvisHeight;
+            && input.mPelvisHeight <= profile.mFallenMaximumPelvisHeight && !onItsFeet;
         const bool recoveryStallCandidate = mMode == ActiveControllerMode::BlendBack && grounded
             && centerOfMassSpeed <= profile.mSettledMaximumSpeed
             && !recoveryStanding;

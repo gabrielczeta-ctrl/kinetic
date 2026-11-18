@@ -223,6 +223,12 @@ I.Settings.registerGroup({
         -- TRAJ-01 (user 10-31): the committed attack's path drawn on screen.
         { key = 'reticleTrajectory', renderer = 'checkbox', name = 'reticleTrajectoryName',
             description = 'reticleTrajectoryDescription', default = true },
+        -- TRACE-01 (user 11-05): the held press's mouse path at the reticle.
+        { key = 'reticleMouseTrace', renderer = 'checkbox', name = 'reticleMouseTraceName',
+            description = 'reticleMouseTraceDescription', default = true },
+        -- HUD-02 (user 11-03 B21): the weight arrow under the reticle.
+        { key = 'reticleWeightArrow', renderer = 'checkbox', name = 'reticleWeightArrowName',
+            description = 'reticleWeightArrowDescription', default = true },
     },
 })
 

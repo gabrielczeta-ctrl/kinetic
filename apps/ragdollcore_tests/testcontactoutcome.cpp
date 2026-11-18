@@ -53,6 +53,24 @@ namespace
         EXPECT_EQ(classifyBodyContact(cut(1600, 2.4f, 0.9f)).mOutcome, BodyContactOutcome::Stop);
     }
 
+    TEST(RagdollCoreContactOutcome, anEdgeStoppedByArmourSticksWithTheSetting)
+    {
+        // K2_EDGE_BITE: mail stops a solid cut; the edge holds in it.
+        EXPECT_FLOAT_EQ(classifyBodyContact(cut(800, 1.6f, 0.6f)).mHoldTime, 0.0f);
+        BodyContactSettings settings;
+        settings.mEdgeStick = 0.1f;
+        const auto stuck = classifyBodyContact(cut(800, 1.6f, 0.6f), settings);
+        EXPECT_EQ(stuck.mOutcome, BodyContactOutcome::Stop);
+        EXPECT_FLOAT_EQ(stuck.mHoldTime, 0.1f);
+        // Not the flat, not a blunt head.
+        BodyContactInput flat = cut(800, 1.6f, 0.2f);
+        flat.mEdgeAlignment = 0.2f;
+        EXPECT_FLOAT_EQ(classifyBodyContact(flat, settings).mHoldTime, 0.0f);
+        BodyContactInput blunt = cut(800, 1.6f, 0.6f);
+        blunt.mKind = BlowKind::Blunt;
+        EXPECT_FLOAT_EQ(classifyBodyContact(blunt, settings).mHoldTime, 0.0f);
+    }
+
     TEST(RagdollCoreContactOutcome, shallowAndFlatBlowsGlance)
     {
         // A shallow edge on flesh is a draw cut; on mail it glances.
@@ -147,5 +165,122 @@ namespace
         clash.mAttackMomentum = std::nanf("");
         clash.mGuardFirmness = std::nanf("");
         EXPECT_TRUE(std::isfinite(classifyClash(clash).mRatio));
+    }
+
+    // K2_BLOW_PRESS: flesh takes the blade as a shove, plate still rebounds.
+    TEST(RagdollCoreContactOutcome, pressKeepsTheBladeOnFlesh)
+    {
+        BlowPressSettings press;
+        press.mOn = true;
+        const ImpactHold before{ 0.1f, 300.0f };
+        for (const auto outcome :
+            { BodyContactOutcome::Bite, BodyContactOutcome::Cleave, BodyContactOutcome::Glance })
+        {
+            const ImpactHold held = pressImpact(outcome, 0.0f, 0.05f, before, press);
+            EXPECT_EQ(held.mFreeze, 0.0f);
+            EXPECT_EQ(held.mRecoil, 0.0f);
+        }
+        const ImpactHold flesh = pressImpact(BodyContactOutcome::Stop, 0.2f, 0.0f, before, press);
+        EXPECT_EQ(flesh.mFreeze, 0.0f);
+        EXPECT_EQ(flesh.mRecoil, 0.0f);
+        const ImpactHold plate = pressImpact(BodyContactOutcome::Stop, 0.9f, 0.0f, before, press);
+        EXPECT_EQ(plate.mFreeze, before.mFreeze);
+        EXPECT_EQ(plate.mRecoil, before.mRecoil);
+        const ImpactHold stuck = pressImpact(BodyContactOutcome::Stop, 0.9f, 0.1f, before, press);
+        EXPECT_EQ(stuck.mFreeze, 0.1f);
+        EXPECT_EQ(stuck.mRecoil, 0.0f);
+        press.mOn = false;
+        const ImpactHold off = pressImpact(BodyContactOutcome::Bite, 0.0f, 0.05f, before, press);
+        EXPECT_EQ(off.mFreeze, before.mFreeze);
+        EXPECT_EQ(off.mRecoil, before.mRecoil);
+    }
+
+    TEST(RagdollCoreContactOutcome, pressCarriesTheBodyMovingAlongTheBlow)
+    {
+        BlowPressSettings press;
+        press.mOn = true;
+        press.mBodyShare = 0.15f;
+        press.mMassCap = 8.0f;
+        // Standing: the weapon alone.
+        EXPECT_FLOAT_EQ(pressCarriedMass(2.0f, 75.0f, 0.0f, 900.0f, press), 2.0f);
+        // Moving away from the blow: never less than the weapon.
+        EXPECT_FLOAT_EQ(pressCarriedMass(2.0f, 75.0f, -300.0f, 900.0f, press), 2.0f);
+        // A jumping chop, a third of the closing speed the body's: + 0.15 x 75 / 3.
+        EXPECT_NEAR(pressCarriedMass(2.0f, 75.0f, 300.0f, 900.0f, press), 2.0f + 0.15f * 75.0f / 3.0f, 1e-4f);
+        // Capped.
+        EXPECT_FLOAT_EQ(pressCarriedMass(2.0f, 75.0f, 900.0f, 900.0f, press), 8.0f);
+        EXPECT_TRUE(std::isfinite(pressCarriedMass(std::nanf(""), 75.0f, std::nanf(""), 0.0f, press)));
+        press.mOn = false;
+        EXPECT_FLOAT_EQ(pressCarriedMass(2.0f, 75.0f, 900.0f, 900.0f, press), 2.0f);
+    }
+
+    // K2_PUSH_KICK: Strength drives the foot, Hand-to-hand couples the body,
+    // the run-in adds; off is KICK-01's push.
+    TEST(RagdollCoreContactOutcome, pushKickGrowsWithStrengthSkillAndRunIn)
+    {
+        PushKickInput in;
+        in.mStrength = 50.0f;
+        in.mHandToHand = 0.0f;
+        in.mFootSpeed = 350.0f;
+        PushKickSettings off;
+        const PushKick old = pushKick(in, off);
+        EXPECT_FLOAT_EQ(old.mSpeed, 240.0f);
+        EXPECT_FLOAT_EQ(old.mMass, 14.0f);
+        in.mStrength = 200.0f;
+        EXPECT_FLOAT_EQ(pushKick(in, off).mSpeed, 240.0f * 1.4f); // the old cap
+        PushKickSettings on;
+        on.mOn = true;
+        const PushKick strong = pushKick(in, on);
+        EXPECT_FLOAT_EQ(strong.mSpeed, 240.0f * 4.0f);
+        EXPECT_FLOAT_EQ(strong.mMass, 14.0f + 75.0f * 0.1f);
+        in.mHandToHand = 100.0f;
+        in.mKickerAlong = 200.0f;
+        const PushKick master = pushKick(in, on);
+        EXPECT_FLOAT_EQ(master.mMass, 14.0f + 75.0f * 0.35f);
+        EXPECT_FLOAT_EQ(master.mSpeed, 240.0f * 4.0f + 200.0f);
+        in.mGuarded = true;
+        EXPECT_FLOAT_EQ(pushKick(in, on).mSpeed, master.mSpeed * 0.8f);
+        in.mStrength = std::nanf("");
+        EXPECT_TRUE(std::isfinite(pushKick(in, on).mSpeed));
+    }
+
+    // K2_PUSH_KICK's carry: the whole body takes a share of the push's
+    // momentum, up to a cap; the kicker takes a share of that back.
+    TEST(RagdollCoreContactOutcome, pushKickThrowsTheWholeBodyUpToItsCap)
+    {
+        PushKickInput in;
+        in.mStrength = 50.0f;
+        in.mHandToHand = 0.0f;
+        in.mFootSpeed = 350.0f;
+        PushKickSettings on;
+        on.mOn = true;
+        EXPECT_FLOAT_EQ(pushKick(in, on).mCarry, 0.0f);
+        on.mCarry = 1.0f;
+        on.mCarryCap = 1000.0f;
+        on.mRecoil = 0.25f;
+        const PushKick kick = pushKick(in, on);
+        EXPECT_FLOAT_EQ(kick.mCarry, kick.mSpeed * kick.mMass / 75.0f);
+        EXPECT_FLOAT_EQ(kick.mRecoil, 0.25f * kick.mCarry);
+        in.mVictimMass = 150.0f;
+        EXPECT_FLOAT_EQ(pushKick(in, on).mCarry, 0.5f * kick.mCarry);
+        // It fells from a set speed, never through a guard.
+        in.mVictimMass = 75.0f;
+        on.mFell = kick.mCarry - 1.0f;
+        EXPECT_TRUE(pushKick(in, on).mFells);
+        on.mFell = kick.mCarry + 1.0f;
+        EXPECT_FALSE(pushKick(in, on).mFells);
+        on.mFell = 1.0f;
+        in.mGuarded = true;
+        EXPECT_FALSE(pushKick(in, on).mFells);
+        in.mGuarded = false;
+        on.mCarryCap = 10.0f;
+        EXPECT_FLOAT_EQ(pushKick(in, on).mCarry, 10.0f);
+        on.mOn = false;
+        EXPECT_FLOAT_EQ(pushKick(in, on).mCarry, 0.0f);
+        // The feet take the least of a carry, the trunk all of it.
+        EXPECT_FLOAT_EQ(bodyCarryShare(AnatomicalRegion::Chest), 1.0f);
+        EXPECT_LT(bodyCarryShare(AnatomicalRegion::LeftFoot), bodyCarryShare(AnatomicalRegion::LeftCalf));
+        EXPECT_LT(bodyCarryShare(AnatomicalRegion::RightCalf), bodyCarryShare(AnatomicalRegion::RightThigh));
+        EXPECT_LT(bodyCarryShare(AnatomicalRegion::RightThigh), 1.0f);
     }
 }

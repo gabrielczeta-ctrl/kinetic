@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -53,6 +54,7 @@
 #include "../mwworld/class.hpp"
 #include "../mwworld/esmstore.hpp"
 #include "../mwworld/inventorystore.hpp"
+#include "../mwworld/timestamp.hpp"
 
 #include "../mwmechanics/actorutil.hpp"
 #include "../mwmechanics/npcstats.hpp"
@@ -1073,6 +1075,8 @@ namespace MWRender
                 if (part == ESM::PRT_Weapon)
                     applyWeaponBlood(nullptr);
             }
+        // K2_WOUND_HEAL: wounds heal with health, armour marks with repair.
+        healWounds();
         // FX4: fresh wounds' blood keeps running downhill.
         if (mWoundFx)
             mWoundFx->update();
@@ -1360,7 +1364,8 @@ namespace MWRender
         return *mWoundFx;
     }
 
-    bool NpcAnimation::addWeaponBlood(float alongFrom, float alongTo, float strength, int bloodType)
+    bool NpcAnimation::addWeaponBlood(
+        float alongFrom, float alongTo, float strength, int bloodType, const osg::Vec3f& tipDirection)
     {
         if (!WoundFxSet::bloodEnabled() || !std::isfinite(alongFrom) || !std::isfinite(alongTo)
             || !std::isfinite(strength) || !(strength > 0) || bloodType == WoundFxSet::Blood_Dwemer)
@@ -1370,7 +1375,8 @@ namespace MWRender
         std::lock_guard<std::mutex> lock(mPendingWoundsMutex);
         if (mPendingWeaponBlood.size() >= 8)
             return false;
-        mPendingWeaponBlood.push_back({ alongFrom, alongTo, std::min(strength, 1.0f), bloodType });
+        mPendingWeaponBlood.push_back({ alongFrom, alongTo, std::min(strength, 1.0f), bloodType,
+            tipDirection.valid() ? tipDirection : osg::Vec3f() });
         return true;
     }
 
@@ -1400,7 +1406,7 @@ namespace MWRender
             mWeaponBlood.erase(mWeaponBlood.begin());
         const float seed = woundFx().newSeed();
         mWeaponBlood.push_back({ item, blood.mFrom, blood.mTo, blood.mStrength, WoundFxSet::now(), seed,
-            blood.mBloodType });
+            blood.mBloodType, blood.mTipDirection });
         applyWeaponBlood(&mWeaponBlood.back());
     }
 
@@ -1416,8 +1422,10 @@ namespace MWRender
         if (!only && !freshNode)
             return; // its marks are on it already
         // The blade in the bone's frame: its longest axis, from the grip (the
-        // bone's origin, Morrowind's weapon meshes are held there) to the far
-        // end, which is the tip (the pommel side is the shorter).
+        // bone's origin, Morrowind's weapon meshes are held there) to the
+        // tip: the end the mark's direction points at (the physical weapon's
+        // own), else the far end (the pommel side is the shorter; wrong for
+        // a spear held near its middle: BLADE-BLOOD-01, blood on the butt).
         WeaponDrawableVisitor visitor;
         node->accept(visitor);
         if (visitor.mFound.empty() || !visitor.mBox.valid())
@@ -1428,12 +1436,14 @@ namespace MWRender
         if (!(extent[axis] > 1.0f))
             return;
         osg::Vec3f grip = box.center();
-        osg::Vec3f tip = box.center();
         grip[axis] = std::clamp(0.0f, box._min[axis], box._max[axis]);
-        tip[axis] = std::abs(box._max[axis]) >= std::abs(box._min[axis]) ? box._max[axis] : box._min[axis];
-        const float bladeLength = std::abs(tip[axis] - grip[axis]);
-        if (!(bladeLength > 1.0f))
-            return;
+        const bool maxIsFar = std::abs(box._max[axis]) >= std::abs(box._min[axis]);
+        const auto tipOf = [&](const WeaponBlood& mark) {
+            osg::Vec3f tip = box.center();
+            const float way = mark.mTipDirection[axis];
+            tip[axis] = (std::abs(way) > 0.3f ? way > 0.0f : maxIsFar) ? box._max[axis] : box._min[axis];
+            return tip;
+        };
         Shader::ShaderManager& shaderManager = mResourceSystem->getSceneManager()->getShaderManager();
         WoundFxSet& fx = woundFx();
         std::vector<const WeaponBlood*> marks;
@@ -1449,21 +1459,24 @@ namespace MWRender
             osg::Matrix toLocal;
             if (!own.valid() || !toLocal.invert(found.mToBone))
                 continue;
-            float lowest = std::numeric_limits<float>::max();
-            float highest = -std::numeric_limits<float>::max();
-            for (unsigned int corner = 0; corner < 8; ++corner)
-            {
-                const float along
-                    = ((own.corner(corner) * found.mToBone)[axis] - grip[axis]) / (tip[axis] - grip[axis]);
-                lowest = std::min(lowest, along);
-                highest = std::max(highest, along);
-            }
             // The first mark on a shared (template) geometry swaps in this
             // actor's copy under the same parent: the next ones go on that.
             const unsigned int index = found.mParent->getChildIndex(found.mGeometry.get());
             for (std::size_t i = 0; i < marks.size(); ++i)
             {
                 const WeaponBlood& mark = *marks[i];
+                const osg::Vec3f tip = tipOf(mark);
+                if (!(std::abs(tip[axis] - grip[axis]) > 1.0f))
+                    continue;
+                float lowest = std::numeric_limits<float>::max();
+                float highest = -std::numeric_limits<float>::max();
+                for (unsigned int corner = 0; corner < 8; ++corner)
+                {
+                    const float along
+                        = ((own.corner(corner) * found.mToBone)[axis] - grip[axis]) / (tip[axis] - grip[axis]);
+                    lowest = std::min(lowest, along);
+                    highest = std::max(highest, along);
+                }
                 if (highest < mark.mFrom - 0.3f || lowest > mark.mTo + 0.3f)
                     continue;
                 osg::Drawable* target = index < found.mParent->getNumChildren()
@@ -1475,9 +1488,21 @@ namespace MWRender
                     placed[i] = true;
             }
         }
-        for (const bool took : placed)
-            if (took)
+        for (std::size_t i = 0; i < marks.size(); ++i)
+        {
+            if (placed[i])
                 ++mWeaponBloodPlaced;
+            // Where it went (the bone's frame, the long axis): grip, the two
+            // ends, the bloodied stretch.
+            const float tip = tipOf(*marks[i])[axis];
+            Log(Debug::Info) << "RAGDOLL_WEAPON_BLOOD_DRAWN actor=" << mPtr.getCellRef().getRefId()
+                             << " first_person=" << (mViewMode == VM_FirstPerson) << " placed=" << placed[i]
+                             << " axis=" << axis << " ends=" << box._min[axis] << ',' << box._max[axis]
+                             << " grip=" << grip[axis] << " tip=" << tip << " tip_way="
+                             << marks[i]->mTipDirection[axis] << " from=" << marks[i]->mFrom << " to=" << marks[i]->mTo
+                             << " stretch=" << grip[axis] + (tip - grip[axis]) * marks[i]->mFrom << ','
+                             << grip[axis] + (tip - grip[axis]) * marks[i]->mTo;
+        }
         mBloodiedWeaponNode = node;
     }
 
@@ -1603,6 +1628,7 @@ namespace MWRender
         // Bounded like the marks below: every projection input, in its part
         // node's frame, so a rebuilt part gets its wounds back.
         constexpr std::size_t maximumMarks = 48;
+        const float woundSeed = mReseedingWounds ? mReseedFxSeed : woundFx().newSeed();
         const auto rememberSeed = [&] {
             if (mReseedingWounds || !mObjectParts[part] || !mObjectParts[part]->getNode())
                 return;
@@ -1611,11 +1637,16 @@ namespace MWRender
                 return;
             const osg::Matrix toWorld = osg::computeLocalToWorld(paths.front());
             const osg::Matrix toLocal = osg::Matrix::inverse(toWorld);
+            // The oldest wound gives way, with what is drawn of it (a mark
+            // without its record could never heal).
             while (mWoundSeeds.size() >= maximumMarks)
+            {
+                removeWoundMarks(mWoundSeeds.front().mFxSeed);
                 mWoundSeeds.erase(mWoundSeeds.begin());
+            }
             mWoundSeeds.push_back({ part, std::string(region), kind, severity, point * toLocal,
                 osg::Matrix::transform3x3(normal, toLocal), osg::Matrix::transform3x3(tangent, toLocal), fxLength,
-                fxHalfWidth, surface });
+                fxHalfWidth, surface, woundSeed });
         };
         // WOUNDFX-01 FX1/FX2: every wound on bare skin becomes a wound volume
         // in the skin shader instead of a mesh-copy mark: slashes, stabs,
@@ -1677,7 +1708,7 @@ namespace MWRender
                 }
                 WoundFxSet& fx = woundFx();
                 Shader::ShaderManager& shaderManager = mResourceSystem->getSceneManager()->getShaderManager();
-                const float seed = fx.newSeed();
+                const float seed = woundSeed;
                 // FX4: the frame the skin under the wound moves with, for its
                 // blood running downhill: a skinned part's region bone, a
                 // rigid part's (or a head's) parent node.
@@ -1749,7 +1780,8 @@ namespace MWRender
                             (strength - WoundFxSet::armourBleedSeverity()) / 0.4f, 0.0f, 1.0f);
                         fx.addWound(*query.mDrawable, query.mParent.get(), *query.mPosed, query.mMatrix,
                             welling * osg::Matrix::inverse(query.mMatrix), n, down, WoundFxSet::Kind_Stain,
-                            0.5f * length, 0.9f * halfWidth * ooze, strength, fx.newSeed(), shaderManager,
+                            0.5f * length, 0.9f * halfWidth * ooze, strength, WoundFxSet::bleedSeed(seed),
+                            shaderManager,
                             WoundFxSet::Kind_Bruise, false, runFrame(query.mDrawable.get(), query.mParent.get()));
                     }
                     mLastWoundFxKind = drawnKind;
@@ -1839,7 +1871,7 @@ namespace MWRender
             mWoundOverlays.erase(mWoundOverlays.begin());
         }
         query.mParent->addChild(drawable);
-        mWoundOverlays.push_back({ query.mParent, drawable, part });
+        mWoundOverlays.push_back({ query.mParent, drawable, part, woundSeed });
         rememberSeed();
         return true;
     }
@@ -1858,11 +1890,103 @@ namespace MWRender
             if (seed.mPart != type)
                 continue;
             mReseedSurface = seed.mSurface;
+            mReseedFxSeed = seed.mFxSeed;
             placeWound(seed.mRegion, seed.mKind, seed.mPoint * toWorld,
                 osg::Matrix::transform3x3(seed.mNormal, toWorld), osg::Matrix::transform3x3(seed.mTangent, toWorld),
                 seed.mSeverity, seed.mLength, seed.mHalfWidth);
         }
         mReseedingWounds = false;
+    }
+
+    void NpcAnimation::removeWoundMarks(float seed)
+    {
+        if (mWoundFx)
+            mWoundFx->remove(seed);
+        for (auto it = mWoundOverlays.begin(); it != mWoundOverlays.end();)
+        {
+            if (it->mSeed != seed)
+            {
+                ++it;
+                continue;
+            }
+            it->mParent->removeChild(it->mNode);
+            it = mWoundOverlays.erase(it);
+        }
+    }
+
+    void NpcAnimation::healOldestWounds(bool armour, int count)
+    {
+        for (auto it = mWoundSeeds.begin(); count > 0 && it != mWoundSeeds.end();)
+        {
+            if ((it->mSurface == WoundFxSet::Surface_Armour) != armour)
+            {
+                ++it;
+                continue;
+            }
+            removeWoundMarks(it->mFxSeed);
+            it = mWoundSeeds.erase(it);
+            --count;
+        }
+    }
+
+    void NpcAnimation::healWounds()
+    {
+        static const auto settings_tuned = RagdollCore::tuned<RagdollCore::WoundHealSettings>([] {
+            return RagdollCore::parseWoundHealSettings(RagdollCore::tuningText("OPENMW_RAGDOLL_K2_WOUND_HEAL"));
+        });
+        static const auto& settings = settings_tuned.get();
+        int body = 0;
+        int armour = 0;
+        for (const WoundSeed& seed : mWoundSeeds)
+            ++(seed.mSurface == WoundFxSet::Surface_Armour ? armour : body);
+        mBodyWounds = body;
+        mArmourWounds = armour;
+        // A pool is followed only while it has wounds: the first wound's step
+        // takes the readings, so nothing restored before it counts.
+        if (!settings.mOn || mPtr.isEmpty() || body + armour == 0)
+        {
+            mBodyHeal = {};
+            mArmourHeal = {};
+            return;
+        }
+        const MWWorld::TimeStamp stamp = MWBase::Environment::get().getWorld()->getTimeStamp();
+        const double hours = stamp.getDay() * 24.0 + stamp.getHour();
+        if (body == 0)
+            mBodyHeal = {};
+        else
+        {
+            const auto& health = mPtr.getClass().getCreatureStats(mPtr).getHealth();
+            const float share = RagdollCore::woundHealShare(
+                mBodyHeal, health.getCurrent(), health.getModified(), hours, settings);
+            healOldestWounds(false, RagdollCore::woundMarksHealed(mBodyHeal, body, share));
+        }
+        if (armour == 0 || !mPtr.getClass().hasInventoryStore(mPtr))
+        {
+            mArmourHeal = {};
+            return;
+        }
+        // The armour's pool: the condition of every worn piece, summed (the
+        // game wears a random piece per blow, not the struck one).
+        float condition = 0;
+        float whole = 0;
+        std::size_t worn = 0;
+        const MWWorld::InventoryStore& inv = mPtr.getClass().getInventoryStore(mPtr);
+        for (int slot = 0; slot < MWWorld::InventoryStore::Slots; ++slot)
+        {
+            const MWWorld::ConstContainerStoreIterator item = inv.getSlot(slot);
+            if (item == inv.end() || item->getType() != ESM::Armor::sRecordId)
+                continue;
+            condition += static_cast<float>(item->getClass().getItemHealth(*item));
+            whole += static_cast<float>(item->getClass().getItemMaxHealth(*item));
+            worn = worn * 1000003u + std::hash<const void*>()(item->mRef);
+        }
+        if (worn != mWornArmour)
+        {
+            mWornArmour = worn;
+            mArmourHeal = {};
+        }
+        const float share = RagdollCore::woundHealShare(mArmourHeal, condition, whole, hours, settings);
+        healOldestWounds(true, RagdollCore::woundMarksHealed(mArmourHeal, armour, share));
     }
 
     void NpcAnimation::applyPartDamageTint(ESM::PartReferenceType type)

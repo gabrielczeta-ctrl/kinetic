@@ -5,7 +5,10 @@
 
 #ifdef OPENMW_RAGDOLL_DEV_API
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <charconv>
 #include <string_view>
@@ -576,6 +579,10 @@ namespace MWLua
             result["playerPressCount"] = state->mPlayerPressCount;
             result["wristOutsideRight"] = state->mWristOutsideRight;
             result["blockStaggers"] = state->mBlockStaggers;
+            result["clashes"] = state->mClashes;
+            result["clashSlides"] = state->mClashSlides;
+            result["kicks"] = state->mKicks;
+            result["kickHits"] = state->mKickHits;
             result["dazeTime"] = state->mDazeTime;
             result["dazeDrop"] = state->mDazeDrop;
             result["dazeCount"] = state->mDazeCount;
@@ -598,6 +605,19 @@ namespace MWLua
                 hsc["pole"] = state->mHscPole;
                 hsc["blade"] = state->mHscBlade;
                 hsc["stage"] = state->mHscStage;
+                hsc["fists"] = state->mFistHudActive;
+                hsc["fistDrag"] = state->mFistHudDrag;
+                hsc["leftAim"] = state->mFistAimBlend[0];
+                hsc["rightAim"] = state->mFistAimBlend[1];
+                if (state->mFistAimOrigin)
+                {
+                    hsc["aimOrigin"] = *state->mFistAimOrigin;
+                    hsc["aimDirection"] = state->mFistAimDirection;
+                }
+                hsc["leftCharge"] = state->mFistHudCharge[0];
+                hsc["rightCharge"] = state->mFistHudCharge[1];
+                hsc["leftPunch"] = state->mFistHudKind[0];
+                hsc["rightPunch"] = state->mFistHudKind[1];
                 hsc["stanceX"] = state->mHscStanceX;
                 hsc["stanceY"] = state->mHscStanceY;
                 hsc["angle"] = state->mHscAngle;
@@ -609,8 +629,9 @@ namespace MWLua
                 hsc["riposte"] = state->mHscRiposte;
                 hsc["flow"] = state->mHscFlow;
                 hsc["sinceParryWon"] = state->mHscSinceParryWon;
-                hsc["grip"] = state->mHscGripMode;
+                hsc["gripMode"] = state->mHscGripMode; // "grip" is the grip's position
                 hsc["jabs"] = state->mHscJabs;
+                hsc["palmParries"] = state->mHscPalmParries;
                 hsc["jab"] = state->mHscJab;
                 hsc["route"] = state->mHscRoute;
                 hsc["reseat"] = state->mHscReseat;
@@ -621,6 +642,12 @@ namespace MWLua
                     for (std::size_t i = 0; i < state->mHscTrajectory.size(); ++i)
                         trajectory[i + 1] = state->mHscTrajectory[i];
                     hsc["trajectory"] = std::move(trajectory);
+                }
+                if (state->mHscMark)
+                {
+                    hsc["mark"] = *state->mHscMark;
+                    hsc["markHit"] = state->mHscMarkHit;
+                    hsc["markGap"] = state->mHscMarkGap;
                 }
                 result["hsc"] = std::move(hsc);
             }
@@ -914,7 +941,29 @@ namespace MWLua
             result["guardZone"] = state->mGuardZone;
             result["balanceRight"] = state->mBalanceRight;
             result["balanceForward"] = state->mBalanceForward;
+            result["balanceRisk"] = state->mBalanceRisk;
             result["balanceTip"] = state->mBalanceTip;
+            result["weightRight"] = state->mWeightRight;
+            result["weightForward"] = state->mWeightForward;
+            result["weightEdge"] = state->mWeightEdge;
+            if (state->mBalanceSigil.mKnown)
+            {
+                const auto& s = state->mBalanceSigil;
+                sol::table sigil(thisState, sol::create);
+                sigil["leftX"] = s.mLeftRight;
+                sigil["leftY"] = s.mLeftForward;
+                sigil["rightX"] = s.mRightRight;
+                sigil["rightY"] = s.mRightForward;
+                sigil["comX"] = s.mComRight;
+                sigil["comY"] = s.mComForward;
+                sigil["tipX"] = s.mTipRight;
+                sigil["tipY"] = s.mTipForward;
+                sigil["leftLoad"] = s.mLeftLoad;
+                sigil["rightLoad"] = s.mRightLoad;
+                sigil["edge"] = s.mEdge;
+                sigil["daze"] = state->mBalanceDaze;
+                result["balanceSigil"] = std::move(sigil);
+            }
             result["attackReady"] = state->mAttackReady;
             result["guardStartPhysicsStep"] = std::to_string(state->mGuardStartPhysicsStep);
             result["otherRagdollContacts"] = state->mOtherRagdollContacts;
@@ -1223,6 +1272,50 @@ namespace MWLua
             }, "InjectRagdollTestMouseInput");
         };
 
+        // The pilot channel (tools/body/pilot.py, the test_pilot suite): an
+        // outside process plays the player through the test seams. Lua posts
+        // one observation line to <OPENMW_RAGDOLL_PILOT_DIR>/obs.jsonl and
+        // takes the next unread, newline-ended line of act.txt. The call
+        // waits up to waitMs with the game frozen inside it, so nothing moves
+        // while the pilot decides (step-locked); 0 does not wait.
+        api["pilotExchange"] = [](sol::optional<std::string> observation,
+                                   sol::optional<int> waitMs) -> sol::optional<std::string> {
+            static std::streamoff offset = 0;
+            const char* directory = RagdollCore::tuningText("OPENMW_RAGDOLL_PILOT_DIR");
+            if (directory == nullptr || *directory == '\0')
+                return sol::nullopt;
+            const std::filesystem::path root(directory);
+            if (observation)
+            {
+                std::ofstream out(root / "obs.jsonl", std::ios::binary | std::ios::app);
+                if (!out)
+                    throw std::runtime_error("Unable to open the pilot observation file");
+                out << *observation << '\n';
+            }
+            const auto deadline = std::chrono::steady_clock::now()
+                + std::chrono::milliseconds(std::clamp(waitMs.value_or(0), 0, 600000));
+            for (;;)
+            {
+                std::ifstream in(root / "act.txt", std::ios::binary);
+                if (in)
+                {
+                    in.seekg(offset);
+                    std::string line;
+                    // A line without its newline is still being written.
+                    if (std::getline(in, line) && !in.eof())
+                    {
+                        offset += static_cast<std::streamoff>(line.size()) + 1;
+                        if (!line.empty() && line.back() == '\r')
+                            line.pop_back();
+                        return line;
+                    }
+                }
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return sol::nullopt;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        };
+
         api["testStepMultiplier"] = [] { return OMW::TestStepScheduler::requested(); };
         api["setTestStepActive"] = [](bool active, unsigned seed) {
             if (!OMW::TestStepScheduler::requested()) return;
@@ -1317,6 +1410,13 @@ namespace MWLua
             const auto& ptr = requireActor(object);
             context.mLuaManager->addAction(
                 [actor = Object(ptr)] { getPhysicsSystem().shovePassiveRagdoll(actor.ptr()); }, "RagdollTestShove");
+        };
+
+        // KICK-01: the actor kicks (as the player's middle button).
+        api["kick"] = [context](const GObject& object) {
+            const auto& ptr = requireActor(object);
+            context.mLuaManager->addAction(
+                [actor = Object(ptr)] { getPhysicsSystem().kickPassiveRagdoll(actor.ptr()); }, "RagdollTestKick");
         };
 
         // Live tuning (TUNE-01): the same override the KINETIC page's
@@ -1551,8 +1651,10 @@ namespace MWLua
             getPhysicsSystem().addRagdollLimbDamage(requireActor(object), region, damage);
         };
         api["stageWoundReceipt"] = [](const GObject& actor, std::string_view body, int kind,
-            const osg::Vec3f& point, const osg::Vec3f& normal) {
-            return getPhysicsSystem().stageWoundReceipt(requireActor(actor), body, kind, point, normal);
+            const osg::Vec3f& point, const osg::Vec3f& normal, sol::optional<GObject> attacker,
+            sol::optional<float> weaponAlong) {
+            return getPhysicsSystem().stageWoundReceipt(requireActor(actor), body, kind, point, normal,
+                attacker ? requireActor(*attacker) : MWWorld::Ptr(), weaponAlong.value_or(0.9f));
         };
         // WOUNDFX-01 look check (OPENMW_RAGDOLL_WOUND_FX=1): one shader
         // wound on a region's bare skin. point: world, near the skin; normal:
@@ -1600,6 +1702,18 @@ namespace MWLua
                 "AddRagdollTestWoundFx");
         };
         api["getWoundFxAdded"] = [] { return woundFxAdded().load(); };
+        // HEAL-01 (K2_WOUND_HEAL): the wounds an actor carries as of its last
+        // animation update: { body = on skin and clothing, armour = marks on
+        // its armour }.
+        api["getWoundCounts"] = [lua](const GObject& object) {
+            sol::table result(lua, sol::create);
+            const MWRender::Animation* animation
+                = MWBase::Environment::get().getWorld()->getAnimation(requireActor(object));
+            const std::pair<int, int> counts = animation ? animation->getWoundCounts() : std::pair<int, int>{ 0, 0 };
+            result["body"] = counts.first;
+            result["armour"] = counts.second;
+            return result;
+        };
         // How the last addWoundFx wound was drawn: 'bruise', 'slash', 'stab',
         // 'chop' (skin), 'stain' (clothing), 'scratch' (armour: a scored line
         // or a dent), 'mark' (took as a mesh-copy mark), 'none'.
@@ -1619,6 +1733,8 @@ namespace MWLua
         // skeleton's dust. Queued like a hit's (Animation::addWeaponBlood),
         // drawn at the actor's next animation update; getWeaponBloodFx counts
         // the marks drawn on its weapons so far.
+        // The tip is the end further from the grip (the rule a mark without
+        // the physical weapon's direction falls back to, BLADE-BLOOD-01).
         api["addWeaponBloodFx"] = [context](const GObject& object, float from, float to,
                                       sol::optional<float> strength, sol::optional<int> bloodType) {
             const MWWorld::Ptr& ptr = requireActor(object);
@@ -1639,6 +1755,26 @@ namespace MWLua
             return animation ? animation->getWeaponBloodCount() : 0;
         };
 
+        // K2_LODGE: the actor's weapon in another body - kind (none, stab,
+        // chop, pass), clearing, depth, deepest, age, and of the last one its
+        // kind, release, deepest and held seconds; count so far.
+        api["getLodge"] = [](sol::this_state lua, const GObject& object) -> sol::object {
+            const auto view = getPhysicsSystem().getRagdollLodge(requireActor(object));
+            if (!view)
+                return sol::nil;
+            sol::table result(lua, sol::create);
+            result["kind"] = view->mKind;
+            result["clearing"] = view->mClearing;
+            result["depth"] = view->mDepth;
+            result["deepest"] = view->mDeepest;
+            result["age"] = view->mAge;
+            result["lastKind"] = view->mLastKind;
+            result["lastRelease"] = view->mLastRelease;
+            result["lastDeepest"] = view->mLastDeepest;
+            result["lastHeld"] = view->mLastHeld;
+            result["count"] = view->mCount;
+            return result;
+        };
         api["getSwingSpeed"] = [](const GObject& object) {
             return getPhysicsSystem().getRagdollWeaponSwingSpeed(requireActor(object));
         };

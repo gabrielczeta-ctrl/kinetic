@@ -229,6 +229,30 @@ namespace RagdollCore
         float mTargetClampDelta = 0.0f;
     };
 
+    // A joint's limits, radians: a hinge's angles, or a swing-twist joint's
+    // half cones and twist angles.
+    struct JointRange
+    {
+        bool mHinge = false;
+        float mNormalHalfCone = 0.0f;
+        float mPlaneHalfCone = 0.0f;
+        float mTwistMin = 0.0f;
+        float mTwistMax = 0.0f;
+        float mHingeMin = 0.0f;
+        float mHingeMax = 0.0f;
+    };
+
+    // Where a joint is, in its limits' own terms: a hinge's angle, or the y
+    // and z of the swing quaternion (w >= 0; the plane and the normal half
+    // cones limit them) and the twist angle.
+    struct JointAt
+    {
+        float mHinge = 0.0f;
+        float mSwingY = 0.0f;
+        float mSwingZ = 0.0f;
+        float mTwist = 0.0f;
+    };
+
     struct ConstraintImpulse
     {
         float mLinear = 0.0f;
@@ -282,6 +306,8 @@ namespace RagdollCore
         float getSoftRootStrength() const { return mSoftRootStrength; }
         // Scales the soft root's horizontal hold only (catch steps).
         void setSoftRootHorizontalScale(float scale) { mSoftRootHorizontalScale = std::clamp(scale, 0.0f, 1.0f); }
+        // The whole-body drive's share (ActiveBodyInput::mFieldShare).
+        void setSoftRootFieldShare(float share) { mSoftRootFieldShare = std::clamp(share, 0.0f, 1.0f); }
         // Caps the pelvis anchor's spring frequency (0 = no cap): getting up,
         // a stiff anchor snapped the lying pelvis to the clip and flipped it.
         void setSoftAnchorFrequencyCap(float cap) { mSoftAnchorFrequencyCap = cap; }
@@ -327,6 +353,9 @@ namespace RagdollCore
             float mPositionError = 0.0f;
             float mAngleError = 0.0f;
             bool mSaturated = false;
+            // The target above the root body (units, + up): the spring's
+            // vertical error (MOVE-01 W1, RAGDOLL_LOAD errZ).
+            float mPositionErrorUp = 0.0f;
         };
         const SoftRootTelemetry& getSoftRootTelemetry() const { return mSoftRootTelemetry; }
         // Scale one body's contact friction relative to its authored value
@@ -433,6 +462,11 @@ namespace RagdollCore
         std::optional<std::pair<float, float>> getHingeJointLimits(std::size_t bodyIndex) const;
         bool setSwingTwistJointLimits(
             std::size_t bodyIndex, float normalHalfCone, float planeHalfCone, float twistMin, float twistMax);
+        // The joint to a body's parent: its limits as they are now and where
+        // the two bodies hold it (read from the bodies, any time after the
+        // build). nullopt for the root and for other joint types.
+        std::optional<std::pair<JointRange, JointAt>> getJointRange(std::size_t bodyIndex) const;
+        bool setJointRange(std::size_t bodyIndex, const JointRange& range);
         // Clamps one already-driven joint target relative to the constraint's
         // measured orientation. Call after driveToPoseUsingMotors and before
         // PhysicsSystem::Update.
@@ -615,6 +649,7 @@ namespace RagdollCore
         float mSoftAnchorFrequencyCap = 0.0f;
         float mSoftRootStrength = 1.0f;
         float mSoftRootHorizontalScale = 1.0f;
+        float mSoftRootFieldShare = 0.0f;
         float mSoftRootSupport = 1.0f;
         std::optional<JPH::RVec3> mSoftRootPreviousPosition;
         std::optional<JPH::Quat> mSoftRootPreviousRotation;

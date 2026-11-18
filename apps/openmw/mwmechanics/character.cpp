@@ -18,6 +18,7 @@
  */
 
 #include "character.hpp"
+#include <ragdollcore/roottarget.hpp>
 #include <ragdollcore/tuning.hpp>
 
 #include <array>
@@ -37,6 +38,7 @@
 #include "../mwrender/animation.hpp"
 
 #include "../mwbase/environment.hpp"
+#include "../mwbase/inputmanager.hpp"
 #include "../mwbase/luamanager.hpp"
 #include "../mwbase/mechanicsmanager.hpp"
 #include "../mwbase/soundmanager.hpp"
@@ -60,6 +62,7 @@
 #include "weapontype.hpp"
 
 #ifdef OPENMW_RAGDOLL_DEV_API
+#include <cstdio>
 #include <cstdlib>
 #include <components/debug/debuglog.hpp>
 #include "../mwrender/npcanimation.hpp"
@@ -495,6 +498,11 @@ namespace MWMechanics
         {
             mHitState = isSwimming ? CharState_SwimKnockOut : CharState_KnockOut;
             stats.setKnockedDown(true);
+            // A fall's cause in the log (user 11-07: "make sure that if the
+            // player falls there is a good reason for it"): exhaustion.
+            Log(Debug::Info) << "RAGDOLL_KNOCKOUT actor=" << mPtr.getCellRef().getRefId()
+                             << " cause=exhaustion fatigue=" << stats.getFatigue().getCurrent() << "/"
+                             << stats.getFatigue().getModified();
         }
         else if (knockdown)
         {
@@ -2324,6 +2332,13 @@ namespace MWMechanics
             }
 
             osg::Vec3f rot = cls.getRotationVector(mPtr);
+            // K2_NPC_START: an NPC's body turns at a limited rate.
+            {
+                static const auto npcTurn_tuned = RagdollCore::tuned([] { return RagdollCore::npcStartSettings(); });
+                const float turnRate = npcTurn_tuned.get().mTurnRate;
+                if (turnRate > 0.f && duration > 0.f && !isPlayer && world->isPoweredRagdoll(mPtr))
+                    rot.z() = std::clamp(rot.z(), -turnRate * duration, turnRate * duration);
+            }
             osg::Vec3f vec(movementSettings.asVec3());
             movementSettings.mSpeedFactor = std::min(vec.length(), 1.f);
             vec.normalize();
@@ -2416,6 +2431,29 @@ namespace MWMechanics
                 mAnimation->setUpperBodyYawRadians(mAnimation->getUpperBodyYawRadians() + mAnimation->getHeadYaw() / 2);
 
             speed = cls.getCurrentSpeed(mPtr);
+            // K2_GAIT_CAP (ragdollcore roottarget.hpp): a physical body moves
+            // no faster than its legs carry it. Capped here, the speed the
+            // capsule moves at and the one the movement clip plays at are the
+            // same, so the legs' stride matches the travel.
+            {
+                static const auto gaitCap_tuned = RagdollCore::tuned([] { return RagdollCore::gaitCapSettings(); });
+                const RagdollCore::GaitCapSettings& gaitCap = gaitCap_tuned.get();
+                if (gaitCap.mSpeed > 0.f && speed > gaitCap.mSpeed && !inwater && !flying
+                    && (gaitCap.mPlayer || !isPlayer) && world->isPoweredRagdoll(mPtr))
+                    speed = gaitCap.mSpeed;
+                // K2_STAIR_STRAFE (registry): slower side steps on stairs.
+                if (!inwater && !flying)
+                    speed *= world->poweredMoveScale(mPtr);
+                // K2_NPC_START: from a stop an NPC ramps up to its speed.
+                static const auto npcStart_tuned = RagdollCore::tuned([] { return RagdollCore::npcStartSettings(); });
+                const RagdollCore::NpcStartSettings& npcStart = npcStart_tuned.get();
+                if (npcStart.mAcceleration > 0.f && !isPlayer && !inwater && !flying && world->isPoweredRagdoll(mPtr))
+                {
+                    mNpcStartSpeed = RagdollCore::npcStartSpeed(mNpcStartSpeed, speed, vec.x() != 0.f || vec.y() != 0.f,
+                        npcStart.mAcceleration, duration);
+                    speed = std::min(speed, mNpcStartSpeed);
+                }
+            }
             vec.x() *= speed;
             vec.y() *= speed;
 
@@ -2533,7 +2571,6 @@ namespace MWMechanics
                     }
                 }
             }
-
             if (!mInJump)
             {
                 if (mJumpState == JumpState_InAir && !flying && solid && wasInJump)
@@ -2702,8 +2739,27 @@ namespace MWMechanics
                 // route publishes a persistent scale so the played stride can
                 // match the actor's movement speed.
                 const float maxSpeedMult = 10.f;
-                const float speedMult
-                    = speed / mMovementAnimSpeed * mAnimation->getLocomotionSpeedScale();
+                float speedMult = speed / mMovementAnimSpeed * mAnimation->getLocomotionSpeedScale();
+                // K2_ARM_STEP: the clip's loop takes as long as the legs' cycle.
+                if (const float loop = mAnimation->takeLocomotionLoop(duration); loop > 0.f)
+                {
+                    if (mLoopClip != mCurrentMovement)
+                    {
+                        mLoopClip = mCurrentMovement;
+                        const auto keyTime = [&](std::string_view key) {
+                            return mAnimation->getTextKeyTime(mCurrentMovement + ": " + std::string(key));
+                        };
+                        float from = keyTime("loop start"), to = keyTime("loop stop");
+                        if (from < 0.f || to <= from)
+                        {
+                            from = keyTime("start");
+                            to = keyTime("stop");
+                        }
+                        mLoopLength = from >= 0.f && to > from ? to - from : 0.f;
+                    }
+                    if (mLoopLength > 0.f)
+                        speedMult = mLoopLength / loop;
+                }
                 mAnimation->adjustSpeedMult(mCurrentMovement, std::min(maxSpeedMult, speedMult));
                 // Make sure the actual speed is the "expected" speed even though the animation is slower
                 if (isMovementAnimationControlled())

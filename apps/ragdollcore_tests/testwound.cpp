@@ -101,3 +101,72 @@ TEST(RagdollCoreLongswordTest, EdgeFlatGuardAndDistalTipHaveSeparateSemantics)
     EXPECT_EQ(classifyBladeContact({0.98f, 1, 0, 0, 0, 0, 0}, *profile), WoundKind::None);
     EXPECT_EQ(classifyBladeContact({0.98f, 1, 0, 0, 80, 80, -80}, *profile), WoundKind::None);
 }
+
+TEST(RagdollCoreWoundTest, ASpearPointLeadingTheMotionPuncturesWithTheSetting)
+{
+    using namespace RagdollCore;
+    // A thrust whose hull normal reads the spearhead's side (K2_POINT_LEAD).
+    BladeContact hit;
+    hit.mAlong = 0.92f;
+    hit.mNormalTip = 0.25f;
+    hit.mNormalEdge = 0.2f;
+    hit.mNormalFlat = 0.95f;
+    hit.mVelocityTip = 330.0f;
+    hit.mSpeed = 350.0f;
+    hit.mApproach = 0.4f; // sliding in: the side normal sees almost no approach
+    WoundProfile spear{ WoundClass::Spear, 0.10f, 0.85f };
+    EXPECT_EQ(classifyWeaponContact(hit, spear), WoundKind::None);
+    hit.mApproach = 120.0f;
+    EXPECT_EQ(classifyWeaponContact(hit, spear), WoundKind::Bruise);
+    spear.mPointLead = 0.7f;
+    EXPECT_EQ(classifyWeaponContact(hit, spear), WoundKind::Puncture);
+    hit.mApproach = 0.4f;
+    EXPECT_EQ(classifyWeaponContact(hit, spear), WoundKind::Puncture);
+    hit.mApproach = 120.0f;
+    // The shaft still bruises; a point carried sideways or drawn back still
+    // bruises; a point moving away is nothing.
+    hit.mAlong = 0.5f;
+    EXPECT_EQ(classifyWeaponContact(hit, spear), WoundKind::Bruise);
+    hit.mAlong = 0.92f;
+    hit.mVelocityTip = 100.0f;
+    EXPECT_EQ(classifyWeaponContact(hit, spear), WoundKind::Bruise);
+    hit.mVelocityTip = -330.0f;
+    EXPECT_EQ(classifyWeaponContact(hit, spear), WoundKind::Bruise);
+    hit.mVelocityTip = 330.0f;
+    hit.mApproach = -20.0f;
+    EXPECT_EQ(classifyWeaponContact(hit, spear), WoundKind::None);
+    // A square thrust punctures either way.
+    hit.mApproach = 300.0f;
+    hit.mNormalTip = 0.9f;
+    spear.mPointLead = 0.0f;
+    EXPECT_EQ(classifyWeaponContact(hit, spear), WoundKind::Puncture);
+}
+
+TEST(RagdollCoreWoundTest, AnEdgeLeadingTheMotionCutsWithTheSetting)
+{
+    using namespace RagdollCore;
+    // An axe head's contact whose hull normal reads the flat, the motion
+    // along the edge (K2_EDGE_BITE).
+    BladeContact hit;
+    hit.mAlong = 0.85f;
+    hit.mNormalTip = 0.1f;
+    hit.mNormalEdge = 0.3f;
+    hit.mNormalFlat = 0.9f;
+    hit.mSpeed = 800.0f;
+    hit.mApproach = 500.0f;
+    hit.mVelocityEdge = -700.0f;
+    WoundProfile axe{ WoundClass::Axe, 0.65f, 0.95f };
+    EXPECT_EQ(classifyWeaponContact(hit, axe), WoundKind::Bruise);
+    axe.mEdgeLead = 0.6f;
+    EXPECT_EQ(classifyWeaponContact(hit, axe), WoundKind::Slash);
+    // The haft still bruises; the flat leading still bruises.
+    hit.mAlong = 0.4f;
+    EXPECT_EQ(classifyWeaponContact(hit, axe), WoundKind::Bruise);
+    hit.mAlong = 0.85f;
+    hit.mVelocityEdge = 200.0f;
+    EXPECT_EQ(classifyWeaponContact(hit, axe), WoundKind::Bruise);
+    // A blade too.
+    hit.mVelocityEdge = 700.0f;
+    WoundProfile blade{ WoundClass::Blade, 0.10f, 0.95f, 0.6f };
+    EXPECT_EQ(classifyWeaponContact(hit, blade), WoundKind::Slash);
+}

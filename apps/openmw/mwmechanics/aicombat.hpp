@@ -63,6 +63,7 @@ namespace MWMechanics
         RagdollCore::DuelTacticsState mDuel;
         bool mDuelActive = false;
         bool mDuelDodgeLogged = false; // the current dodge has been logged
+        std::string_view mDuelNowLogged; // the immediate attack (press, back cut, stagger cut) logged
         float mDuelSinceDown = 1.0e9f; // seconds since this fighter was last down
         bool mDuelRun = false;
         // AI-02 item 2 (OPENMW_RAGDOLL_AI_THREAT): the target's last position,
@@ -73,6 +74,10 @@ namespace MWMechanics
         const void* mDuelTargetRef = nullptr; // whose position mDuelTargetLast is
         float mDuelWheelTime = 0.0f; // seconds the wheel has been in wind-up/cut
         float mDuelClosing = 0.0f;
+        // K2_AI_ARRIVE: its own position, differenced into its speed toward the target.
+        osg::Vec3f mDuelSelfLast;
+        bool mDuelSelfLastValid = false;
+        float mDuelSelfClosing = 0.0f;
         bool mDuelGuardWanted = false;
         // AI-02 item 1a (OPENMW_RAGDOLL_AI_AIM): seconds in its wheel's recover stage.
         float mDuelWheelRecover = 0.0f;

@@ -45,7 +45,7 @@ def parse_args():
     )
     parser.add_argument("--native_mouse", action='store_true', help="allow native relative mouse mode instead of --no-grab fallback")
     parser.add_argument(
-        "--render_fps", type=int, choices=(30, 60, 120), default=60,
+        "--render_fps", type=int, choices=(30, 45, 50, 60, 120), default=60,
         help="render rate cap; does not change the physics step rate",
     )
     parser.add_argument(
@@ -199,6 +199,10 @@ def run_test(suite_name, suite_dir, config_dir, log_dir, time_str, data_dirs, ar
     active_case = None
     recording = TestRecording(args.video_directory)
     environment = dict(os.environ)
+    # Scripted cases keep the code's own fallbacks unless they ask for the
+    # game's values (sentinel/cases --play): the engine's built-in play
+    # defaults (ragdollcore playdefaults.cpp) stay off here.
+    environment.setdefault('OPENMW_RAGDOLL_PLAY_DEFAULTS', '0')
     environment['OPENMW_DISABLE_ERROR_DIALOG'] = '1'
     environment.pop('OPENMW_OSG_STATS_FILE', None)
     environment.pop('OPENMW_OSG_STATS_LIST', None)

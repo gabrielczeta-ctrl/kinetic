@@ -1,13 +1,15 @@
 """Per-change check: run a few cases in play settings and print their pass/fail
 and the sentinel's bars for their suite (walking and movement, combat, duel).
 
-usage: python tools/body/cases.py NAME SUITE 'lua pattern' ['lua pattern' ...] [K=V ...] [--play] [--report]
+usage: python tools/body/cases.py NAME SUITE 'lua pattern' ['lua pattern' ...] [K=V ...] [--play] [--report] [--fps=N]
 e.g.   python tools/body/cases.py stag test_play01_walking '^PLAY%-01 unarmed vanilla [kf]'
+--fps=N: rendered frames a second (30, 45, 50, 60, 120; RAGDOLL_TEST_RENDER_FPS for this run).
 
 Output: runtime-ONE-NAME in the dev root; every case also goes to the results
 ledger (ledger.py summary/history show its earlier runs). Suites are for play
 builds and releases (sentinel.py, see PLAN.md).
 """
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +21,9 @@ args = sys.argv[1:]
 if len(args) < 3:
     sys.exit(__doc__)
 name, suite = args[0], args[1]
+for a in args[2:]:
+    if a.startswith('--fps='):
+        os.environ['RAGDOLL_TEST_RENDER_FPS'] = a[6:]
 patterns = [a for a in args[2:] if not a.startswith('--') and '=' not in a]
 envs = [a for a in args[2:] if '=' in a and not a.startswith('--')]
 if '--play' in args:

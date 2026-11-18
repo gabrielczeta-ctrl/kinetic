@@ -6,6 +6,7 @@
 #include "weaponanimation.hpp"
 
 #include <components/vfs/pathutil.hpp>
+#include <ragdollcore/woundheal.hpp>
 
 #include "../mwworld/inventorystore.hpp"
 
@@ -86,6 +87,7 @@ namespace MWRender
             osg::ref_ptr<osg::Group> mParent;
             osg::ref_ptr<osg::Node> mNode;
             ESM::PartReferenceType mPart;
+            float mSeed = 0; // its wound's (WoundSeed::mFxSeed)
         };
         std::vector<WoundOverlay> mWoundOverlays;
         // Every mark's projection input, in its part node's frame, so a part
@@ -100,10 +102,25 @@ namespace MWRender
             osg::Vec3f mPoint, mNormal, mTangent;
             float mLength = 0, mHalfWidth = 0; // WOUNDFX-01 FX1 test shape, 0 = from severity
             int mSurface = 0; // WOUNDFX-01 FX3: the WoundFxSet::Surface it was placed on
+            // The wound's noise seed: every piece drawn for it carries it (its
+            // volumes on each drawable, a mesh-copy mark), so a restored wound
+            // looks the same and healing finds its pieces.
+            float mFxSeed = 0;
         };
         std::vector<WoundSeed> mWoundSeeds;
         bool mReseedingWounds = false;
         int mReseedSurface = 0; // the surface of the seed being restored
+        float mReseedFxSeed = 0; // and its noise seed
+        // K2_WOUND_HEAL (ragdollcore woundheal): the wounds on the body (skin
+        // and clothing) follow the actor's health, the marks on worn armour
+        // that armour's condition; the oldest go first. Once a frame on the
+        // main thread (runAnimation).
+        RagdollCore::WoundHealState mBodyHeal, mArmourHeal;
+        std::size_t mWornArmour = 0; // which armour pieces are worn; a change starts the armour's pool over
+        std::atomic<int> mBodyWounds{ 0 }, mArmourWounds{ 0 }; // getWoundCounts
+        void healWounds();
+        void healOldestWounds(bool armour, int count);
+        void removeWoundMarks(float seed); // one wound's drawn pieces; its seed record stays
         std::array<int, ESM::PRT_Count> mWoundRestoreFrames{};
         void restoreWoundSeeds(ESM::PartReferenceType type);
         // WOUNDFX-01 FX1/FX2: wounds on bare skin as shader wound volumes
@@ -138,6 +155,7 @@ namespace MWRender
             const void* mItem; // the weapon's MWWorld::LiveCellRefBase
             float mFrom, mTo, mStrength, mBirth, mSeed;
             int mBloodType;
+            osg::Vec3f mTipDirection; // grip to tip in the weapon bone's frame; zero: the far end
         };
         std::vector<WeaponBlood> mWeaponBlood;
         // GRIP-05: the transform the weapon part is wrapped in while it is
@@ -148,6 +166,7 @@ namespace MWRender
         {
             float mFrom, mTo, mStrength;
             int mBloodType;
+            osg::Vec3f mTipDirection;
         };
         std::vector<PendingWeaponBlood> mPendingWeaponBlood; // guarded by mPendingWoundsMutex
         osg::observer_ptr<osg::Node> mBloodiedWeaponNode; // the weapon node the marks are on
@@ -271,9 +290,12 @@ namespace MWRender
         bool addWoundFx(std::string_view region, const osg::Vec3f& point, const osg::Vec3f& normal,
             const osg::Vec3f& direction, float length, float halfWidth, float severity, int kind) override;
         std::size_t getWoundFxCount() const override;
+        std::pair<int, int> getWoundCounts() const override { return { mBodyWounds.load(), mArmourWounds.load() }; }
         int getLastWoundFxKind() const override { return mLastWoundFxKind; }
         int getLastWoundSurface() const override { return mLastWoundSurface.load(); }
-        bool addWeaponBlood(float alongFrom, float alongTo, float strength, int bloodType) override;
+        bool addWeaponBlood(
+            float alongFrom, float alongTo, float strength, int bloodType,
+            const osg::Vec3f& tipDirection) override;
         std::size_t getWeaponBloodCount() const override { return mWeaponBloodPlaced.load(); }
 
         void setVampire(bool vampire) override;

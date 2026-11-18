@@ -23,6 +23,11 @@
 #include <string>
 #include <vector>
 
+namespace JPH
+{
+    class PhysicsSystem;
+}
+
 namespace RagdollCore
 {
     // Fixed-step offline scenario harness. It exercises the shared OpenMW
@@ -49,6 +54,11 @@ namespace RagdollCore
     // documented differences: the identifier and the absent bone aliases.
     // The elbow limits now match the authored profile on both sides.
     RagdollProfile makeScenarioHumanoidProfile();
+
+    // The game's Jolt settings: its tolerances scaled from metres to world
+    // units, manifold reduction off (the OPENMW_RAGDOLL_PHYS_* probes apply),
+    // and `velocitySteps` solver iterations (0: Jolt's default).
+    void configureScenarioPhysics(JPH::PhysicsSystem& physics, std::uint32_t velocitySteps);
 
     enum class ScenarioTranslationRouting : std::uint8_t
     {

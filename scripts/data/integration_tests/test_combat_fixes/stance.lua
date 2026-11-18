@@ -109,6 +109,14 @@ return {
         end,
         fixActorRun = function(on) running = on end,
         fixActorHealth = function(value) refillHealth = value end,
+        -- HEAL-01: the health at this share of its base, left alone after.
+        fixActorHealthShare = function(share)
+            refillHealth = nil
+            local health = types.Actor.stats.dynamic.health(self)
+            health.current = health.base * share
+        end,
+        -- DOWN-01: knocked out the vanilla way (fatigue below zero).
+        fixActorFatigue = function(value) types.Actor.stats.dynamic.fatigue(self).current = value end,
         fixActorFight = function(on)
             aiFights = on
             self:enableAI(on)

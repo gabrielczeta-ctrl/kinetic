@@ -6,6 +6,10 @@
 #include <components/debug/debuglog.hpp>
 #include <components/misc/convert.hpp>
 
+#include <ragdollcore/contact.hpp>
+#include <ragdollcore/tuning.hpp>
+
+#include "joltlayers.hpp"
 #include "ptrholder.hpp"
 
 namespace MWPhysics
@@ -36,6 +40,21 @@ namespace MWPhysics
                 ptr2->onContactSettingsSided(body2, body1, manifold, ioSettings, false);
         }
 
+        // OPENMW_RAGDOLL_FLOOR_UNDERSIDE (1 = on, default off): a static's
+        // contact that pushes a powered ragdoll's body down from below its
+        // centre is rejected. A thin floor mesh has no inside: a foot pressed
+        // more than half its height into it (the ship-hold walker, MOVE-01 W2,
+        // 11-03) was pushed out through the bottom and walked on its calves
+        // under the floor. Rejected, the leg lifts the foot back up through it.
+        static bool floorUndersideRejected()
+        {
+            static const auto on = RagdollCore::tuned<bool>([] {
+                const char* text = RagdollCore::tuningText("OPENMW_RAGDOLL_FLOOR_UNDERSIDE");
+                return text && text[0] == '1';
+            });
+            return on.get();
+        }
+
     public:
         JoltContactListener() {}
 
@@ -59,6 +78,12 @@ namespace MWPhysics
 
             if (canCollide)
             {
+                // Each hit (a mesh's triangle) is checked, not the pair's first.
+                if ((inBody1.GetObjectLayer() == Layers::RAGDOLL || inBody2.GetObjectLayer() == Layers::RAGDOLL)
+                    && (inBody1.IsStatic() || inBody2.IsStatic()) && floorUndersideRejected())
+                    return RagdollCore::rejectsFloorUnderside(inBody1, inBody2, inBaseOffset, inCollisionResult)
+                        ? JPH::ValidateResult::RejectContact
+                        : JPH::ValidateResult::AcceptContact;
                 return JPH::ValidateResult::AcceptAllContactsForThisBodyPair;
             }
 

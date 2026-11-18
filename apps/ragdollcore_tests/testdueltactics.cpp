@@ -9,6 +9,33 @@ namespace
 {
     using namespace RagdollCore;
 
+    TEST(DuelTacticsBearings, NoRunAndAPaceWhileGettingBearings)
+    {
+        DuelTacticsOutput out;
+        out.mRun = true;
+        out.mDodgeBurst = true;
+        out.mForward = 1.0f;
+        out.mStrafe = -0.9f;
+        limitToBearings(out, true, 0.35f);
+        EXPECT_FALSE(out.mRun);
+        EXPECT_FALSE(out.mDodgeBurst);
+        EXPECT_FLOAT_EQ(out.mForward, 0.35f);
+        EXPECT_FLOAT_EQ(out.mStrafe, -0.35f);
+    }
+
+    TEST(DuelTacticsBearings, LeavesTheMoveAloneOtherwiseOrOff)
+    {
+        DuelTacticsOutput out;
+        out.mRun = true;
+        out.mForward = -1.0f;
+        limitToBearings(out, false, 0.35f);
+        EXPECT_TRUE(out.mRun);
+        EXPECT_FLOAT_EQ(out.mForward, -1.0f);
+        limitToBearings(out, true, 0.0f);
+        EXPECT_TRUE(out.mRun);
+        EXPECT_FLOAT_EQ(out.mForward, -1.0f);
+    }
+
     constexpr float sStep = 1.0f / 60.0f;
 
     DuelOpponentView calmOpponent(float distance)
@@ -815,4 +842,215 @@ TEST(RagdollCoreDuelTactics, theDodgeReadIsOffByDefault)
         opponent.mBladeSide = 25.0f;
         EXPECT_FALSE(stepDuelTactics(state, fighter(), opponent, sStep).mDodgeBurst);
     }
+}
+
+// K2_AI_ARRIVE: a fast run-in brakes before its mark; its own cut holds the
+// weapon's distance instead of pressing chest to chest.
+TEST(RagdollCoreDuelTacticsTest, arrivingFastItBrakesInsteadOfRunningThrough)
+{
+    DuelTacticsSettings settings;
+    settings.mArriveDecel = 900.0f;
+    DuelTacticsState state;
+    DuelSelfView self = fighter();
+    self.mOwnClosing = 680.0f;
+    // 680 u/s stops in ~257 u: at 200 u out it must not run or press on.
+    const auto out = stepDuelTactics(state, self, calmOpponent(200.0f), sStep, settings);
+    EXPECT_FALSE(out.mRun);
+    EXPECT_LT(out.mForward, 1.0f);
+    // Off: the old charge.
+    DuelTacticsState old;
+    EXPECT_FLOAT_EQ(stepDuelTactics(old, self, calmOpponent(400.0f), sStep).mForward, 1.0f);
+}
+
+TEST(RagdollCoreDuelTacticsTest, inItsOwnAttackItHoldsTheWeaponsDistance)
+{
+    DuelTacticsSettings settings;
+    settings.mArriveDecel = 900.0f;
+    settings.mStrikeHold = 0.85f;
+    DuelTacticsState state;
+    DuelSelfView self = fighter(1.0f);
+    self.mAttacking = true;
+    // Pressed to a gap of 2 u while cutting: it backs off, never presses in.
+    const auto close = stepDuelTactics(state, self, calmOpponent(2.0f), sStep, settings);
+    EXPECT_LT(close.mForward, 0.0f);
+    EXPECT_FALSE(close.mRun);
+    // At its strike reach's 0.85 it holds.
+    const auto held = stepDuelTactics(state, self, calmOpponent(34.0f), sStep, settings);
+    EXPECT_NEAR(held.mForward, 0.0f, 0.1f);
+}
+
+// Duel aggression (DuelPressSettings, user 11-07: "make them chain attacks,
+// step out less ... attack while walking back, or try to attack when
+// staggered").
+namespace
+{
+    // Strikes once (an opening), then runs its attack for a step: returns
+    // the output of the step after the attack ended.
+    DuelTacticsOutput strikeOnce(DuelTacticsState& state, const DuelSelfView& self, const DuelTacticsSettings& settings,
+        float gap = 38.0f)
+    {
+        DuelOpponentView recovering = calmOpponent(54.0f);
+        recovering.mSinceSwing = 0.1f;
+        EXPECT_GE(secondsUntilAttackWith(state, self, recovering, 3.0f, settings), 0.0f);
+        DuelSelfView attacking = self;
+        attacking.mAttacking = true;
+        stepDuelTactics(state, attacking, calmOpponent(gap), sStep, settings);
+        return stepDuelTactics(state, self, calmOpponent(gap), sStep, settings);
+    }
+}
+
+TEST(RagdollCoreDuelTacticsTest, aPressChainsAttacksWhileTheFoeStaysInReach)
+{
+    DuelTacticsSettings settings;
+    settings.mPress.mChance0 = settings.mPress.mChance100 = 1.0f;
+    settings.mPress.mAttacks = 3;
+    DuelTacticsState state;
+    const DuelSelfView self = fighter(0.0f, 1.0f);
+    DuelSelfView attacking = self;
+    attacking.mAttacking = true;
+    auto out = strikeOnce(state, self, settings);
+    EXPECT_EQ(out.mPhase, DuelPhase::StepIn);
+    EXPECT_EQ(out.mReason, "press");
+    EXPECT_TRUE(out.mAttack);
+    EXPECT_TRUE(out.mAttackNow); // no vanilla attack delay
+    // The second press, then the third attack ends it: out it steps.
+    stepDuelTactics(state, attacking, calmOpponent(38.0f), sStep, settings);
+    out = stepDuelTactics(state, self, calmOpponent(38.0f), sStep, settings);
+    EXPECT_EQ(out.mReason, "press");
+    stepDuelTactics(state, attacking, calmOpponent(38.0f), sStep, settings);
+    out = stepDuelTactics(state, self, calmOpponent(38.0f), sStep, settings);
+    EXPECT_EQ(out.mPhase, DuelPhase::StepOut);
+    EXPECT_FALSE(out.mAttack);
+    // A foe out of reach, or a tired fighter, is not pressed.
+    DuelTacticsState far;
+    EXPECT_EQ(strikeOnce(far, self, settings, 90.0f).mPhase, DuelPhase::StepOut);
+    DuelTacticsState spent;
+    DuelSelfView tired = self;
+    tired.mFatigue = 0.3f;
+    EXPECT_EQ(strikeOnce(spent, tired, settings).mPhase, DuelPhase::StepOut);
+    // Off (attacks 1): one attack, then the step-out.
+    DuelTacticsState old;
+    EXPECT_EQ(strikeOnce(old, self, DuelTacticsSettings{}).mPhase, DuelPhase::StepOut);
+}
+
+TEST(RagdollCoreDuelTacticsTest, theStepOutSettingShortensTheBackOff)
+{
+    const auto measureAfter = [](const DuelTacticsSettings& settings) {
+        DuelTacticsState state;
+        strikeOnce(state, fighter(0.0f, 1.0f), settings);
+        for (float t = 0.0f; t < 3.0f; t += sStep)
+            if (stepDuelTactics(state, fighter(0.0f, 1.0f), calmOpponent(60.0f), sStep, settings).mPhase
+                == DuelPhase::Measure)
+                return t;
+        return -1.0f;
+    };
+    DuelTacticsSettings shorter;
+    shorter.mPress.mStepOut = 0.3f;
+    EXPECT_NEAR(measureAfter(shorter), 0.3f, 0.05f);
+    EXPECT_NEAR(measureAfter(DuelTacticsSettings{}), 0.6f, 0.05f);
+}
+
+TEST(RagdollCoreDuelTacticsTest, aBackpedalCutsTheChargerAsItComes)
+{
+    DuelTacticsSettings settings = threatOn();
+    settings.mPress.mBackCut0 = settings.mPress.mBackCut100 = 1.0f;
+    // A timid fighter backpedals (nerve 0.1: before, no cut at all).
+    const DuelSelfView timid = duellist(0.1f, 1.0f, 0.1f);
+    int backCuts = 0, backpedals = 0;
+    for (std::uint32_t seed = 1; seed <= 40; ++seed)
+    {
+        DuelTacticsState state;
+        state.mSeed = (seed * 2654435761u) | 1u;
+        for (int i = 0; i < 30; ++i)
+            stepDuelTactics(state, timid, calmOpponent(80.0f), sStep, settings);
+        DuelTacticsOutput read;
+        for (int i = 0; i < 60 && read.mThreatRead.empty(); ++i)
+            read = stepDuelTactics(state, timid, charger(), sStep, settings);
+        if (read.mThreatRead != "backpedal")
+            continue;
+        ++backpedals;
+        // 80 u out, closing 250: in reach of 40 + 5 + 250 x 0.45 - it cuts
+        // now, walking back.
+        EXPECT_TRUE(read.mAttack);
+        EXPECT_TRUE(read.mAttackNow);
+        EXPECT_FLOAT_EQ(read.mForward, -1.0f);
+        EXPECT_FALSE(read.mGuard);
+        if (read.mReason == "back cut")
+            ++backCuts;
+        // Its attack under way it keeps walking back.
+        DuelSelfView attacking = timid;
+        attacking.mAttacking = true;
+        const auto during = stepDuelTactics(state, attacking, charger(), sStep, settings);
+        EXPECT_EQ(during.mPhase, DuelPhase::StepIn);
+        EXPECT_LT(during.mForward, 0.0f);
+    }
+    EXPECT_GE(backpedals, 20);
+    EXPECT_EQ(backCuts, backpedals);
+    // Off: the timid backpedal never strikes.
+    const auto off = responsesOf(timid);
+    EXPECT_GE(off.mBackpedal, 20);
+}
+
+TEST(RagdollCoreDuelTacticsTest, aFoeRunningAfterItsStepOutIsCutWalkingBack)
+{
+    DuelTacticsSettings settings;
+    settings.mPress.mBackCut0 = settings.mPress.mBackCut100 = 1.0f;
+    DuelTacticsState state;
+    const DuelSelfView self = fighter(0.0f, 1.0f);
+    ASSERT_EQ(strikeOnce(state, self, settings).mPhase, DuelPhase::StepOut);
+    DuelOpponentView chasing = calmOpponent(120.0f);
+    chasing.mClosing = 300.0f; // 120 <= 40 + 5 + 300 x 0.45
+    const auto out = stepDuelTactics(state, self, chasing, sStep, settings);
+    EXPECT_TRUE(out.mAttack);
+    EXPECT_EQ(out.mReason, "back cut");
+    EXPECT_EQ(out.mPhase, DuelPhase::StepIn);
+    EXPECT_LT(out.mForward, 0.0f);
+    // Off: the step-out goes on.
+    DuelTacticsState old;
+    strikeOnce(old, self, DuelTacticsSettings{});
+    const auto plain = stepDuelTactics(old, self, chasing, sStep);
+    EXPECT_FALSE(plain.mAttack);
+    EXPECT_EQ(plain.mPhase, DuelPhase::StepOut);
+}
+
+TEST(RagdollCoreDuelTacticsTest, aStaggeredFighterSwingsBackOncePerStagger)
+{
+    DuelTacticsSettings settings;
+    settings.mPress.mStaggerCut0 = settings.mPress.mStaggerCut100 = 1.0f;
+    settings.mPress.mStaggerDelay = 0.15f;
+    DuelTacticsState state;
+    DuelSelfView self = fighter(0.0f, 1.0f);
+    for (int i = 0; i < 30; ++i)
+        stepDuelTactics(state, self, calmOpponent(56.0f), sStep, settings);
+    self.mStaggered = true;
+    float firstCut = -1.0f;
+    bool readYes = false;
+    for (float t = 0.0f; t < 0.5f && firstCut < 0.0f; t += sStep)
+    {
+        const auto out = stepDuelTactics(state, self, calmOpponent(56.0f), sStep, settings);
+        readYes = readYes || out.mStaggerRead == "yes";
+        if (out.mAttack)
+        {
+            firstCut = t;
+            EXPECT_TRUE(out.mFightThrough);
+            EXPECT_TRUE(out.mAttackNow);
+            EXPECT_EQ(out.mReason, "stagger cut");
+        }
+    }
+    EXPECT_TRUE(readYes);
+    EXPECT_NEAR(firstCut, 0.15f, 0.03f);
+    // Its attack ran: the same stagger brings no second one.
+    DuelSelfView attacking = self;
+    attacking.mAttacking = true;
+    for (int i = 0; i < 10; ++i)
+        stepDuelTactics(state, attacking, calmOpponent(56.0f), sStep, settings);
+    for (int i = 0; i < 10; ++i)
+        EXPECT_FALSE(stepDuelTactics(state, self, calmOpponent(56.0f), sStep, settings).mFightThrough);
+    // Out of reach, or off: none.
+    DuelTacticsState far;
+    for (int i = 0; i < 30; ++i)
+        EXPECT_FALSE(stepDuelTactics(far, self, calmOpponent(90.0f), sStep, settings).mFightThrough);
+    DuelTacticsState old;
+    for (int i = 0; i < 30; ++i)
+        EXPECT_FALSE(stepDuelTactics(old, self, calmOpponent(56.0f), sStep).mFightThrough);
 }

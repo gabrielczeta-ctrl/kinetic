@@ -8,7 +8,13 @@ local cases = require('manual_hub_cases')
 local config = require('manual_hub_config')
 local status = require('manual_hub_status')
 local items = require('manual_hub_items')
+local duel = require('manual_hub_duel')
 local index, circuit, phase = 1, 1, 'init'
+-- The duel built in the F8 menu (manual_hub_duel.lua) is index 0: a case of
+-- its own, outside the preset list, until F6 moves on to the presets.
+local customCase, customCount = nil, 0
+-- The player's stats were set to a built duel's tier (restored at the next preset).
+local playerTiered = false
 -- A restricted circuit (launcher -Only) is for playing, not for a timed tour:
 -- it never advances by itself and a duel waits for F10 before the opponent fights.
 -- The automated wiring check still has to tour on its timer.
@@ -33,7 +39,57 @@ local foe, foeCycle, foeIndex = nil, nil, 0
 local function player() return world.players[1] end
 -- Self-check auto attacks (see autoClick).
 local autoClickAt, autoClickDown, autoShot, autoClicks = 0, false, false, 0
-local function case() return cases[index] end
+local function case() return index == 0 and customCase or cases[index] end
+local function position() return index == 0 and 'Duel' or string.format('%d/%d', index, #cases) end
+-- The duel builder's selection as a scenario: both sides' weapons in the
+-- chosen material (falling back to steel, then iron), shields and armor sets
+-- of that material, the opponent's game record and both skill tiers.
+local function duelWeapon(w, material)
+    if not w.family then return nil end
+    for _, m in ipairs({ material, 'steel', 'iron' }) do
+        local id = (m == 'iron' and w.family == 'staff') and 'wooden staff' or (m .. ' ' .. w.family)
+        if items.weapon(id, nil) then return id end
+    end
+end
+local function duelCase(s)
+    local material = duel.materials[s.material] or 'steel'
+    local opponent = duel.opponents[s.opponent] or duel.opponents[1]
+    local mine, theirs = duel.weaponOf(s, false), duel.weaponOf(s, true)
+    local shield = (duel.shields[s.shield] or duel.shields[1]).key
+    local armor = (duel.armors[s.armor] or duel.armors[1]).key
+    local scale = duel.healths[s.health] and duel.healths[s.health].key or 1
+    customCount = customCount + 1
+    local c = { id = 'duel-' .. customCount, kind = 'duel', custom = s, title = duel.describe(s),
+        hint = opponent.about .. ' F10 starts the fight, F7 restages it, F8 changes the duel.',
+        playerWeapon = duelWeapon(mine, material), foeWeapon = duelWeapon(theirs, material),
+        opponent = opponent, playerTier = s.playerTier, foeTier = s.foeTier, healthScale = scale,
+        playerSkill = mine.skill, foeSkill = theirs.skill }
+    -- A two-handed weapon takes no shield (the engine would unequip one or the other).
+    if (shield == 'both' or shield == 'player') and not mine.twoHanded then c.playerShield = material end
+    if (shield == 'both' or shield == 'foe') and not theirs.twoHanded then c.foeShield = material end
+    if armor == 'both' or armor == 'player' then c.playerArmor = material end
+    if armor == 'both' or armor == 'foe' then c.foeArmor = material end
+    -- The title names the weapons handed out (glass and ebony lack some families).
+    local foeTier = s.foeTier == 'own' and 'own record' or duel.tiers[s.foeTier].label
+    c.title = string.format('%s, %s | you %s | %s%s', opponent.label, foeTier, duel.tiers[s.playerTier].label,
+        c.playerWeapon or 'fists', c.foeWeapon ~= c.playerWeapon and (' vs ' .. (c.foeWeapon or 'fists')) or '')
+    print('PLAY05_HUB DUEL ' .. c.title .. string.format(' | you %s%s%s | foe %s%s%s | health x%s',
+        c.playerWeapon or 'fists', c.playerShield and ' + shield' or '', c.playerArmor and ' + armor' or '',
+        c.foeWeapon or 'fists', c.foeShield and ' + shield' or '', c.foeArmor and ' + armor' or '', tostring(scale)))
+    return c
+end
+-- A tier's stats with its best weapon skill on the weapon in hand.
+local function tierStats(key, skill, healthScale, health)
+    local tier = duel.tiers[key]
+    if not tier then return nil end
+    local skills, best = {}, 0
+    for name, value in pairs(tier.skills) do skills[name] = value end
+    for _, name in ipairs(duel.meleeSkills) do best = math.max(best, skills[name] or 0) end
+    if skill then skills[skill] = math.max(skills[skill] or 0, best) end
+    return { level = tier.level, attributes = tier.attributes, skills = skills,
+        health = math.floor((health or tier.health) * (healthScale or 1) + 0.5) }
+end
+if config.duel then customCase = duelCase(duel.parse(config.duel)); index = 0 end
 -- A scenario's equipment, resolved once from the game records: the player's
 -- and the foe's weapon (a missing material falls back to iron), and the
 -- armor/shield ids each side wears.
@@ -67,6 +123,8 @@ local function loadout(c)
         #L.playerEquip > 0 and (' + ' .. #L.playerEquip .. ' armor pieces') or '',
         L.foe or 'fists', #L.foeEquip > 0 and (' + ' .. #L.foeEquip .. ' armor pieces') or '')
     if #L.notes > 0 then L.text = L.text .. ' (' .. table.concat(L.notes, '; ') .. ')' end
+    -- No armor picked for the foe: everyday clothes, not bare skin.
+    if not c.foeArmor and not c.armor then add(L.foeEquip, items.clothes(), 'clothes') end
     print('PLAY05_HUB_LOADOUT ' .. c.id .. ' ' .. L.text .. ' player=[' .. table.concat(L.playerEquip, ',')
         .. '] foe=[' .. table.concat(L.foeEquip, ',') .. ']')
     loadouts[c.id] = L
@@ -95,15 +153,15 @@ local function standing(actor)
     return s and s.controller and s.controller.mode == 'standing'
 end
 local function publish(loud)
-    local text = string.format('Manual circuit %d | %d/%d %s | %s | %s\n%s\n%s',
-        circuit, index, #cases, case().title, phase,
+    local text = string.format('Manual circuit %d | %s %s | %s | %s\n%s\n%s',
+        circuit, position(), case().title, phase,
         paused and 'AUTO-ADVANCE PAUSED' or string.format('%.0fs', math.max(0, remaining)), case().hint, note)
     local enemy, detail = '', ''
     if opponent and opponent:isValid() then
         enemy, detail = status.enemy(state(opponent), types.Actor.stats.dynamic.health(opponent).current,
             types.Actor.stats.dynamic.health(player()).current)
     end
-    local short = string.format('%d/%d %s | %s', index, #cases, case().title,
+    local short = string.format('%s %s | %s', position(), case().title,
         phase == 'ready' and case().kind == 'duel' and (fighting and 'fighting' or 'F10 to start') or phase)
     -- Keep setup failures visible too; routine fight statistics have dedicated
     -- short lines instead of one long paragraph across the aiming view.
@@ -213,6 +271,8 @@ local function begin()
     publish(true)
 end
 local function advance()
+    -- The self-check of a launcher duel (-Duel with -CheckCircuits) ends after it.
+    if index == 0 and config.checkCircuits then core.quit(); return end
     index = index % #cases + 1
     if index == 1 then
         circuit = circuit + 1
@@ -225,19 +285,49 @@ local function ready()
     phase, nextAction = 'ready', core.getSimulationTime() + 2
     publish(true)
 end
+-- A built duel's opponent: a copy of the game NPC's record (not essential,
+-- not persistent), made once per NPC; nil when the record is missing.
+local duelRecords = {}
+local function duelRecord(opponentData)
+    local key = opponentData.id
+    if duelRecords[key] == nil then
+        local ok, made = pcall(function()
+            local draft = { template = types.NPC.record(key), isEssential = false, isPersistent = false,
+                isRespawning = false }
+            if opponentData.class then draft.class = opponentData.class end
+            return world.createRecord(types.NPC.createRecordDraft(draft))
+        end)
+        if not ok then print('PLAY05_HUB DUEL no record for ' .. key .. ': ' .. tostring(made)) end
+        duelRecords[key] = ok and made or false
+    end
+    return duelRecords[key] or nil
+end
 local function spawnOpponent()
     if not record then
         record = world.createRecord(types.NPC.createRecordDraft({ template = types.NPC.record(player()),
             name = 'Manual circuit opponent', isEssential = false, isPersistent = false, isRespawning = false }))
     end
-    opponent = world.createObject(record.id)
-    foe = foe or foeOf(case())
+    local c = case()
+    local npc = c.opponent and duelRecord(c.opponent)
+    opponent = world.createObject((npc or record).id)
+    if npc then
+        -- The NPC's own weapons and armor go: the duel's loadout replaces them.
+        for _, item in ipairs(types.Actor.inventory(opponent):getAll()) do
+            if types.Weapon.objectIsInstance(item) or types.Armor.objectIsInstance(item) then item:remove() end
+        end
+    end
+    foe = foe or foeOf(c)
     for _, id in pairs({ weapon = foe.weapon, armor = foe.armor }) do
         world.createObject(id, 1):moveInto(types.Actor.inventory(opponent))
     end
     for _, id in ipairs(foe.equip) do world.createObject(id, 1):moveInto(types.Actor.inventory(opponent)) end
+    -- A built duel's opponent keeps its game health (times the duel's scale)
+    -- and its record's stats unless a tier replaces them (manual_hub_opponent).
+    local stats = c.custom and { tier = tierStats(c.foeTier, c.foeSkill, c.healthScale), skill = c.foeSkill,
+        meleeSkills = duel.meleeSkills, healthScale = c.healthScale } or nil
     opponent:addScript('manual_hub_opponent.lua', { weapon = foe.weapon, unarmed = not foe.weapon,
-        armor = foe.armor, equip = foe.equip, health = config.opponentHealth or 40 })
+        armor = foe.armor, equip = foe.equip, health = not stats and (config.opponentHealth or 40) or nil,
+        stats = stats })
     if respawning then
         -- The next duelist comes in ahead of the player, facing them.
         local yaw = player().rotation:getYaw()
@@ -341,6 +431,15 @@ local characters = {
             endurance = 70, personality = 35, luck = 45 },
         skills = { longblade = 65, bluntweapon = 55, axe = 55, block = 50, heavyarmor = 55, mediumarmor = 40,
             athletics = 45, armorer = 40, spear = 30, shortblade = 30, handtohand = 30 } },
+    -- User 11-04 ("Balmora guards are really hard ... let me test fighting
+    -- with full gear and high level"): a level 30 warrior in full ebony,
+    -- vanilla hit roll; Run-Fight-Veteran.cmd starts it in Balmora.
+    veteran = { level = 30, health = 320, material = 'ebony',
+        weapons = { 'ebony longsword', 'daedric claymore', 'daedric battle axe' },
+        attributes = { strength = 100, intelligence = 40, willpower = 70, agility = 90, speed = 80,
+            endurance = 100, personality = 40, luck = 60 },
+        skills = { longblade = 90, bluntweapon = 80, axe = 85, block = 80, heavyarmor = 85, mediumarmor = 60,
+            athletics = 70, armorer = 60, spear = 50, shortblade = 50, handtohand = 50 } },
 }
 local character = characters[config.character or '']
 if character then
@@ -498,14 +597,19 @@ local function feedAim()
         local hsc = ps.hsc
         if hsc then
             hud = { stage = hsc.stage, x = hsc.stanceX, y = hsc.stanceY, angle = hsc.angle, line = hsc.line,
+                fists = hsc.fists, fistDrag = hsc.fistDrag, leftCharge = hsc.leftCharge, rightCharge = hsc.rightCharge,
+                leftPunch = hsc.leftPunch, rightPunch = hsc.rightPunch,
                 snap = hsc.snap, chain = hsc.chain, click = hsc.click, route = hsc.route,
                 reseat = hsc.reseat, reseats = hsc.reseats,
-                bladeCommand = hsc.blade, blade = blade, trajectory = hsc.trajectory }
+                bladeCommand = hsc.blade, blade = blade, trajectory = hsc.trajectory,
+                mark = hsc.mark, markHit = hsc.markHit, markGap = hsc.markGap }
         end
         player():sendEvent('manualHubAim', { command = ps.tip and ps.tip.command or nil, tip = tip, hud = hud,
             wristRight = ps.wristOutsideRight, wristLeft = ps.wristOutsideLeft,
             guard = ps.guardActive, guardZone = ps.guardZone,
-            balance = { x = ps.balanceRight or 0, y = ps.balanceForward or 0, tip = ps.balanceTip or 0 },
+            balance = { x = ps.balanceRight or 0, y = ps.balanceForward or 0, tip = ps.balanceTip or 0,
+            shiftX = ps.weightRight or 0, shiftY = ps.weightForward or 0, edge = ps.weightEdge or 0,
+                risk = ps.balanceRisk or 0, sigil = ps.balanceSigil },
             ready = ps.attackReady or 1 })
     end
 end
@@ -534,6 +638,20 @@ local function update(dt)
             -- Keep the four demonstrations out of the player's swing lane.
             h.cleanup()
             local L = loadout(c)
+            -- The player's skill tier: the built duel's, else back to the
+            -- hub's max character once a duel has changed it. Below max the
+            -- player rolls to hit like in vanilla (as the dungeon characters).
+            if c.custom or playerTiered then
+                local key = c.custom and c.playerTier or 'max'
+                local stats = tierStats(key, c.playerSkill, c.healthScale or 1,
+                    key == 'max' and config.playerHealth or nil)
+                player():sendEvent('manualHubCharacter', stats)
+                ragdoll.setPlayerAlwaysHits(key == 'max'
+                    and not (ragdoll.playerRollWanted and ragdoll.playerRollWanted()))
+                playerTiered = c.custom ~= nil
+                print(string.format('PLAY05_HUB DUEL player tier %s (%s %d) health %d', key, tostring(c.playerSkill),
+                    c.playerSkill and stats.skills[c.playerSkill] or 0, stats.health))
+            end
             givePlayer(L.player)
             for _, id in ipairs(L.playerEquip) do givePlayer(id) end
             h.playerFists(L.player)
@@ -589,9 +707,12 @@ local function update(dt)
             end
             opponent, fighting, respawning = nil, false, true
             deadline = core.getRealTime() + 20
-            local current = foeKey(foe)
-            repeat foe = nextFoe() until foeKey(foe) ~= current or #foeCycle < 2
-            outcome = outcome .. 'Foe: ' .. (foe.weapon or 'fists') .. ' (' .. foe.title .. '). '
+            -- A built duel brings the same opponent back; the presets cycle.
+            if not c.custom then
+                local current = foeKey(foe)
+                repeat foe = nextFoe() until foeKey(foe) ~= current or #foeCycle < 2
+            end
+            outcome = outcome .. 'Foe: ' .. (foe.weapon or 'fists') .. (c.custom and '. ' or (' (' .. foe.title .. '). '))
             print('PLAY05_HUB next duelist ' .. (foe.weapon or 'fists') .. ' [' .. table.concat(foe.equip, ',') .. ']')
             spawnOpponent()
             note = outcome
@@ -648,7 +769,8 @@ return {
         elseif data.action == 'repeat' then begin()
         elseif data.action == 'pause' then paused = not paused; publish(true)
         elseif data.action == 'action' then action()
-        elseif data.action == 'jump' and cases[data.index] then index = data.index; begin() end
+        elseif data.action == 'jump' and cases[data.index] then index = data.index; begin()
+        elseif data.action == 'duel' and data.duel then customCase = duelCase(data.duel); index = 0; begin() end
     end,
     },
 }
